@@ -37,7 +37,9 @@ namespace TradingRadar.NT
         private bool _subscribed;
         private int      _depthEvents;
         private int      _tradeEvents;
-        private DateTime _lastDiag = DateTime.MinValue;
+        private DateTime _lastDiag      = DateTime.MinValue;
+        private DateTime _lastEngineRun = DateTime.MinValue;
+        private const double EngineIntervalMs = 50;   // run engine+snapshot at most ~20Hz
 
         public RadarTab()
         {
@@ -174,17 +176,8 @@ namespace TradingRadar.NT
                 IsReset  = false
             };
             _book.ApplyDepth(de);
-            _tracker.Update(_book, e.Time);
             _depthEvents++;
-            _latest = new Frame
-            {
-                Nodes = _tracker.GetSnapshot(e.Time),
-                Bids  = new List<DepthLevel>(_book.Levels(Side.Bid)),
-                Asks  = new List<DepthLevel>(_book.Levels(Side.Ask)),
-                Mid   = MidOf(),
-                Tick  = _cfg.TickSize
-            };
-            MaybeDiag(e.Time);
+            MaybeRunEngine(e.Time);
         }
 
         private void OnMarketData(object sender, MarketDataEventArgs e)
@@ -192,17 +185,25 @@ namespace TradingRadar.NT
             if (e.MarketDataType != MarketDataType.Last) return;
             TradeEvent te = new TradeEvent { Price = e.Price, Volume = e.Volume, Time = e.Time };
             _book.ApplyTrade(te);
-            _tracker.Update(_book, e.Time);
             _tradeEvents++;
+            MaybeRunEngine(e.Time);
+        }
+
+        private void MaybeRunEngine(DateTime now)
+        {
+            if (_lastEngineRun != DateTime.MinValue && (now - _lastEngineRun).TotalMilliseconds < EngineIntervalMs)
+                return;
+            _lastEngineRun = now;
+            _tracker.Update(_book, now);
             _latest = new Frame
             {
-                Nodes = _tracker.GetSnapshot(e.Time),
+                Nodes = _tracker.GetSnapshot(now),
                 Bids  = new List<DepthLevel>(_book.Levels(Side.Bid)),
                 Asks  = new List<DepthLevel>(_book.Levels(Side.Ask)),
                 Mid   = MidOf(),
                 Tick  = _cfg.TickSize
             };
-            MaybeDiag(e.Time);
+            MaybeDiag(now);
         }
 
         private void MaybeDiag(DateTime now)
