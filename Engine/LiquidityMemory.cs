@@ -90,13 +90,13 @@ namespace TradingRadar.Engine
                     break;
                 case Outcome.Pulled:
                     n.PulledCount++;
-                    n.Confidence *= _cfg.PullPenalty;
+                    n.Confidence = Clamp(n.Confidence * _cfg.PullPenalty, 0.0, 1.0);
                     n.Phantom = true;
                     n.State = NodeState.Pulled;
                     break;
                 case Outcome.Consumed:
                     n.Consumed = true;
-                    n.Confidence *= 0.5; // demote to a flipped S/R reference
+                    n.Confidence = Clamp(n.Confidence * 0.5, 0.0, 1.0); // demote to a flipped S/R reference
                     n.State = NodeState.Consumed;
                     break;
             }

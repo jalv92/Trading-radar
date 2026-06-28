@@ -18,7 +18,7 @@ public class LiquidityMemoryTests
         var s = m.Snapshot(21000.00, 21000.25, T0);
         var n = NodeAt(s, 21000.00);
         Assert.Equal(NodeState.Wall, n.State);
-        Assert.InRange(n.Confidence, 0.4, 0.8);
+        Assert.Equal(0.8, n.Confidence, 3); // size/B=45.5 → 0.4+0.1*41.5 clamps to ceiling
         Assert.True(n.InWindow);
         Assert.Equal(500, n.LastKnownSize);
     }
@@ -42,12 +42,17 @@ public class LiquidityMemoryTests
     public void Live_node_does_not_decay()
     {
         var m = new LiquidityMemory(new RadarConfig());
-        m.Promote(Side.Bid, 21000.00, 500, 11, T0);
+        m.Promote(Side.Bid, 21000.00, 500, 11, T0); // C0 ~0.8, InWindow=true
         double c0 = NodeAt(m.Snapshot(21000.00, 21000.25, T0), 21000.00).Confidence;
-        // still live 60s later (kept observed)
-        m.ObserveLive(Side.Bid, 21000.00, 500, true, T0.AddSeconds(60));
-        double c1 = NodeAt(m.Snapshot(21000.00, 21000.25, T0.AddSeconds(60)), 21000.00).Confidence;
-        Assert.True(c1 >= c0); // confirmed raised it, never decayed
+
+        // 300s later, still InWindow, NO ObserveLive/MarkBlind in between.
+        double cLive = NodeAt(m.Snapshot(21000.00, 21000.25, T0.AddSeconds(300)), 21000.00).Confidence;
+        Assert.Equal(c0, cLive); // live confidence never decays regardless of elapsed time
+
+        // Contrast: once blind, the SAME elapsed time DOES decay it (proves the decay path is live).
+        m.MarkBlind(Side.Bid, 21000.00);
+        double cBlind = NodeAt(m.Snapshot(21000.00, 21000.25, T0.AddSeconds(300)), 21000.00).Confidence;
+        Assert.True(cBlind < c0);
     }
 
     [Fact]
@@ -60,11 +65,11 @@ public class LiquidityMemoryTests
         m.ApplyOutcome(new EpisodeResult { Side = Side.Ask, Price = 21000.50, Outcome = Outcome.Absorbed, Traded = 600, Cancelled = 0, ResolvedAt = T0.AddSeconds(1) }, T0.AddSeconds(1));
         var n = NodeAt(m.Snapshot(21000.25, 21000.50, T0.AddSeconds(1)), 21000.50);
         Assert.Equal(NodeState.Absorbed, n.State);
-        Assert.True(n.Confidence >= before);
+        Assert.True(n.Confidence > before); // dC_absorb is strictly positive
     }
 
     [Fact]
-    public void Pulled_outcome_collapses_confidence_and_flags_phantom()
+    public void Pulled_outcome_collapses_confidence()
     {
         var cfg = new RadarConfig { PullPenalty = 0.2 };
         var m = new LiquidityMemory(cfg);
