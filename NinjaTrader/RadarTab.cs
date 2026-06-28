@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
 using System.Windows.Threading;
 using System.Xml.Linq;
 using NinjaTrader.Cbi;
@@ -39,6 +41,7 @@ namespace TradingRadar.NT
 
         public RadarTab()
         {
+            _cfg.MinAbsSize = 20;   // NQ RTH starting point; tuned live via UI bar
             _book    = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
             _tracker = new WallTracker(_cfg);
             _visual  = new RadarVisual();
@@ -47,8 +50,19 @@ namespace TradingRadar.NT
             _selector.InstrumentChanged += OnSelectorChanged;
 
             DockPanel root = new DockPanel();
-            DockPanel.SetDock(_selector, Dock.Top);
-            root.Children.Add(_selector);
+            // Top bar: instrument selector + live threshold knobs (edit _cfg directly; engine reads live).
+            StackPanel topBar = new StackPanel { Orientation = Orientation.Horizontal,
+                Background = new SolidColorBrush(Color.FromRgb(0x0f, 0x14, 0x20)) };
+            topBar.Children.Add(_selector);
+            topBar.Children.Add(MakeCfgInput("MinSize", _cfg.MinAbsSize.ToString(),
+                v => _cfg.MinAbsSize = (long)v));
+            topBar.Children.Add(MakeCfgInput("K×", _cfg.K_mult.ToString("0.#"),
+                v => _cfg.K_mult = v));
+            topBar.Children.Add(MakeCfgInput("Persist(ms)",
+                ((long)_cfg.T_persist.TotalMilliseconds).ToString(),
+                v => _cfg.T_persist = TimeSpan.FromMilliseconds(v)));
+            DockPanel.SetDock(topBar, Dock.Top);
+            root.Children.Add(topBar);
             root.Children.Add(_visual);          // fills remaining space
             Content = root;
 
@@ -207,6 +221,28 @@ namespace TradingRadar.NT
                 _book.MedianSize(Side.Bid), _book.MedianSize(Side.Ask),
                 _cfg.MinAbsSize, _cfg.K_mult, nodes);
             NinjaTrader.Code.Output.Process(msg, NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+        }
+
+        // Aurora-styled label+TextBox pair; assigns to a _cfg field on Enter/LostFocus.
+        private static UIElement MakeCfgInput(string label, string init, Action<double> apply)
+        {
+            var lbl = new TextBlock { Text = label + ":",
+                Margin = new Thickness(8, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center,
+                FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
+                Foreground = new SolidColorBrush(Color.FromRgb(0x9a, 0xa4, 0xb2)) };
+            var box = new TextBox { Text = init, Width = 50,
+                Background  = new SolidColorBrush(Color.FromRgb(0x0f, 0x14, 0x20)),
+                Foreground  = new SolidColorBrush(Color.FromRgb(0xcf, 0xd6, 0xe2)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(30, 0xff, 0xff, 0xff)),
+                VerticalContentAlignment = VerticalAlignment.Center,
+                Padding = new Thickness(3, 1, 3, 1) };
+            Action commit = () => { if (double.TryParse(box.Text, out double v)) apply(v); };
+            box.LostFocus += (o, e) => commit();
+            box.KeyDown   += (o, e) => { if (e.Key == Key.Enter) commit(); };
+            var sp = new StackPanel { Orientation = Orientation.Horizontal,
+                Margin = new Thickness(4, 2, 4, 2), VerticalAlignment = VerticalAlignment.Center };
+            sp.Children.Add(lbl); sp.Children.Add(box);
+            return sp;
         }
 
         // ---- NTTabPage members ----
