@@ -166,11 +166,11 @@ namespace TradingRadar.NT
 
                 // Price label (left, tabular).
                 DrawText(dc, n.Price.ToString("0.00", CultureInfo.InvariantCulture),
-                         4, y, 11, Mono, PriceTxt, dpi, op);
+                         4, y, 14, Mono, PriceTxt, dpi, op);
 
                 // Size label (right of bar).
                 DrawText(dc, n.LastKnownSize.ToString(),
-                         barX + barW + 6, y, 11, Mono, isBid ? BidText : AskText, dpi, op);
+                         barX + barW + 6, y, 13, Mono, isBid ? BidText : AskText, dpi, op);
 
                 // State badge / age tag.
                 string badge = BadgeFor(n.State);
@@ -182,12 +182,11 @@ namespace TradingRadar.NT
             // Inside-market amber line + mid chip (chip covers line so text is readable).
             dc.DrawLine(AmberLine, new Point(0, centerY), new Point(w, centerY));
             var midFt = new FormattedText(_mid.ToString("0.00", CultureInfo.InvariantCulture),
-                CultureInfo.InvariantCulture, FlowDirection.LeftToRight, Mono, 12, AmberTxt, dpi);
-            const double chipPad = 4.0;
-            double chipW = midFt.Width + chipPad * 2, chipH = midFt.Height + chipPad;
-            double chipX = 2.0, chipY = centerY - chipH / 2.0;
-            dc.DrawRoundedRectangle(MidChipBg, MidChipBorder, new Rect(chipX, chipY, chipW, chipH), 3, 3);
-            dc.DrawText(midFt, new Point(chipX + chipPad, centerY - midFt.Height / 2.0));
+                CultureInfo.InvariantCulture, FlowDirection.LeftToRight, Mono, 16, AmberTxt, dpi);
+            double chipW = midFt.Width + 10, chipH = midFt.Height + 4;
+            double chipY = centerY - chipH / 2.0;
+            dc.DrawRoundedRectangle(MidChipBg, MidChipBorder, new Rect(2, chipY, chipW, chipH), 3, 3);
+            dc.DrawText(midFt, new Point(7, centerY - midFt.Height / 2.0));
 
             // Refresh-pulse sweep: honest data-refresh indicator.
             double sy = _sweep * h;
