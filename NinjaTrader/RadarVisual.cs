@@ -24,7 +24,9 @@ namespace TradingRadar.NT
         static readonly Pen   Grid     = FrozenPen(Color.FromArgb(16, 0xff, 0xff, 0xff), 1);
         static readonly Pen   AmberLine= FrozenPen(Color.FromArgb(128, 0xff, 0xce, 0x5c), 1);
         static readonly Pen   PullDash = FrozenDash(Color.FromRgb(0x94, 0xa3, 0xb8), 1);
-        static readonly Brush Sweep    = FrozenBrush(Color.FromArgb(10, 0xff, 0xff, 0xff));
+        static readonly Brush Sweep    = FrozenBrush(Color.FromArgb(10,  0xff, 0xff, 0xff));
+        static readonly Brush BidBook  = FrozenBrush(Color.FromArgb(115, 0x34, 0xd3, 0x99));  // ~.45
+        static readonly Brush AskBook  = FrozenBrush(Color.FromArgb(115, 0xfb, 0x71, 0x85));  // ~.45
         static readonly Typeface Mono  = new Typeface(new FontFamily("Consolas"),
                                              FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
         static readonly Typeface Sans  = new Typeface(new FontFamily("Segoe UI"),
@@ -41,15 +43,18 @@ namespace TradingRadar.NT
             BgGrad = gb;
         }
 
-        private IReadOnlyList<RadarNode> _nodes;
+        private IReadOnlyList<RadarNode>  _nodes;
+        private IReadOnlyList<DepthLevel> _bids;
+        private IReadOnlyList<DepthLevel> _asks;
         private double _mid;
-        private double _tick  = 0.25;
+        private double _tick      = 0.25;
         private int    _bandTicks = 25;
         private double _sweep;      // 0..1 animation phase
 
-        public void SetNodes(IReadOnlyList<RadarNode> nodes, double mid, double tickSize)
+        public void SetFrame(IReadOnlyList<RadarNode> nodes, IReadOnlyList<DepthLevel> bids,
+                             IReadOnlyList<DepthLevel> asks, double mid, double tickSize)
         {
-            _nodes = nodes;
+            _nodes = nodes; _bids = bids; _asks = asks;
             _mid   = mid;
             if (tickSize > 0) _tick = tickSize;
             InvalidateVisual();
@@ -70,7 +75,7 @@ namespace TradingRadar.NT
 
             dc.DrawRectangle(BgGrad, null, new Rect(0, 0, w, h));
 
-            if (_nodes == null || _mid <= 0) return;
+            if (_mid <= 0) return;
 
             int    rows    = 2 * _bandTicks + 1;
             double rowH    = h / rows;
@@ -85,10 +90,35 @@ namespace TradingRadar.NT
                 if (yDn < h) dc.DrawLine(Grid, new Point(0, yDn), new Point(w, yDn));
             }
 
+            // maxSize spans book levels + wall nodes so bar widths are proportional across both layers.
             long maxSize = 1;
-            for (int i = 0; i < _nodes.Count; i++)
-                if (_nodes[i].LastKnownSize > maxSize) maxSize = _nodes[i].LastKnownSize;
+            if (_nodes != null) for (int i = 0; i < _nodes.Count; i++) if (_nodes[i].LastKnownSize > maxSize) maxSize = _nodes[i].LastKnownSize;
+            if (_bids  != null) for (int i = 0; i < _bids.Count;  i++) if (_bids[i].Volume  > maxSize) maxSize = _bids[i].Volume;
+            if (_asks  != null) for (int i = 0; i < _asks.Count;  i++) if (_asks[i].Volume  > maxSize) maxSize = _asks[i].Volume;
 
+            // ---- faint book ladder (drawn first; wall nodes overlay on top) ----
+            if (_bids != null)
+                for (int i = 0; i < _bids.Count; i++)
+                {
+                    double y = centerY - ((_bids[i].Price - _mid) / _tick) * rowH;
+                    if (y < -rowH || y > h + rowH) continue;
+                    double barW   = Math.Max(2.0, (_bids[i].Volume / (double)maxSize) * barMaxW);
+                    double rowTop = y - rowH * 0.40, rowHt = rowH * 0.80;
+                    dc.DrawRoundedRectangle(BidBook, null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
+                    DrawText(dc, _bids[i].Volume.ToString(), barX + barW + 6, y, 11, Mono, BidText, dpi, 1.0);
+                }
+            if (_asks != null)
+                for (int i = 0; i < _asks.Count; i++)
+                {
+                    double y = centerY - ((_asks[i].Price - _mid) / _tick) * rowH;
+                    if (y < -rowH || y > h + rowH) continue;
+                    double barW   = Math.Max(2.0, (_asks[i].Volume / (double)maxSize) * barMaxW);
+                    double rowTop = y - rowH * 0.40, rowHt = rowH * 0.80;
+                    dc.DrawRoundedRectangle(AskBook, null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
+                    DrawText(dc, _asks[i].Volume.ToString(), barX + barW + 6, y, 11, Mono, AskText, dpi, 1.0);
+                }
+
+            if (_nodes != null)
             for (int i = 0; i < _nodes.Count; i++)
             {
                 RadarNode n    = _nodes[i];

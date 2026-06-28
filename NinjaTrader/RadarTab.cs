@@ -60,7 +60,7 @@ namespace TradingRadar.NT
             _paintTimer.Tick += (o, e) =>
             {
                 Frame f = _latest;          // volatile read of the latest immutable frame
-                if (f != null) _visual.SetNodes(f.Nodes, f.Mid, f.Tick);
+                if (f != null) _visual.SetFrame(f.Nodes, f.Bids, f.Asks, f.Mid, f.Tick);
                 _visual.AdvanceAnimation(); // sweep/fade clock
             };
             _paintTimer.Start();
@@ -161,7 +161,16 @@ namespace TradingRadar.NT
             };
             _book.ApplyDepth(de);
             _tracker.Update(_book, e.Time);
-            _latest = new Frame { Nodes = _tracker.GetSnapshot(e.Time), Mid = MidOf(), Tick = _cfg.TickSize };
+            _depthEvents++;
+            _latest = new Frame
+            {
+                Nodes = _tracker.GetSnapshot(e.Time),
+                Bids  = new List<DepthLevel>(_book.Levels(Side.Bid)),
+                Asks  = new List<DepthLevel>(_book.Levels(Side.Ask)),
+                Mid   = MidOf(),
+                Tick  = _cfg.TickSize
+            };
+            MaybeDiag(e.Time);
         }
 
         private void OnMarketData(object sender, MarketDataEventArgs e)
@@ -170,7 +179,34 @@ namespace TradingRadar.NT
             TradeEvent te = new TradeEvent { Price = e.Price, Volume = e.Volume, Time = e.Time };
             _book.ApplyTrade(te);
             _tracker.Update(_book, e.Time);
-            _latest = new Frame { Nodes = _tracker.GetSnapshot(e.Time), Mid = MidOf(), Tick = _cfg.TickSize };
+            _tradeEvents++;
+            _latest = new Frame
+            {
+                Nodes = _tracker.GetSnapshot(e.Time),
+                Bids  = new List<DepthLevel>(_book.Levels(Side.Bid)),
+                Asks  = new List<DepthLevel>(_book.Levels(Side.Ask)),
+                Mid   = MidOf(),
+                Tick  = _cfg.TickSize
+            };
+            MaybeDiag(e.Time);
+        }
+
+        private void MaybeDiag(DateTime now)
+        {
+            if (_lastDiag != DateTime.MinValue && (now - _lastDiag).TotalSeconds < 2) return;
+            _lastDiag = now;
+            var bids = _book.Levels(Side.Bid); var asks = _book.Levels(Side.Ask);
+            long maxB = 0, maxA = 0;
+            for (int i = 0; i < bids.Count; i++) if (bids[i].Volume > maxB) maxB = bids[i].Volume;
+            for (int i = 0; i < asks.Count; i++) if (asks[i].Volume > maxA) maxA = asks[i].Volume;
+            int nodes = _latest != null && _latest.Nodes != null ? _latest.Nodes.Count : 0;
+            string msg = string.Format(
+                "[Radar] {0:HH:mm:ss} depth#={1} trade#={2} | bids={3} asks={4} | maxBid={5} maxAsk={6}" +
+                " medBid={7} medAsk={8} | MinAbs={9} Kx={10} nodes={11}",
+                now, _depthEvents, _tradeEvents, bids.Count, asks.Count, maxB, maxA,
+                _book.MedianSize(Side.Bid), _book.MedianSize(Side.Ask),
+                _cfg.MinAbsSize, _cfg.K_mult, nodes);
+            NinjaTrader.Code.Output.Process(msg, NinjaTrader.NinjaScript.PrintTo.OutputTab1);
         }
 
         // ---- NTTabPage members ----
