@@ -91,7 +91,8 @@ namespace TradingRadar.Engine
             Outcome o;
             if (ep.Crossed)
                 o = Outcome.Consumed;
-            else if (traded >= _cfg.A_absorb * ep.SizeAtOpen)
+            else if (traded >= _cfg.A_absorb * ep.SizeAtOpen
+                     && traded >= _cfg.RefillRatioTrigger * Math.Max(drop, 1))
                 o = Outcome.Absorbed;
             else if (cancelled > traded && ep.QuoteAwayAtVanish)
                 o = Outcome.Pulled;

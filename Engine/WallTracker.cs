@@ -122,13 +122,13 @@ namespace TradingRadar.Engine
             return _memory.Snapshot(_lastBestBid, _lastBestAsk, now);
         }
 
-        // Overload for tests and replay tools that need to query with an explicit mid.
+        // Test seam: lets a test supply the mid explicitly so the band filter is centred on the
+        // node being observed rather than on the gap quote cached by the last Update call.
         public IReadOnlyList<RadarNode> GetSnapshot(double bestBid, double bestAsk, DateTime now)
         {
             return _memory.Snapshot(bestBid, bestAsk, now);
         }
 
         private long Key(Side s, double price) { return ((long)Math.Round(price / _tick)) * 2 + (s == Side.Ask ? 1 : 0); }
-        private double RoundToTick(double price) { return Math.Round(price / _tick) * _tick; }
     }
 }
