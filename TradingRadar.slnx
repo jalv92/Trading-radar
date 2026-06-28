@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/Engine/">
+    <Project Path="Engine/TradingRadar.Engine.csproj" />
+  </Folder>
+  <Folder Name="/Tests/">
+    <Project Path="Tests/TradingRadar.Tests.csproj" />
+  </Folder>
+</Solution>
