@@ -113,11 +113,9 @@ namespace TradingRadar.Engine
         // For an Ask wall: crossed if best ask moved above P. For a Bid wall: best bid below P.
         private bool QuoteCrossed(BookMirror book, Side side, double price)
         {
-            DepthLevel a;
-            DepthLevel b;
             if (side == Side.Ask)
-                return book.TryBestAsk(out a) && a.Price > price + _tick / 2.0;
-            return book.TryBestBid(out b) && b.Price < price - _tick / 2.0;
+                return book.TryBestAsk(out var a) && a.Price > price + _tick / 2.0;
+            return book.TryBestBid(out var b) && b.Price < price - _tick / 2.0;
         }
 
         private int QuoteTicksAway(BookMirror book, Side side, double price)
