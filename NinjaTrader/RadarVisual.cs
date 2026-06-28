@@ -76,7 +76,7 @@ namespace TradingRadar.NT
             int half = 6;
             if (_bids  != null) for (int i = 0; i < _bids.Count;  i++) { int t = (int)Math.Round(Math.Abs(_bids[i].Price  - _mid) / _tick); if (t > half) half = t; }
             if (_asks  != null) for (int i = 0; i < _asks.Count;  i++) { int t = (int)Math.Round(Math.Abs(_asks[i].Price  - _mid) / _tick); if (t > half) half = t; }
-            if (_nodes != null) for (int i = 0; i < _nodes.Count; i++) { int t = (int)Math.Round(Math.Abs(_nodes[i].Price - _mid) / _tick); if (t > half) half = t; }
+            if (_nodes != null) for (int i = 0; i < _nodes.Count; i++) { if (!Visible(_nodes[i])) continue; int t = (int)Math.Round(Math.Abs(_nodes[i].Price - _mid) / _tick); if (t > half) half = t; }
             if (half > 22) half = 22;
             half += 1;
             int    rows = 2 * half + 1;
@@ -114,10 +114,12 @@ namespace TradingRadar.NT
                     DrawText(dc, _asks[i].Volume.ToString(), barX + barW + 6, y, 13, Mono, AskText, dpi, 1.0);
                 }
 
+            double lastBadgeY = double.NaN;
             if (_nodes != null)
             for (int i = 0; i < _nodes.Count; i++)
             {
                 RadarNode n    = _nodes[i];
+                if (!Visible(n)) continue;
                 double    y    = centerY - ((n.Price - _mid) / _tick) * rowH;
                 if (y < 0 || y > h) continue;
 
@@ -163,11 +165,11 @@ namespace TradingRadar.NT
                 DrawText(dc, n.LastKnownSize.ToString(),
                          barX + barW + 6, y, 13, Mono, isBid ? BidText : AskText, dpi, op);
 
-                // State badge / age tag.
+                // State badge / age tag (deduped: skip if too close to previous badge).
                 string badge = BadgeFor(n.State);
                 if (blind) badge = "· " + Math.Round(n.AgeSeconds) + "s";
-                if (!string.IsNullOrEmpty(badge))
-                    DrawText(dc, badge, w - 70, y, 10, Sans, BadgeBrush(n.State, blind), dpi, op);
+                if (!string.IsNullOrEmpty(badge) && (double.IsNaN(lastBadgeY) || Math.Abs(y - lastBadgeY) >= 12))
+                { DrawText(dc, badge, w - 70, y, 10, Sans, BadgeBrush(n.State, blind), dpi, op); lastBadgeY = y; }
             }
 
             // Inside-market amber line + mid chip (chip covers line so text is readable).
@@ -192,6 +194,11 @@ namespace TradingRadar.NT
                 case NodeState.Consumed: return "BROKE";
                 default:                 return "";
             }
+        }
+
+        private static bool Visible(RadarNode n)
+        {
+            return n.InWindow || n.Confidence >= 0.25;
         }
 
         private static Brush BadgeBrush(NodeState s, bool blind)
