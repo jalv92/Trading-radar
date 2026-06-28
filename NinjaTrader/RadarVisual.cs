@@ -157,9 +157,17 @@ namespace TradingRadar.NT
                 }
                 dc.DrawRoundedRectangle(barBrush, barPen, new Rect(barX, rowTop, barW, rowHt), 3, 3);
 
-                // Price label (left, tabular).
+                // Price-gutter highlight band for live Wall/Absorbed rows.
+                bool wallHighlight = !blind && (n.State == NodeState.Wall || n.State == NodeState.Absorbed);
+                if (wallHighlight)
+                {
+                    var hi = new SolidColorBrush(Color.FromArgb(80, base1.R, base1.G, base1.B));
+                    dc.DrawRoundedRectangle(hi, null, new Rect(0, rowTop, barX, rowHt), 3, 3);
+                }
+
+                // Price label (left, tabular); bright side color on highlighted rows.
                 DrawText(dc, n.Price.ToString("0.00", CultureInfo.InvariantCulture),
-                         4, y, 14, Mono, PriceTxt, dpi, op);
+                         4, y, 14, Mono, wallHighlight ? (isBid ? BidText : AskText) : PriceTxt, dpi, op);
 
                 // Size label (right of bar).
                 DrawText(dc, n.LastKnownSize.ToString(),
