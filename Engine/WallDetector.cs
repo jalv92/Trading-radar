@@ -42,6 +42,9 @@ namespace TradingRadar.Engine
             var map = StateMap(side);
             var samples = SampleList(side);
 
+            // B_time is side-wide and identical across levels; hoist before the loop.
+            long bTime = TemporalMedian(samples, now);
+
             // Record presence set this update.
             var presentNow = new HashSet<long>();
             for (int i = 0; i < levels.Count; i++)
@@ -58,7 +61,7 @@ namespace TradingRadar.Engine
                 st.PresentLastUpdate = true;
 
                 // Persistence: relative + absolute must hold continuously.
-                long b = Baseline(side, levels[i].Price, book, now);
+                long b = Math.Max(book.MedianSizeExcluding(side, levels[i].Price), bTime);
                 bool qualifies = levels[i].Volume >= _cfg.K_mult * b && levels[i].Volume >= _cfg.MinAbsSize;
                 if (qualifies) { if (st.QualifyingSince == null) st.QualifyingSince = now; }
                 else st.QualifyingSince = null;
@@ -113,6 +116,7 @@ namespace TradingRadar.Engine
             if (v.Count == 0) return 0;
             v.Sort();
             int mid = v.Count / 2;
+            // Even count: lower-middle (floor) — conservative baseline a single wall can't inflate.
             return (v.Count % 2 == 1) ? v[mid] : v[mid - 1];
         }
 

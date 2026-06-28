@@ -82,6 +82,38 @@ public class WallDetectorTests
     }
 
     [Fact]
+    public void Flicker_gate_fires_on_rapid_transitions_within_window()
+    {
+        // VolGovernor=0.1 -> T_persist_scaled ~150ms, well inside the 1s flicker window.
+        var cfg = new RadarConfig { F_flicker = 2.0, VolGovernor = 0.1 };
+        var d = new WallDetector(cfg);
+        double px = 20999.50;
+
+        // Alternate present/absent 4 times -> 8 transitions, all within 1s window.
+        for (int i = 0; i < 4; i++)
+        {
+            d.Update(BookWithBidWall(500), T0.AddMilliseconds(i * 50));
+            var absent = new BookMirror(0.25, TimeSpan.FromSeconds(10));
+            absent.ApplyDepth(new DepthEvent { Side = Side.Bid, Op = DepthOp.Add,
+                Position = 0, Price = 21000.00, Volume = 10, Time = T0 });
+            d.Update(absent, T0.AddMilliseconds(i * 50 + 25));
+        }
+
+        // Hold present for 200ms (> scaled T_persist ~150ms).
+        d.Update(BookWithBidWall(500), T0.AddMilliseconds(200));
+        d.Update(BookWithBidWall(500), T0.AddMilliseconds(400)); // 200ms of stability
+
+        // Persistence passes (400ms > 150ms) but recent transitions trip the gate.
+        Assert.False(d.IsConfirmed(Side.Bid, px, BookWithBidWall(500), T0.AddMilliseconds(400)));
+
+        // Sanity: no-flicker stability path still confirms.
+        var d2 = new WallDetector(cfg);
+        d2.Update(BookWithBidWall(500), T0);
+        d2.Update(BookWithBidWall(500), T0.AddMilliseconds(200));
+        Assert.True(d2.IsConfirmed(Side.Bid, px, BookWithBidWall(500), T0.AddMilliseconds(200)));
+    }
+
+    [Fact]
     public void Flicker_above_threshold_rejects_the_wall()
     {
         var cfg = new RadarConfig { F_flicker = 6.0 };
