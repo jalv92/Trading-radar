@@ -70,30 +70,39 @@ namespace TradingRadar.Engine
 
             foreach (var ep in toResolve)
             {
-                _resolved.Enqueue(Classify(ep, book, now));
+                EpisodeResult r;
+                if (TryClassify(ep, book, now, out r)) _resolved.Enqueue(r);
                 _open.Remove(Key(ep.Side, ep.Price));
             }
         }
 
-        private EpisodeResult Classify(Episode ep, BookMirror book, DateTime now)
+        // Returns true only when a real condition fired (spec §6.3). Ambiguous timeouts
+        // (no trades, no cancellation, no cross) produce no outcome — memory is untouched.
+        private bool TryClassify(Episode ep, BookMirror book, DateTime now, out EpisodeResult r)
         {
             long displayed = CurrentVolume(book, ep.Side, ep.Price);
             long drop = Math.Max(0, ep.SizeAtOpen - displayed);
+            // ponytail: trade attribution currently sums over the whole episode lifetime, not within
+            // W_assoc of each size decrease (spec §6.3); W_assoc is reserved and will be wired +
+            // calibrated during Market Replay testing via a debug data-capture path (TODO).
             long traded = book.TradedAt(ep.Price, ep.OpenTime, ConsumingAggressor(ep.Side));
             long cancelled = Math.Max(0, drop - traded);
-            double refillRatio = traded / (double)Math.Max(drop, 1);
 
             Outcome o;
             if (ep.Crossed)
                 o = Outcome.Consumed;
-            else if (traded >= _cfg.A_absorb * ep.SizeAtOpen && refillRatio >= _cfg.RefillRatioTrigger)
+            else if (traded >= _cfg.A_absorb * ep.SizeAtOpen)
                 o = Outcome.Absorbed;
             else if (cancelled > traded && ep.QuoteAwayAtVanish)
                 o = Outcome.Pulled;
             else
-                o = traded >= cancelled ? Outcome.Absorbed : Outcome.Pulled;
+            {
+                r = default(EpisodeResult);
+                return false;   // ambiguous: do not touch memory
+            }
 
-            return new EpisodeResult { Side = ep.Side, Price = ep.Price, Outcome = o, Traded = traded, Cancelled = cancelled, ResolvedAt = now };
+            r = new EpisodeResult { Side = ep.Side, Price = ep.Price, Outcome = o, Traded = traded, Cancelled = cancelled, ResolvedAt = now };
+            return true;
         }
 
         public bool TryTakeResolved(out EpisodeResult r)

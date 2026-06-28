@@ -17,6 +17,9 @@ namespace TradingRadar.Engine
         // Episode / classification
         public int D_approach = 1;              // ticks to open an episode
         public TimeSpan T_episode = TimeSpan.FromMilliseconds(3000);
+        // W_assoc: trade attribution window. Currently reserved — TradedAt sums over the full
+        // episode lifetime; W_assoc will be wired + calibrated during Market Replay testing via
+        // a debug data-capture path (TODO: build that capture path when testing begins; spec §6.3).
         public TimeSpan W_assoc = TimeSpan.FromMilliseconds(250);
         public double A_absorb = 1.0;           // Traded@P / S0 to call absorption
         public double RefillRatioTrigger = 3.0; // iceberg refill threshold

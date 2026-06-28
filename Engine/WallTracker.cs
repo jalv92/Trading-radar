@@ -39,8 +39,7 @@ namespace TradingRadar.Engine
             UpdateSide(book, Side.Ask, now, visible);
 
             // 2) Mark blind every tracked node not in the current visible set.
-            MarkAbsentBlind(book, Side.Bid, visible);
-            MarkAbsentBlind(book, Side.Ask, visible);
+            MarkAbsentBlind(visible);
 
             // 3) Approach detection -> open episodes for tracked, visible walls near the inside.
             OpenApproaching(book, Side.Bid, now);
@@ -73,25 +72,16 @@ namespace TradingRadar.Engine
             }
         }
 
-        private void MarkAbsentBlind(BookMirror book, Side side, HashSet<long> visible)
+        private void MarkAbsentBlind(HashSet<long> visible)
         {
-            // A tracked node whose price is not in the visible set is blind. We can only test
-            // prices the memory knows; iterate the visible book to mark present, blind the rest
-            // via the memory's own knowledge by re-walking known prices is not exposed, so we
-            // rely on MarkBlind being idempotent: any node we did NOT ObserveLive this tick
-            // stays at its prior InWindow. To force-blind, mark blind for every price within the
-            // band that is not visible.
-            // ponytail: band-scan ±MemoryBandTicks; add MemoryMarkBlindExcept(visibleSet) if band grows large.
-            double center = _lastBestBid > 0 && _lastBestAsk > 0 ? (_lastBestBid + _lastBestAsk) / 2.0
-                          : (_lastBestBid > 0 ? _lastBestBid : _lastBestAsk);
-            if (center <= 0) return;
-            int band = _cfg.MemoryBandTicks;
-            for (int t = -band; t <= band; t++)
+            // Iterate every tracked node; blind any whose key is not in the visible set.
+            // This covers price gaps larger than MemoryBandTicks that a band-scan would miss.
+            var tracked = _memory.TrackedLevels();
+            for (int i = 0; i < tracked.Count; i++)
             {
-                double price = RoundToTick(center) + t * _tick;
-                long k = Key(side, price);
-                if (visible.Contains(k)) continue;
-                if (_memory.Contains(side, price)) _memory.MarkBlind(side, price);
+                var kv = tracked[i];
+                if (!visible.Contains(Key(kv.Key, kv.Value)))
+                    _memory.MarkBlind(kv.Key, kv.Value);
             }
         }
 
@@ -130,6 +120,12 @@ namespace TradingRadar.Engine
         public IReadOnlyList<RadarNode> GetSnapshot(DateTime now)
         {
             return _memory.Snapshot(_lastBestBid, _lastBestAsk, now);
+        }
+
+        // Overload for tests and replay tools that need to query with an explicit mid.
+        public IReadOnlyList<RadarNode> GetSnapshot(double bestBid, double bestAsk, DateTime now)
+        {
+            return _memory.Snapshot(bestBid, bestAsk, now);
         }
 
         private long Key(Side s, double price) { return ((long)Math.Round(price / _tick)) * 2 + (s == Side.Ask ? 1 : 0); }

@@ -53,6 +53,7 @@ namespace TradingRadar.Engine
         {
             MemoryNode n;
             if (!_nodes.TryGetValue(Key(side, price), out n)) return;
+            bool wasBlind = !n.InWindow;
             if (n.LastKnownSize > 0)
             {
                 double change = (size - n.LastKnownSize) / (double)n.LastKnownSize;
@@ -63,7 +64,13 @@ namespace TradingRadar.Engine
             if (size > n.PeakSize) n.PeakSize = size;
             n.LastSeen = now;
             n.InWindow = true;
-            if (stillConfirmedWall) { n.TimesConfirmed++; n.Confidence += _cfg.dC_confirm; n.State = NodeState.Wall; }
+            if (stillConfirmedWall)
+            {
+                n.State = NodeState.Wall;
+                // dC_confirm is a discrete revisit event (spec §6.4): only when going blind→live.
+                // A continuously-live wall must not ratchet to 1.0 every tick.
+                if (wasBlind) { n.TimesConfirmed++; n.Confidence += _cfg.dC_confirm; }
+            }
             else n.State = NodeState.Live;
             n.Confidence = Clamp(n.Confidence, 0.0, 1.0);
         }
@@ -123,6 +130,13 @@ namespace TradingRadar.Engine
             double h = ScaledH().TotalSeconds;
             if (h <= 0) return n.Confidence;
             return n.Confidence * Math.Exp(-Math.Log(2.0) / h * dt);
+        }
+
+        public IReadOnlyList<KeyValuePair<Side, double>> TrackedLevels()
+        {
+            var list = new List<KeyValuePair<Side, double>>(_nodes.Count);
+            foreach (var n in _nodes.Values) list.Add(new KeyValuePair<Side, double>(n.Side, n.Price));
+            return list;
         }
 
         public IReadOnlyList<RadarNode> Snapshot(double bestBid, double bestAsk, DateTime now)
