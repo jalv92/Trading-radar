@@ -25,8 +25,11 @@ namespace TradingRadar.NT
         static readonly Pen   AmberLine= FrozenPen(Color.FromArgb(128, 0xff, 0xce, 0x5c), 1);
         static readonly Pen   PullDash = FrozenDash(Color.FromRgb(0x94, 0xa3, 0xb8), 1);
         static readonly Brush Sweep    = FrozenBrush(Color.FromArgb(10,  0xff, 0xff, 0xff));
-        static readonly Brush BidBook  = FrozenBrush(Color.FromArgb(115, 0x34, 0xd3, 0x99));  // ~.45
-        static readonly Brush AskBook  = FrozenBrush(Color.FromArgb(115, 0xfb, 0x71, 0x85));  // ~.45
+        static readonly Brush BidBook      = FrozenBrush(Color.FromArgb(115, 0x34, 0xd3, 0x99));  // ~.45
+        static readonly Brush AskBook      = FrozenBrush(Color.FromArgb(115, 0xfb, 0x71, 0x85));  // ~.45
+        static readonly Brush GridPriceTxt = FrozenBrush(Color.FromArgb(76,  0xff, 0xff, 0xff));  // ~.30
+        static readonly Brush MidChipBg    = FrozenBrush(Color.FromArgb(230, 0x14, 0x18, 0x22));
+        static readonly Pen   MidChipBorder= FrozenPen(Color.FromArgb(89, 0xff, 0xce, 0x5c), 1); // ~.35
         static readonly Typeface Mono  = new Typeface(new FontFamily("Consolas"),
                                              FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
         static readonly Typeface Sans  = new Typeface(new FontFamily("Segoe UI"),
@@ -82,12 +85,12 @@ namespace TradingRadar.NT
             double centerY = h / 2.0;
             double barX    = 64, barMaxW = w - barX - 96;
 
-            // Iso-distance gridlines.
+            // Iso-distance gridlines + price scale labels.
             foreach (int g in new[] { 5, 10, 25 })
             {
                 double yUp = centerY - g * rowH, yDn = centerY + g * rowH;
-                if (yUp > 0) dc.DrawLine(Grid, new Point(0, yUp), new Point(w, yUp));
-                if (yDn < h) dc.DrawLine(Grid, new Point(0, yDn), new Point(w, yDn));
+                if (yUp > 0) { dc.DrawLine(Grid, new Point(0, yUp), new Point(w, yUp)); DrawText(dc, (_mid + g * _tick).ToString("0.00", CultureInfo.InvariantCulture), 4, yUp, 10, Mono, GridPriceTxt, dpi, 1.0); }
+                if (yDn < h) { dc.DrawLine(Grid, new Point(0, yDn), new Point(w, yDn)); DrawText(dc, (_mid - g * _tick).ToString("0.00", CultureInfo.InvariantCulture), 4, yDn, 10, Mono, GridPriceTxt, dpi, 1.0); }
             }
 
             // maxSize spans book levels + wall nodes so bar widths are proportional across both layers.
@@ -105,6 +108,7 @@ namespace TradingRadar.NT
                     double barW   = Math.Max(2.0, (_bids[i].Volume / (double)maxSize) * barMaxW);
                     double rowTop = y - rowH * 0.40, rowHt = rowH * 0.80;
                     dc.DrawRoundedRectangle(BidBook, null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
+                    DrawText(dc, _bids[i].Price.ToString("0.00", CultureInfo.InvariantCulture), 4, y, 11, Mono, PriceTxt, dpi, 1.0);
                     DrawText(dc, _bids[i].Volume.ToString(), barX + barW + 6, y, 11, Mono, BidText, dpi, 1.0);
                 }
             if (_asks != null)
@@ -115,6 +119,7 @@ namespace TradingRadar.NT
                     double barW   = Math.Max(2.0, (_asks[i].Volume / (double)maxSize) * barMaxW);
                     double rowTop = y - rowH * 0.40, rowHt = rowH * 0.80;
                     dc.DrawRoundedRectangle(AskBook, null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
+                    DrawText(dc, _asks[i].Price.ToString("0.00", CultureInfo.InvariantCulture), 4, y, 11, Mono, PriceTxt, dpi, 1.0);
                     DrawText(dc, _asks[i].Volume.ToString(), barX + barW + 6, y, 11, Mono, AskText, dpi, 1.0);
                 }
 
@@ -174,10 +179,15 @@ namespace TradingRadar.NT
                     DrawText(dc, badge, w - 70, y, 10, Sans, BadgeBrush(n.State, blind), dpi, op);
             }
 
-            // Inside-market amber line + mid chip.
+            // Inside-market amber line + mid chip (chip covers line so text is readable).
             dc.DrawLine(AmberLine, new Point(0, centerY), new Point(w, centerY));
-            DrawText(dc, _mid.ToString("0.00", CultureInfo.InvariantCulture),
-                     4, centerY - 1, 12, Mono, AmberTxt, dpi, 1.0);
+            var midFt = new FormattedText(_mid.ToString("0.00", CultureInfo.InvariantCulture),
+                CultureInfo.InvariantCulture, FlowDirection.LeftToRight, Mono, 12, AmberTxt, dpi);
+            const double chipPad = 4.0;
+            double chipW = midFt.Width + chipPad * 2, chipH = midFt.Height + chipPad;
+            double chipX = 2.0, chipY = centerY - chipH / 2.0;
+            dc.DrawRoundedRectangle(MidChipBg, MidChipBorder, new Rect(chipX, chipY, chipW, chipH), 3, 3);
+            dc.DrawText(midFt, new Point(chipX + chipPad, centerY - midFt.Height / 2.0));
 
             // Refresh-pulse sweep: honest data-refresh indicator.
             double sy = _sweep * h;
