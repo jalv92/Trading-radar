@@ -83,14 +83,14 @@ namespace TradingRadar.NT
             int    rows    = 2 * _bandTicks + 1;
             double rowH    = h / rows;
             double centerY = h / 2.0;
-            double barX    = 64, barMaxW = w - barX - 96;
+            double barX    = 88, barMaxW = w - barX - 96;
 
             // Iso-distance gridlines + price scale labels.
             foreach (int g in new[] { 5, 10, 25 })
             {
                 double yUp = centerY - g * rowH, yDn = centerY + g * rowH;
-                if (yUp > 0) { dc.DrawLine(Grid, new Point(0, yUp), new Point(w, yUp)); DrawText(dc, (_mid + g * _tick).ToString("0.00", CultureInfo.InvariantCulture), 4, yUp, 10, Mono, GridPriceTxt, dpi, 1.0); }
-                if (yDn < h) { dc.DrawLine(Grid, new Point(0, yDn), new Point(w, yDn)); DrawText(dc, (_mid - g * _tick).ToString("0.00", CultureInfo.InvariantCulture), 4, yDn, 10, Mono, GridPriceTxt, dpi, 1.0); }
+                if (yUp > 0) { dc.DrawLine(Grid, new Point(0, yUp), new Point(w, yUp)); DrawText(dc, (_mid + g * _tick).ToString("0.00", CultureInfo.InvariantCulture), 4, yUp, 11, Mono, GridPriceTxt, dpi, 1.0); }
+                if (yDn < h) { dc.DrawLine(Grid, new Point(0, yDn), new Point(w, yDn)); DrawText(dc, (_mid - g * _tick).ToString("0.00", CultureInfo.InvariantCulture), 4, yDn, 11, Mono, GridPriceTxt, dpi, 1.0); }
             }
 
             // maxSize spans book levels + wall nodes so bar widths are proportional across both layers.
@@ -108,8 +108,8 @@ namespace TradingRadar.NT
                     double barW   = Math.Max(2.0, (_bids[i].Volume / (double)maxSize) * barMaxW);
                     double rowTop = y - rowH * 0.40, rowHt = rowH * 0.80;
                     dc.DrawRoundedRectangle(BidBook, null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
-                    DrawText(dc, _bids[i].Price.ToString("0.00", CultureInfo.InvariantCulture), 4, y, 11, Mono, PriceTxt, dpi, 1.0);
-                    DrawText(dc, _bids[i].Volume.ToString(), barX + barW + 6, y, 11, Mono, BidText, dpi, 1.0);
+                    DrawText(dc, _bids[i].Price.ToString("0.00", CultureInfo.InvariantCulture), 4, y, 14, Mono, PriceTxt, dpi, 1.0);
+                    DrawText(dc, _bids[i].Volume.ToString(), barX + barW + 6, y, 13, Mono, BidText, dpi, 1.0);
                 }
             if (_asks != null)
                 for (int i = 0; i < _asks.Count; i++)
@@ -119,8 +119,8 @@ namespace TradingRadar.NT
                     double barW   = Math.Max(2.0, (_asks[i].Volume / (double)maxSize) * barMaxW);
                     double rowTop = y - rowH * 0.40, rowHt = rowH * 0.80;
                     dc.DrawRoundedRectangle(AskBook, null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
-                    DrawText(dc, _asks[i].Price.ToString("0.00", CultureInfo.InvariantCulture), 4, y, 11, Mono, PriceTxt, dpi, 1.0);
-                    DrawText(dc, _asks[i].Volume.ToString(), barX + barW + 6, y, 11, Mono, AskText, dpi, 1.0);
+                    DrawText(dc, _asks[i].Price.ToString("0.00", CultureInfo.InvariantCulture), 4, y, 14, Mono, PriceTxt, dpi, 1.0);
+                    DrawText(dc, _asks[i].Volume.ToString(), barX + barW + 6, y, 13, Mono, AskText, dpi, 1.0);
                 }
 
             if (_nodes != null)

@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
 using System.Windows.Threading;
 using System.Xml.Linq;
 using NinjaTrader.Cbi;
@@ -16,7 +18,9 @@ namespace TradingRadar.NT
         // ---- Task 4: frame bundle for the cross-thread handoff ----
         private sealed class Frame
         {
-            public IReadOnlyList<RadarNode> Nodes;
+            public IReadOnlyList<RadarNode>  Nodes;
+            public IReadOnlyList<DepthLevel> Bids;
+            public IReadOnlyList<DepthLevel> Asks;
             public double Mid;
             public double Tick;
         }
@@ -31,9 +35,13 @@ namespace TradingRadar.NT
         private volatile Frame _latest;       // immutable snapshot + mid + tick, swapped from instrument thread
         private DispatcherTimer _paintTimer;
         private bool _subscribed;
+        private int      _depthEvents;
+        private int      _tradeEvents;
+        private DateTime _lastDiag = DateTime.MinValue;
 
         public RadarTab()
         {
+            _cfg.MinAbsSize = 20;   // NQ RTH starting point; tuned live via UI bar
             _book    = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
             _tracker = new WallTracker(_cfg);
             _visual  = new RadarVisual();
@@ -42,8 +50,19 @@ namespace TradingRadar.NT
             _selector.InstrumentChanged += OnSelectorChanged;
 
             DockPanel root = new DockPanel();
-            DockPanel.SetDock(_selector, Dock.Top);
-            root.Children.Add(_selector);
+            // Top bar: instrument selector + live threshold knobs (edit _cfg directly; engine reads live).
+            StackPanel topBar = new StackPanel { Orientation = Orientation.Horizontal,
+                Background = new SolidColorBrush(Color.FromRgb(0x0f, 0x14, 0x20)) };
+            topBar.Children.Add(_selector);
+            topBar.Children.Add(MakeCfgInput("MinSize", _cfg.MinAbsSize.ToString(),
+                v => _cfg.MinAbsSize = (long)v));
+            topBar.Children.Add(MakeCfgInput("K×", _cfg.K_mult.ToString("0.#"),
+                v => _cfg.K_mult = v));
+            topBar.Children.Add(MakeCfgInput("Persist(ms)",
+                ((long)_cfg.T_persist.TotalMilliseconds).ToString(),
+                v => _cfg.T_persist = TimeSpan.FromMilliseconds(v)));
+            DockPanel.SetDock(topBar, Dock.Top);
+            root.Children.Add(topBar);
             root.Children.Add(_visual);          // fills remaining space
             Content = root;
 
@@ -55,7 +74,7 @@ namespace TradingRadar.NT
             _paintTimer.Tick += (o, e) =>
             {
                 Frame f = _latest;          // volatile read of the latest immutable frame
-                if (f != null) _visual.SetNodes(f.Nodes, f.Mid, f.Tick);
+                if (f != null) _visual.SetFrame(f.Nodes, f.Bids, f.Asks, f.Mid, f.Tick);
                 _visual.AdvanceAnimation(); // sweep/fade clock
             };
             _paintTimer.Start();
@@ -156,7 +175,16 @@ namespace TradingRadar.NT
             };
             _book.ApplyDepth(de);
             _tracker.Update(_book, e.Time);
-            _latest = new Frame { Nodes = _tracker.GetSnapshot(e.Time), Mid = MidOf(), Tick = _cfg.TickSize };
+            _depthEvents++;
+            _latest = new Frame
+            {
+                Nodes = _tracker.GetSnapshot(e.Time),
+                Bids  = new List<DepthLevel>(_book.Levels(Side.Bid)),
+                Asks  = new List<DepthLevel>(_book.Levels(Side.Ask)),
+                Mid   = MidOf(),
+                Tick  = _cfg.TickSize
+            };
+            MaybeDiag(e.Time);
         }
 
         private void OnMarketData(object sender, MarketDataEventArgs e)
@@ -165,7 +193,56 @@ namespace TradingRadar.NT
             TradeEvent te = new TradeEvent { Price = e.Price, Volume = e.Volume, Time = e.Time };
             _book.ApplyTrade(te);
             _tracker.Update(_book, e.Time);
-            _latest = new Frame { Nodes = _tracker.GetSnapshot(e.Time), Mid = MidOf(), Tick = _cfg.TickSize };
+            _tradeEvents++;
+            _latest = new Frame
+            {
+                Nodes = _tracker.GetSnapshot(e.Time),
+                Bids  = new List<DepthLevel>(_book.Levels(Side.Bid)),
+                Asks  = new List<DepthLevel>(_book.Levels(Side.Ask)),
+                Mid   = MidOf(),
+                Tick  = _cfg.TickSize
+            };
+            MaybeDiag(e.Time);
+        }
+
+        private void MaybeDiag(DateTime now)
+        {
+            if (_lastDiag != DateTime.MinValue && (now - _lastDiag).TotalSeconds < 2) return;
+            _lastDiag = now;
+            var bids = _book.Levels(Side.Bid); var asks = _book.Levels(Side.Ask);
+            long maxB = 0, maxA = 0;
+            for (int i = 0; i < bids.Count; i++) if (bids[i].Volume > maxB) maxB = bids[i].Volume;
+            for (int i = 0; i < asks.Count; i++) if (asks[i].Volume > maxA) maxA = asks[i].Volume;
+            int nodes = _latest != null && _latest.Nodes != null ? _latest.Nodes.Count : 0;
+            string msg = string.Format(
+                "[Radar] {0:HH:mm:ss} depth#={1} trade#={2} | bids={3} asks={4} | maxBid={5} maxAsk={6}" +
+                " medBid={7} medAsk={8} | MinAbs={9} Kx={10} nodes={11}",
+                now, _depthEvents, _tradeEvents, bids.Count, asks.Count, maxB, maxA,
+                _book.MedianSize(Side.Bid), _book.MedianSize(Side.Ask),
+                _cfg.MinAbsSize, _cfg.K_mult, nodes);
+            NinjaTrader.Code.Output.Process(msg, NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+        }
+
+        // Aurora-styled label+TextBox pair; assigns to a _cfg field on Enter/LostFocus.
+        private static UIElement MakeCfgInput(string label, string init, Action<double> apply)
+        {
+            var lbl = new TextBlock { Text = label + ":",
+                Margin = new Thickness(8, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center,
+                FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
+                Foreground = new SolidColorBrush(Color.FromRgb(0x9a, 0xa4, 0xb2)) };
+            var box = new TextBox { Text = init, Width = 50,
+                Background  = new SolidColorBrush(Color.FromRgb(0x0f, 0x14, 0x20)),
+                Foreground  = new SolidColorBrush(Color.FromRgb(0xcf, 0xd6, 0xe2)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(30, 0xff, 0xff, 0xff)),
+                VerticalContentAlignment = VerticalAlignment.Center,
+                Padding = new Thickness(3, 1, 3, 1) };
+            Action commit = () => { if (double.TryParse(box.Text, out double v)) apply(v); };
+            box.LostFocus += (o, e) => commit();
+            box.KeyDown   += (o, e) => { if (e.Key == Key.Enter) commit(); };
+            var sp = new StackPanel { Orientation = Orientation.Horizontal,
+                Margin = new Thickness(4, 2, 4, 2), VerticalAlignment = VerticalAlignment.Center };
+            sp.Children.Add(lbl); sp.Children.Add(box);
+            return sp;
         }
 
         // ---- NTTabPage members ----
