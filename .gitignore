@@ -480,3 +480,6 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# nt8c staging mirror (local build scratch)
+build/.stage/
