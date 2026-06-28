@@ -24,6 +24,7 @@ namespace TradingRadar.NT
         static readonly Pen   Grid     = FrozenPen(Color.FromArgb(16, 0xff, 0xff, 0xff), 1);
         static readonly Pen   AmberLine= FrozenPen(Color.FromArgb(128, 0xff, 0xce, 0x5c), 1);
         static readonly Pen   PullDash = FrozenDash(Color.FromRgb(0x94, 0xa3, 0xb8), 1);
+        static readonly Brush Sweep    = FrozenBrush(Color.FromArgb(10, 0xff, 0xff, 0xff));
         static readonly Typeface Mono  = new Typeface(new FontFamily("Consolas"),
                                              FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
         static readonly Typeface Sans  = new Typeface(new FontFamily("Segoe UI"),
@@ -150,8 +151,7 @@ namespace TradingRadar.NT
 
             // Refresh-pulse sweep: honest data-refresh indicator.
             double sy = _sweep * h;
-            dc.DrawRectangle(new SolidColorBrush(Color.FromArgb(10, 0xff, 0xff, 0xff)),
-                             null, new Rect(0, sy, w, 2));
+            dc.DrawRectangle(Sweep, null, new Rect(0, sy, w, 2));
         }
 
         // ---- helpers ----
