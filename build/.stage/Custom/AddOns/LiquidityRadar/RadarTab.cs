@@ -16,9 +16,7 @@ namespace TradingRadar.NT
         // ---- Task 4: frame bundle for the cross-thread handoff ----
         private sealed class Frame
         {
-            public IReadOnlyList<RadarNode>  Nodes;
-            public IReadOnlyList<DepthLevel> Bids;
-            public IReadOnlyList<DepthLevel> Asks;
+            public IReadOnlyList<RadarNode> Nodes;
             public double Mid;
             public double Tick;
         }
@@ -33,9 +31,6 @@ namespace TradingRadar.NT
         private volatile Frame _latest;       // immutable snapshot + mid + tick, swapped from instrument thread
         private DispatcherTimer _paintTimer;
         private bool _subscribed;
-        private int      _depthEvents;
-        private int      _tradeEvents;
-        private DateTime _lastDiag = DateTime.MinValue;
 
         public RadarTab()
         {
