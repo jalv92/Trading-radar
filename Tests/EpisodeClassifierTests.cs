@@ -31,6 +31,8 @@ public class EpisodeClassifierTests
         c.Update(book, T0.AddSeconds(4)); // timeout resolves
         Assert.True(c.TryTakeResolved(out var r));
         Assert.Equal(Outcome.Absorbed, r.Outcome);
+        Assert.True(r.Traded >= 200);   // 5 × 120 = 600 ≥ A_absorb·S0; iceberg refill
+        Assert.Equal(0L, r.Cancelled);  // displayed_drop = 0; nothing cancelled
     }
 
     [Fact]
@@ -45,7 +47,8 @@ public class EpisodeClassifierTests
         c.Update(book, T0.AddMilliseconds(400));
         Assert.True(c.TryTakeResolved(out var r));
         Assert.Equal(Outcome.Pulled, r.Outcome);
-        Assert.True(r.Cancelled > r.Traded);
+        Assert.Equal(0L, r.Traded);            // no prints at the wall
+        Assert.True(r.Cancelled > r.Traded);   // all drop was cancellation
     }
 
     [Fact]
@@ -75,5 +78,29 @@ public class EpisodeClassifierTests
         Assert.True(c.HasOpenEpisode(Side.Ask, 21000.50));
         c.OnApproach(Side.Ask, 21000.50, 999, T0.AddMilliseconds(10)); // ignored
         Assert.True(c.HasOpenEpisode(Side.Ask, 21000.50));
+    }
+
+    [Fact]
+    public void Absorbed_bid_wall_when_sell_aggressors_explain_drop()
+    {
+        // Exercises ConsumingAggressor(Bid→Side.Bid), QuoteCrossed Bid branch, QuoteTicksAway Bid branch.
+        // If ConsumingAggressor(Bid) were inverted to Side.Ask, traded=0 → resolves PULLED → fails.
+        var cfg = new RadarConfig();
+        var c = new EpisodeClassifier(cfg);
+        var book = new BookMirror(0.25, TimeSpan.FromSeconds(30));
+        book.ApplyDepth(new DepthEvent { Side = Side.Ask, Op = DepthOp.Add, Position = 0, Price = 21000.25, Volume = 20, Time = T0 });
+        book.ApplyDepth(new DepthEvent { Side = Side.Bid, Op = DepthOp.Add, Position = 0, Price = 21000.00, Volume = 200, Time = T0 });
+        c.OnApproach(Side.Bid, 21000.00, 200, T0);
+        // Sell aggressors hit the bid wall (Last <= best bid → Side.Bid aggressor in BookMirror).
+        for (int i = 1; i <= 5; i++)
+            book.ApplyTrade(new TradeEvent { Price = 21000.00, Volume = 120, Time = T0.AddMilliseconds(i * 100) });
+        // Level refills; price holds at bid.
+        book.ApplyDepth(new DepthEvent { Side = Side.Bid, Op = DepthOp.Update, Position = 0, Price = 21000.00, Volume = 200, Time = T0.AddMilliseconds(600) });
+        c.Update(book, T0.AddMilliseconds(700));
+        c.Update(book, T0.AddSeconds(4)); // timeout resolves
+        Assert.True(c.TryTakeResolved(out var r));
+        Assert.Equal(Outcome.Absorbed, r.Outcome);
+        Assert.True(r.Traded >= 200);   // sell aggressors counted via ConsumingAggressor(Bid)
+        Assert.Equal(0L, r.Cancelled);
     }
 }
