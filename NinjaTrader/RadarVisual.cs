@@ -43,6 +43,8 @@ namespace TradingRadar.NT
             BgGrad = gb;
         }
 
+        public RadarVisual() { ClipToBounds = true; }
+
         private IReadOnlyList<RadarNode>  _nodes;
         private IReadOnlyList<DepthLevel> _bids;
         private IReadOnlyList<DepthLevel> _asks;
@@ -93,7 +95,7 @@ namespace TradingRadar.NT
                 for (int i = 0; i < _bids.Count; i++)
                 {
                     double y = centerY - ((_bids[i].Price - _mid) / _tick) * rowH;
-                    if (y < -rowH || y > h + rowH) continue;
+                    if (y < 0 || y > h) continue;
                     double barW   = Math.Max(2.0, (_bids[i].Volume / (double)maxSize) * barMaxW);
                     double rowTop = y - rowH * 0.35, rowHt = rowH * 0.70;
                     dc.DrawRoundedRectangle(BidBook, null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
@@ -104,7 +106,7 @@ namespace TradingRadar.NT
                 for (int i = 0; i < _asks.Count; i++)
                 {
                     double y = centerY - ((_asks[i].Price - _mid) / _tick) * rowH;
-                    if (y < -rowH || y > h + rowH) continue;
+                    if (y < 0 || y > h) continue;
                     double barW   = Math.Max(2.0, (_asks[i].Volume / (double)maxSize) * barMaxW);
                     double rowTop = y - rowH * 0.35, rowHt = rowH * 0.70;
                     dc.DrawRoundedRectangle(AskBook, null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
@@ -117,7 +119,7 @@ namespace TradingRadar.NT
             {
                 RadarNode n    = _nodes[i];
                 double    y    = centerY - ((n.Price - _mid) / _tick) * rowH;
-                if (y < -rowH || y > h + rowH) continue;
+                if (y < 0 || y > h) continue;
 
                 bool blind  = !n.InWindow || n.State == NodeState.Remembered;
                 bool isBid  = n.Side == Side.Bid;
