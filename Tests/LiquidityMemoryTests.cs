@@ -1,0 +1,103 @@
+using System;
+using System.Linq;
+using TradingRadar.Engine;
+using Xunit;
+
+public class LiquidityMemoryTests
+{
+    static readonly DateTime T0 = new DateTime(2026, 6, 28, 9, 30, 0, DateTimeKind.Utc);
+
+    static RadarNode NodeAt(System.Collections.Generic.IReadOnlyList<RadarNode> s, double price)
+        => s.First(n => Math.Abs(n.Price - price) < 0.01);
+
+    [Fact]
+    public void Promote_sets_C0_in_band_and_wall_state()
+    {
+        var m = new LiquidityMemory(new RadarConfig());
+        m.Promote(Side.Bid, 21000.00, size: 500, baseline: 11, now: T0); // size/B=45.5, K=4 -> 0.4+0.1*41.5 clamps to 0.8
+        var s = m.Snapshot(21000.00, 21000.25, T0);
+        var n = NodeAt(s, 21000.00);
+        Assert.Equal(NodeState.Wall, n.State);
+        Assert.InRange(n.Confidence, 0.4, 0.8);
+        Assert.True(n.InWindow);
+        Assert.Equal(500, n.LastKnownSize);
+    }
+
+    [Fact]
+    public void Confidence_decays_by_half_after_one_half_life_while_blind()
+    {
+        var cfg = new RadarConfig { H = TimeSpan.FromSeconds(30) };
+        var m = new LiquidityMemory(cfg);
+        m.Promote(Side.Bid, 21000.00, 500, 11, T0); // C0 = 0.8
+        m.MarkBlind(Side.Bid, 21000.00);
+        var s = m.Snapshot(21000.00, 21000.25, T0.AddSeconds(30)); // one half-life
+        var n = NodeAt(s, 21000.00);
+        Assert.False(n.InWindow);
+        Assert.Equal(NodeState.Remembered, n.State);
+        Assert.InRange(n.Confidence, 0.38, 0.42); // ~0.4
+        Assert.InRange(n.AgeSeconds, 29.9, 30.1);
+    }
+
+    [Fact]
+    public void Live_node_does_not_decay()
+    {
+        var m = new LiquidityMemory(new RadarConfig());
+        m.Promote(Side.Bid, 21000.00, 500, 11, T0);
+        double c0 = NodeAt(m.Snapshot(21000.00, 21000.25, T0), 21000.00).Confidence;
+        // still live 60s later (kept observed)
+        m.ObserveLive(Side.Bid, 21000.00, 500, true, T0.AddSeconds(60));
+        double c1 = NodeAt(m.Snapshot(21000.00, 21000.25, T0.AddSeconds(60)), 21000.00).Confidence;
+        Assert.True(c1 >= c0); // confirmed raised it, never decayed
+    }
+
+    [Fact]
+    public void Absorbed_outcome_raises_confidence()
+    {
+        var cfg = new RadarConfig();
+        var m = new LiquidityMemory(cfg);
+        m.Promote(Side.Ask, 21000.50, 200, 20, T0); // C0 ~ 0.4+0.1*(10-4)=clamp .8
+        double before = NodeAt(m.Snapshot(21000.25, 21000.50, T0), 21000.50).Confidence;
+        m.ApplyOutcome(new EpisodeResult { Side = Side.Ask, Price = 21000.50, Outcome = Outcome.Absorbed, Traded = 600, Cancelled = 0, ResolvedAt = T0.AddSeconds(1) }, T0.AddSeconds(1));
+        var n = NodeAt(m.Snapshot(21000.25, 21000.50, T0.AddSeconds(1)), 21000.50);
+        Assert.Equal(NodeState.Absorbed, n.State);
+        Assert.True(n.Confidence >= before);
+    }
+
+    [Fact]
+    public void Pulled_outcome_collapses_confidence_and_flags_phantom()
+    {
+        var cfg = new RadarConfig { PullPenalty = 0.2 };
+        var m = new LiquidityMemory(cfg);
+        m.Promote(Side.Ask, 21000.50, 200, 20, T0);
+        m.ApplyOutcome(new EpisodeResult { Side = Side.Ask, Price = 21000.50, Outcome = Outcome.Pulled, Traded = 0, Cancelled = 200, ResolvedAt = T0.AddSeconds(1) }, T0.AddSeconds(1));
+        var n = NodeAt(m.Snapshot(21000.25, 21000.50, T0.AddSeconds(1)), 21000.50);
+        Assert.Equal(NodeState.Pulled, n.State);
+        Assert.True(n.Confidence < 0.4);
+    }
+
+    [Fact]
+    public void Node_dies_after_P_max_pulls()
+    {
+        var cfg = new RadarConfig { P_max = 2 };
+        var m = new LiquidityMemory(cfg);
+        m.Promote(Side.Ask, 21000.50, 200, 20, T0);
+        m.ApplyOutcome(new EpisodeResult { Side = Side.Ask, Price = 21000.50, Outcome = Outcome.Pulled, ResolvedAt = T0 }, T0);
+        m.ApplyOutcome(new EpisodeResult { Side = Side.Ask, Price = 21000.50, Outcome = Outcome.Pulled, ResolvedAt = T0.AddSeconds(1) }, T0.AddSeconds(1));
+        m.Evict(T0.AddSeconds(1));
+        Assert.False(m.Contains(Side.Ask, 21000.50));
+    }
+
+    [Fact]
+    public void Snapshot_excludes_nodes_outside_the_memory_band()
+    {
+        var cfg = new RadarConfig { MemoryBandTicks = 25, TickSize = 0.25 }; // band = 6.25 price units
+        var m = new LiquidityMemory(cfg);
+        m.Promote(Side.Bid, 21000.00, 500, 11, T0);   // inside band
+        m.MarkBlind(Side.Bid, 21000.00);
+        m.Promote(Side.Bid, 20990.00, 500, 11, T0);   // 40 ticks away -> outside
+        m.MarkBlind(Side.Bid, 20990.00);
+        var s = m.Snapshot(21000.00, 21000.25, T0);
+        Assert.Contains(s, n => Math.Abs(n.Price - 21000.00) < 0.01);
+        Assert.DoesNotContain(s, n => Math.Abs(n.Price - 20990.00) < 0.01);
+    }
+}
