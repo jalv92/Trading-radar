@@ -34,3 +34,28 @@ Across a full day, the classifier essentially never produced PULLED or CONSUMED.
 
 ## W_assoc note
 Trade attribution still sums over the whole episode (not windowed). Despite that, Absorbed already yields a real 65–77% edge — wiring W_assoc may sharpen it but is not blocking.
+
+---
+
+## Multi-day update (6/22 + 6/24 — two full RTH days, 918 absorbed events)
+
+Cross-day consistency is the real test (one day could be luck):
+
+| Day | walls | absorbed | hold@15s | hold@30s | hold@60s | big≥100 @30 | small<100 @30 |
+|---|---|---|---|---|---|---|---|
+| 6/22 | 1361 | 333 | 77% | 69% | 65% | 75% | 66% |
+| 6/24 | 2560 | 585 | 67% | 61% | 56% | 71% | 59% |
+| **Combined** | 3921 | **918** | — | **64%** | — | **~73%** | **~62%** |
+
+**Verdict: the Absorbed edge is REPRODUCIBLE.** Both independent days clearly beat 50% (64% combined @30s). The **size filter holds on BOTH days**: walls ≥100 → ~71-75% vs small ~59-66%. → lock `prioritize walls ≥100`.
+
+**Honest scope:** the edge is SHORT-TERM — strongest at 15s (67-77%), decays toward 56-65% by 60s. So Absorbed = "this level likely holds for the next ~15-30s" → a timing/scalp confluence signal, not a position-trade signal. 6/24 was a weaker regime than 6/22 (61 vs 69%); real but regime-dependent.
+
+**Pulled/Consumed across 2 full days: 0 Pulled, 6 Consumed.** Structurally near-zero on ES inside walls → either genuine (deep books absorb, don't get pulled/consumed at the inside) or the classifier conditions are too strict. Cannot calibrate; requires a classifier-logic review and/or a deliberately trending (Consumed) / spoofy (Pulled) session.
+
+**6/23 was empty NOT due to a bug:** that replay day had median book size = 0 all day → it only carried Level-1 (price), no L2 depth volumes. So "nothing shows" = that day's replay lacks recorded depth. Recognise it: if the book bars show no sizes / medBid=medAsk=0 in the diag, that session has no L2.
+
+## Calibrated defaults (locked from 2 days)
+- Auto MinSize (1.8×median), K×=1.5, Persist=1000 → **good, keep.**
+- Quality filter for acting: **wall peak ≥ 100 (≈3× median)** raises hold ~10pts.
+- Treat Absorbed as a ~15-30s confluence signal at a chart level, small size, tight stop.
