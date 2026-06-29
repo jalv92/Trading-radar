@@ -170,6 +170,32 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _halted = false;
             }
 
+            // ── dead-man's switch: protect open position even when halted/gated ─
+            // Runs before all gates so a naked position can never be left unguarded.
+            if (_ph == PH_TRADE && !_exitSent && !_tradeClosed
+                && Position.MarketPosition != MarketPosition.Flat)
+            {
+                bool dmsLong = Position.MarketPosition == MarketPosition.Long;
+                if (_so == null || Order.IsTerminalState(_so.OrderState))
+                {
+                    double stopPx = dmsLong
+                        ? _wallPx - (StopTks - 1) * TickSize
+                        : _wallPx + (StopTks - 1) * TickSize;
+                    _so = dmsLong
+                        ? ExitLongStopMarket (0, true, Position.Quantity, stopPx, "Stop",   "AbsLong")
+                        : ExitShortStopMarket(0, true, Position.Quantity, stopPx, "Stop",   "AbsShort");
+                }
+                if (_to == null || Order.IsTerminalState(_to.OrderState))
+                {
+                    double tgtPx = dmsLong
+                        ? _eFx + TgtTks * TickSize
+                        : _eFx - TgtTks * TickSize;
+                    _to = dmsLong
+                        ? ExitLongLimit (0, true, Position.Quantity, tgtPx, "Target", "AbsLong")
+                        : ExitShortLimit(0, true, Position.Quantity, tgtPx, "Target", "AbsShort");
+                }
+            }
+
             // ── global gates ─────────────────────────────────────────────────
             if (_halted || _dTrade >= DayMaxTrade) return;
             int tod = ToTime(Time[0]);
@@ -346,7 +372,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             Order o = execution.Order;
 
             // ── entry filled ──────────────────────────────────────────────────
-            if (_eo != null && o == _eo && o.OrderState == OrderState.Filled)
+            // Accept PartFilled too; bracket is (re-)submitted on each fill. Final Filled clears _eo.
+            if (_eo != null && o == _eo
+                && (o.OrderState == OrderState.Filled || o.OrderState == OrderState.PartFilled))
             {
                 _eFx = o.AverageFillPrice; _eFt = time;
                 _mfe = 0; _mae = 0; _beReached = false;
