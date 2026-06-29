@@ -128,3 +128,12 @@ If the apparent edge were just ES drift, SIGNAL ≈ OPPOSITE (~50/50). Instead s
 Caveats still open (do NOT skip): 2s-mid undersampling (affects both arms ~equally, so the *difference* is robust; absolute win-rate may be optimistic), replay≠live fills/latency, in-sample-ish (2 days). The stop-entry-beyond-the-wall design addresses the adverse-selection fill problem.
 
 **Updated verdict: green-light BUILD FOR REPLAY-SIM.** The directional edge is real; the open question is now purely whether it survives real fills + slippage + live latency — which is exactly what the Replay-sim measures. Risk-manager veto before any live money stands.
+
+---
+
+## Session-2 sim trades (6/22, a TREND/down day — worst case)
+4 signals, all LONG (no shorts: one-way down day → no ask-wall absorptions to fade). Faded descending supports into the crash → ran over. Totals: BE-on **−9t**, BE-off **−16t** over 4 trades. BE saved 7t on the one trade that reached +3 then reversed (−1 vs −8) → keep BE.
+- **Not a verdict on edge** — a trend day is the strategy's worst regime; it's a RANGE/mean-reversion fade. Need chop/range-day captures for a fair test.
+- **KNOWN BUG (next session):** exitReason mislabeled "Flat" on stop-outs (the OnPositionUpdate backstop is catching closes instead of the primary Stop/TP path; P&L correct, reason wrong). Fix: ensure the `_so`/`_to` exit-order match fires reliably (likely the dead-man's-switch resubmits `_so` so the original ref goes stale → re-point `_so` when re-armed).
+- Confirmed working: entry stop-side validation (no more rejects), guaranteed stop+target, dead-man's switch, per-trade logging, optional-BE param.
+- NEXT: capture ≥3 RANGE/chop ES days + ≥1 trend day, run BE-on & BE-off, then analyze expectancy vs the gates (exp≥+1t, PF≥1.3, signal−baseline≥+0.75t OOS) → risk-manager.
