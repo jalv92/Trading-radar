@@ -72,11 +72,10 @@ namespace TradingRadar.NT
 
             if (_mid <= 0) return;
 
-            // Auto-fit band to actual book + node extent so data fills the screen.
+            // Auto-fit band to live book only; off-screen remembered nodes use edge markers.
             int half = 6;
             if (_bids  != null) for (int i = 0; i < _bids.Count;  i++) { int t = (int)Math.Round(Math.Abs(_bids[i].Price  - _mid) / _tick); if (t > half) half = t; }
             if (_asks  != null) for (int i = 0; i < _asks.Count;  i++) { int t = (int)Math.Round(Math.Abs(_asks[i].Price  - _mid) / _tick); if (t > half) half = t; }
-            if (_nodes != null) for (int i = 0; i < _nodes.Count; i++) { if (!Visible(_nodes[i])) continue; int t = (int)Math.Round(Math.Abs(_nodes[i].Price - _mid) / _tick); if (t > half) half = t; }
             if (half > 22) half = 22;
             half += 1;
             int    rows = 2 * half + 1;
@@ -188,6 +187,42 @@ namespace TradingRadar.NT
             double chipY = centerY - chipH / 2.0;
             dc.DrawRoundedRectangle(MidChipBg, MidChipBorder, new Rect(2, chipY, chipW, chipH), 3, 3);
             dc.DrawText(midFt, new Point(7, centerY - midFt.Height / 2.0));
+
+            // Edge markers for Visible nodes whose row is off-screen (remembered walls outside the live band).
+            if (_nodes != null)
+            {
+                var above = new List<RadarNode>();
+                var below = new List<RadarNode>();
+                for (int i = 0; i < _nodes.Count; i++)
+                {
+                    if (!Visible(_nodes[i])) continue;
+                    double ny = centerY - ((_nodes[i].Price - _mid) / _tick) * rowH;
+                    if      (ny < 0) above.Add(_nodes[i]);
+                    else if (ny > h) below.Add(_nodes[i]);
+                }
+                // Above: ascending price = index 0 is nearest to the top edge.
+                above.Sort((a, b) => a.Price.CompareTo(b.Price));
+                for (int i = 0; i < above.Count && i < 3; i++)
+                {
+                    RadarNode n = above[i];
+                    string txt = "↑ " + n.Price.ToString("0.00", CultureInfo.InvariantCulture) +
+                                 "  " + n.LastKnownSize + "  ·" + (int)Math.Round(n.AgeSeconds) + "s";
+                    DrawText(dc, txt, 4, 10 + i * 14, 11, Mono, n.Side == Side.Bid ? BidText : AskText, dpi, 0.8);
+                }
+                if (above.Count > 3)
+                    DrawText(dc, "+" + (above.Count - 3), 4, 10 + 3 * 14, 11, Sans, PriceTxt, dpi, 0.6);
+                // Below: descending price = index 0 is nearest to the bottom edge.
+                below.Sort((a, b) => b.Price.CompareTo(a.Price));
+                for (int i = 0; i < below.Count && i < 3; i++)
+                {
+                    RadarNode n = below[i];
+                    string txt = "↓ " + n.Price.ToString("0.00", CultureInfo.InvariantCulture) +
+                                 "  " + n.LastKnownSize + "  ·" + (int)Math.Round(n.AgeSeconds) + "s";
+                    DrawText(dc, txt, 4, h - 10 - i * 14, 11, Mono, n.Side == Side.Bid ? BidText : AskText, dpi, 0.8);
+                }
+                if (below.Count > 3)
+                    DrawText(dc, "+" + (below.Count - 3), 4, h - 10 - 3 * 14, 11, Sans, PriceTxt, dpi, 0.6);
+            }
 
         }
 

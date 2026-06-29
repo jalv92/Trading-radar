@@ -40,6 +40,12 @@ namespace TradingRadar.NT
         private DateTime _lastDiag      = DateTime.MinValue;
         private DateTime _lastEngineRun = DateTime.MinValue;
         private const double EngineIntervalMs = 50;   // run engine+snapshot at most ~20Hz
+        private volatile bool _autoCalib;
+        private double _medianEwma;
+        private double _autoFactor = 1.8;
+        private const double EwmaAlpha = 0.0017;      // ~60s smoothing at ~20Hz engine runs
+        private TextBox  _minSizeBox;
+        private CheckBox _autoChk;
 
         public RadarTab()
         {
@@ -56,8 +62,37 @@ namespace TradingRadar.NT
             StackPanel topBar = new StackPanel { Orientation = Orientation.Horizontal,
                 Background = new SolidColorBrush(Color.FromRgb(0x0f, 0x14, 0x20)) };
             topBar.Children.Add(_selector);
-            topBar.Children.Add(MakeCfgInput("MinSize", _cfg.MinAbsSize.ToString(),
-                v => _cfg.MinAbsSize = (long)v));
+            // MinSize input — keep ref for Auto mode to update/dim it.
+            {
+                var lbl = new TextBlock { Text = "MinSize:",
+                    Margin = new Thickness(8, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center,
+                    FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
+                    Foreground = new SolidColorBrush(Color.FromRgb(0x9a, 0xa4, 0xb2)) };
+                _minSizeBox = new TextBox { Text = _cfg.MinAbsSize.ToString(), Width = 50,
+                    Background  = new SolidColorBrush(Color.FromRgb(0x0f, 0x14, 0x20)),
+                    Foreground  = new SolidColorBrush(Color.FromRgb(0xcf, 0xd6, 0xe2)),
+                    BorderBrush = new SolidColorBrush(Color.FromArgb(30, 0xff, 0xff, 0xff)),
+                    VerticalContentAlignment = VerticalAlignment.Center,
+                    Padding = new Thickness(3, 1, 3, 1) };
+                Action commitMin = () => { if (double.TryParse(_minSizeBox.Text, out double v)) _cfg.MinAbsSize = (long)v; };
+                _minSizeBox.LostFocus += (o, e) => commitMin();
+                _minSizeBox.KeyDown   += (o, e) => { if (e.Key == Key.Enter) commitMin(); };
+                var sp = new StackPanel { Orientation = Orientation.Horizontal,
+                    Margin = new Thickness(4, 2, 4, 2), VerticalAlignment = VerticalAlignment.Center };
+                sp.Children.Add(lbl); sp.Children.Add(_minSizeBox);
+                topBar.Children.Add(sp);
+            }
+            // Auto-calibration toggle + factor multiplier.
+            _autoChk = new CheckBox { Content = "Auto",
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(8, 0, 2, 0),
+                Foreground = new SolidColorBrush(Color.FromRgb(0xcf, 0xd6, 0xe2)),
+                FontFamily = new FontFamily("Segoe UI"), FontSize = 11 };
+            _autoChk.Checked   += (o, e) => _autoCalib = true;
+            _autoChk.Unchecked += (o, e) => _autoCalib = false;
+            topBar.Children.Add(_autoChk);
+            topBar.Children.Add(MakeCfgInput("×", _autoFactor.ToString("0.#"),
+                v => _autoFactor = v));
             topBar.Children.Add(MakeCfgInput("K×", _cfg.K_mult.ToString("0.#"),
                 v => _cfg.K_mult = v));
             topBar.Children.Add(MakeCfgInput("Persist(ms)",
@@ -78,6 +113,21 @@ namespace TradingRadar.NT
                 Frame f = _latest;          // volatile read of the latest immutable frame
                 if (f != null) _visual.SetFrame(f.Nodes, f.Bids, f.Asks, f.Mid, f.Tick);
                 _visual.AdvanceAnimation(); // sweep/fade clock
+                if (_minSizeBox != null)
+                {
+                    if (_autoCalib)
+                    {
+                        _minSizeBox.IsReadOnly = true;
+                        _minSizeBox.Foreground = new SolidColorBrush(Color.FromRgb(0x8a, 0x93, 0xa3));
+                        string t = _cfg.MinAbsSize.ToString();
+                        if (_minSizeBox.Text != t) _minSizeBox.Text = t;
+                    }
+                    else
+                    {
+                        _minSizeBox.IsReadOnly = false;
+                        _minSizeBox.Foreground = new SolidColorBrush(Color.FromRgb(0xcf, 0xd6, 0xe2));
+                    }
+                }
             };
             _paintTimer.Start();
         }
@@ -195,6 +245,10 @@ namespace TradingRadar.NT
                 return;
             _lastEngineRun = now;
             _tracker.Update(_book, now);
+            double m = (_book.MedianSize(Side.Bid) + _book.MedianSize(Side.Ask)) / 2.0;
+            if (m > 0) _medianEwma = _medianEwma <= 0 ? m : EwmaAlpha * m + (1 - EwmaAlpha) * _medianEwma;
+            if (_autoCalib && _medianEwma > 0)
+                _cfg.MinAbsSize = Math.Max(1, (long)Math.Round(_autoFactor * _medianEwma));
             _latest = new Frame
             {
                 Nodes = _tracker.GetSnapshot(now),
