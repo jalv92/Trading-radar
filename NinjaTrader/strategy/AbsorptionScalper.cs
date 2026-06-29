@@ -326,7 +326,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             int quantity, int filled, double averageFillPrice,
             OrderState orderState, DateTime time, ErrorCode error, string nativeError)
         {
-            if (_eo != null && order == _eo && Order.IsTerminalState(orderState))
+            // Only null _eo on non-fill terminal states; OnExecutionUpdate owns the fill path.
+            // If we null here on Filled, OnExecutionUpdate sees _eo==null and skips brackets → naked position.
+            if (_eo != null && order == _eo && Order.IsTerminalState(orderState)
+                && orderState != OrderState.Filled && orderState != OrderState.PartFilled)
             {
                 _eo = null;
                 if (_ph == PH_PEND) _ph = PH_FLAT; // cancelled / rejected
