@@ -110,3 +110,21 @@ Before any sim→live promotion the **risk-manager agent** reviews and signs off
 - Queue imbalance / adverse selection of resting limit orders: https://arxiv.org/pdf/1610.00261 , https://www.sciencedirect.com/science/article/pii/S1386418125000229
 - Iceberg/absorption (refill = hidden size): https://bookmap.com/blog/how-to-read-and-trade-iceberg-orders-hidden-liquidity-in-plain-sight
 - Why DOM scalping fails retail (latency, front-running, pulled walls): https://bookmap.com/blog/can-real-time-order-flow-give-you-an-edge-in-scalp-trading
+
+---
+
+## BASELINE TEST RESULT (the #1 gate) — PASSED decisively
+Test: at each Absorbed timestamp/price, P(reach +3t before −6t) within 60s, SIGNAL direction vs OPPOSITE direction (same times/prices = controls for drift/volatility).
+
+| Set | SIGNAL | OPPOSITE | edge |
+|---|---|---|---|
+| All absorbed (n=918) | **80%** | 41% | **+40 pts** |
+| Walls ≥100 (n=201) | **84%** | 34% | **+49 pts** |
+| +3/−4 @45s (≥100) | 81% | 24% | +57 |
+| +2/−4 @30s (≥100) | 88% | 27% | +61 |
+
+If the apparent edge were just ES drift, SIGNAL ≈ OPPOSITE (~50/50). Instead signal beats opposite by +40 to +61 pts → the absorption signal is **directionally predictive**, not volatility capture. This kills the "it's just drift" objection.
+
+Caveats still open (do NOT skip): 2s-mid undersampling (affects both arms ~equally, so the *difference* is robust; absolute win-rate may be optimistic), replay≠live fills/latency, in-sample-ish (2 days). The stop-entry-beyond-the-wall design addresses the adverse-selection fill problem.
+
+**Updated verdict: green-light BUILD FOR REPLAY-SIM.** The directional edge is real; the open question is now purely whether it survives real fills + slippage + live latency — which is exactly what the Replay-sim measures. Risk-manager veto before any live money stands.
