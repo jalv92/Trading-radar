@@ -49,7 +49,10 @@ namespace TradingRadar.NT
 
         public RadarTab()
         {
-            _cfg.MinAbsSize = 20;   // NQ RTH starting point; tuned live via UI bar
+            _cfg.MinAbsSize  = 20;                                   // auto-overrides immediately when _autoCalib is true
+            _cfg.K_mult      = 1.5;
+            _cfg.T_persist   = TimeSpan.FromMilliseconds(1000);
+            _autoCalib       = true;
             _book    = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
             _tracker = new WallTracker(_cfg);
             _visual  = new RadarVisual();
@@ -90,6 +93,7 @@ namespace TradingRadar.NT
                 FontFamily = new FontFamily("Segoe UI"), FontSize = 11 };
             _autoChk.Checked   += (o, e) => _autoCalib = true;
             _autoChk.Unchecked += (o, e) => _autoCalib = false;
+            _autoChk.IsChecked  = true;
             topBar.Children.Add(_autoChk);
             topBar.Children.Add(MakeCfgInput("×", _autoFactor.ToString("0.#"),
                 v => _autoFactor = v));
