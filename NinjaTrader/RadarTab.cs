@@ -236,7 +236,8 @@ namespace TradingRadar.NT
         private double MidOf()
         {
             DepthLevel bb, ba;
-            bool hb = _book.TryBestBid(out bb), ha = _book.TryBestAsk(out ba);
+            bool hb = _book.TryBestBid(out bb)  && bb.Price > 0;
+            bool ha = _book.TryBestAsk(out ba)  && ba.Price > 0;
             if (hb && ha) return (bb.Price + ba.Price) / 2.0;
             if (hb) return bb.Price;
             if (ha) return ba.Price;
@@ -246,6 +247,7 @@ namespace TradingRadar.NT
         // ---- instrument-thread handlers: map -> engine -> swap frame ----
         private void OnMarketDepth(object sender, MarketDepthEventArgs e)
         {
+            if (e.Price <= 0) return;
             DepthOp op = e.Operation == Operation.Add    ? DepthOp.Add
                        : e.Operation == Operation.Update ? DepthOp.Update
                                                          : DepthOp.Remove;
@@ -266,7 +268,7 @@ namespace TradingRadar.NT
 
         private void OnMarketData(object sender, MarketDataEventArgs e)
         {
-            if (e.MarketDataType != MarketDataType.Last) return;
+            if (e.MarketDataType != MarketDataType.Last || e.Price <= 0) return;
             TradeEvent te = new TradeEvent { Price = e.Price, Volume = e.Volume, Time = e.Time };
             _book.ApplyTrade(te);
             _tradeEvents++;
