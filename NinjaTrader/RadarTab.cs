@@ -292,6 +292,49 @@ namespace TradingRadar.NT
                 Tick  = _cfg.TickSize
             };
             MaybeDiag(now);
+            if (_capture && _capWriter != null)
+            {
+                try
+                {
+                    var nodes  = _latest.Nodes;
+                    double mid = _latest.Mid;
+                    long medBid = _book.MedianSize(Side.Bid), medAsk = _book.MedianSize(Side.Ask);
+                    if (nodes != null)
+                    {
+                        for (int i = 0; i < nodes.Count; i++)
+                        {
+                            RadarNode n = nodes[i];
+                            long key = (long)Math.Round(n.Price / _cfg.TickSize) * 2 + (n.Side == Side.Ask ? 1 : 0);
+                            NodeState prev;
+                            bool had = _prevStates.TryGetValue(key, out prev);
+                            if ((!had || n.State != prev) &&
+                                (n.State == NodeState.Wall     || n.State == NodeState.Absorbed ||
+                                 n.State == NodeState.Pulled   || n.State == NodeState.Consumed))
+                            {
+                                _capWriter.WriteLine(string.Format(
+                                    System.Globalization.CultureInfo.InvariantCulture,
+                                    "{0},evt,{1},{2:0.00},{3},{4},{5},{6},{7:0.000},{8},{9:0.0},{10:0.00},{11},{12}",
+                                    now.ToString("o"),
+                                    n.Side == Side.Ask ? "Ask" : "Bid",
+                                    n.Price, n.PeakSize, n.LastKnownSize,
+                                    had ? prev.ToString() : "", n.State,
+                                    n.Confidence, n.InWindow, n.AgeSeconds, mid, medBid, medAsk));
+                            }
+                            _prevStates[key] = n.State;
+                        }
+                    }
+                    if (_lastMidLog == DateTime.MinValue || (now - _lastMidLog).TotalSeconds >= 2)
+                    {
+                        _lastMidLog = now;
+                        _capWriter.WriteLine(string.Format(
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            "{0},mid,,,,,,,,,,{1:0.00},{2},{3}",
+                            now.ToString("o"), mid, medBid, medAsk));
+                        _capWriter.Flush();
+                    }
+                }
+                catch { }
+            }
         }
 
         private void MaybeDiag(DateTime now)
@@ -337,6 +380,8 @@ namespace TradingRadar.NT
         // ---- NTTabPage members ----
         public override void Cleanup()
         {
+            _capture = false;
+            if (_capWriter != null) { _capWriter.Flush(); _capWriter.Dispose(); _capWriter = null; }
             _selector.InstrumentChanged -= OnSelectorChanged;
             if (_paintTimer != null) { _paintTimer.Stop(); _paintTimer = null; }
             Unsubscribe();
