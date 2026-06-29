@@ -59,3 +59,21 @@ Cross-day consistency is the real test (one day could be luck):
 - Auto MinSize (1.8×median), K×=1.5, Persist=1000 → **good, keep.**
 - Quality filter for acting: **wall peak ≥ 100 (≈3× median)** raises hold ~10pts.
 - Treat Absorbed as a ~15-30s confluence signal at a chart level, small size, tight stop.
+
+---
+
+## Trade economics — is there a tradeable edge? (sim on 918 absorbed events, 2 days)
+Simulated a scalp at each Absorbed level (limit/marketable entry at the level, bracket exit, 60s horizon, mids @2s). ES tick=$12.50.
+
+**Realistic cost (1.4 ticks = ~1 spread + commission):**
+- Tight brackets (2/2, 2/3): NEGATIVE (-0.23 to -0.38 t/trade) despite 79-83% win — classic high-win-rate / negative-expectancy trap (wins too small vs cost + tail).
+- Wider (4/4): +0.30 t/trade (+$3.75), 71% win. **Big walls ≥100, 4/4: +0.72 t/trade (+$9), 76% win** — the only clearly positive cell.
+
+**Optimistic cost (0.8 t = passive LIMIT entry+exit, commission only):** all positive — ALL 3/4 +0.62t, BIG 3/4 +0.91t (82% win).
+
+### Verdict (honest)
+A **thin, real, but fragile edge.** The signal predicts (high win rate confirmed), but the favorable move is small (1.5-3 ticks), so profitability is dominated by EXECUTION, not the signal:
+- Market-in + tight stop → negative. Passive limit-in at the wall + wider bracket + big-wall filter → positive on paper (+0.7-0.9 t/trade).
+- **Killers not in this sim:** queue position (your limit may not fill ahead of a real wall), stop slippage in fast moves, 2s-mid granularity (misses spikes → understates stop hits), in-sample bracket choice, replay≠live latency. Real edge is likely BELOW the optimistic numbers.
+
+**Conclusion:** worth pursuing as an automated scalper ONLY with: big-wall (≥100) filter, passive limit entry, wide-ish bracket (3-4t target), and rigorous out-of-sample + Market-Replay-sim + risk-manager gate before real money. It is NOT a proven money-maker; it is a real signal whose edge lives or dies on fills.
