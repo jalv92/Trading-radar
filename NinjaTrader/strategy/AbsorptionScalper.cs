@@ -67,6 +67,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ── daily guardrails ──────────────────────────────────────────────────
         private const int DayMaxLoss  = 3;
         private const int DayMaxTrade = 12;
+        private const int MaxChase    = 3; // ticks: skip entry if stop must be clamped > this past the wall
         private volatile int  _dLoss;
         private volatile int  _dTrade;
         private volatile bool _halted;
@@ -181,9 +182,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     double stopPx = dmsLong
                         ? _wallPx - (StopTks - 1) * TickSize
                         : _wallPx + (StopTks - 1) * TickSize;
-                    _so = dmsLong
-                        ? ExitLongStopMarket (0, true, Position.Quantity, stopPx, "Stop",   "AbsLong")
-                        : ExitShortStopMarket(0, true, Position.Quantity, stopPx, "Stop",   "AbsShort");
+                    // If price has already blown through the stop, submitting it would be rejected
+                    // (wrong-side stop). Flatten at market instead.
+                    bool breached = dmsLong ? (stopPx >= GetCurrentBid(0)) : (stopPx <= GetCurrentAsk(0));
+                    if (breached)
+                        ForceExit("StopBreached");
+                    else
+                        _so = dmsLong
+                            ? ExitLongStopMarket (0, true, Position.Quantity, stopPx, "Stop",   "AbsLong")
+                            : ExitShortStopMarket(0, true, Position.Quantity, stopPx, "Stop",   "AbsShort");
                 }
                 if (_to == null || Order.IsTerminalState(_to.OrderState))
                 {
@@ -220,14 +227,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _coolPx    = wp;
                 _coolTime  = Time[0];
 
-                if (_pendL)
+                double ask = GetCurrentAsk(0), bid = GetCurrentBid(0);
+                if (_pendL)   // LONG: buy-stop must be above the ask
                 {
-                    double stp = Instrument.MasterInstrument.RoundToTickSize(wp + TickSize);
+                    double trig = Math.Max(wp + TickSize, ask + TickSize);
+                    if (trig - wp > MaxChase * TickSize) { ClearPend(); _ph = PH_FLAT; _coolPx = wp; _coolTime = Time[0]; return; }
+                    double stp = Instrument.MasterInstrument.RoundToTickSize(trig);
                     _eo = EnterLongStopMarket(0, true, 1, stp, "AbsLong");
                 }
-                else
+                else          // SHORT: sell-stop must be below the bid
                 {
-                    double stp = Instrument.MasterInstrument.RoundToTickSize(wp - TickSize);
+                    double trig = Math.Min(wp - TickSize, bid - TickSize);
+                    if (wp - trig > MaxChase * TickSize) { ClearPend(); _ph = PH_FLAT; _coolPx = wp; _coolTime = Time[0]; return; }
+                    double stp = Instrument.MasterInstrument.RoundToTickSize(trig);
                     _eo = EnterShortStopMarket(0, true, 1, stp, "AbsShort");
                 }
                 _ph = PH_PEND;
