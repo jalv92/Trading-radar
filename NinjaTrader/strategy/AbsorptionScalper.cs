@@ -456,6 +456,33 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        protected override void OnPositionUpdate(Position position, double averagePrice,
+            int quantity, MarketPosition marketPosition)
+        {
+            // Backstop: if the position went Flat but OnExecutionUpdate never logged it
+            // (e.g. disable-flatten, external close, reference mismatch), log here.
+            if (marketPosition == MarketPosition.Flat && _ph == PH_TRADE && !_tradeClosed)
+            {
+                _tradeClosed = true;
+                if (_exitReason == null) _exitReason = "Flat";
+                try
+                {
+                    var trades = SystemPerformance.AllTrades;
+                    if (trades.Count > 0)
+                    {
+                        var t = trades[trades.Count - 1];
+                        bool wasLong = t.Entry.MarketPosition == MarketPosition.Long;
+                        double pnlTicks = (t.Exit.Price - t.Entry.Price) / TickSize
+                                        * (wasLong ? 1.0 : -1.0);
+                        LogTrade(t.Exit.Time, wasLong ? "Long" : "Short", t.Exit.Price, pnlTicks);
+                        if (pnlTicks < 0) { _dLoss++; if (_dLoss >= DayMaxLoss) _halted = true; }
+                    }
+                }
+                catch { }
+                ResetTrade();
+            }
+        }
+
         // ── helpers ──────────────────────────────────────────────────────────
 
         private void ForceExit(string reason)
