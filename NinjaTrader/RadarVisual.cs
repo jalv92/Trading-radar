@@ -89,10 +89,18 @@ namespace TradingRadar.NT
             if (_bids  != null) for (int i = 0; i < _bids.Count;  i++) if (_bids[i].Volume  > maxSize) maxSize = _bids[i].Volume;
             if (_asks  != null) for (int i = 0; i < _asks.Count;  i++) if (_asks[i].Volume  > maxSize) maxSize = _asks[i].Volume;
 
+            // Live-node price keys — skip book levels that coincide with a live wall node (prevents double bar + double size label).
+            var liveNodeKeys = new HashSet<long>();
+            if (_nodes != null)
+                for (int i = 0; i < _nodes.Count; i++)
+                    if (_nodes[i].InWindow)
+                        liveNodeKeys.Add((long)Math.Round(_nodes[i].Price / _tick));
+
             // ---- faint book ladder (drawn first; wall nodes overlay on top) ----
             if (_bids != null)
                 for (int i = 0; i < _bids.Count; i++)
                 {
+                    if (liveNodeKeys.Contains((long)Math.Round(_bids[i].Price / _tick))) continue;
                     double y = centerY - ((_bids[i].Price - _mid) / _tick) * rowH;
                     if (y < 0 || y > h) continue;
                     double barW   = Math.Max(2.0, (_bids[i].Volume / (double)maxSize) * barMaxW);
@@ -104,6 +112,7 @@ namespace TradingRadar.NT
             if (_asks != null)
                 for (int i = 0; i < _asks.Count; i++)
                 {
+                    if (liveNodeKeys.Contains((long)Math.Round(_asks[i].Price / _tick))) continue;
                     double y = centerY - ((_asks[i].Price - _mid) / _tick) * rowH;
                     if (y < 0 || y > h) continue;
                     double barW   = Math.Max(2.0, (_asks[i].Volume / (double)maxSize) * barMaxW);
