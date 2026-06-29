@@ -53,7 +53,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Order  _fo;   // force-exit market order (Consumed / TimeStop)
         private double _eFx;  // entry fill price
         private DateTime _eFt = DateTime.MinValue;
-        private bool   _beReached;
+        private bool   _beMoved;
         private bool   _exitSent;    // ForceExit already dispatched
         private bool   _tradeClosed; // exit execution logged; guard against double-log
         private string _exitReason;
@@ -112,6 +112,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Entry Window Secs", Order = 6, GroupName = "AbsScalper")]
         public int EntryWin { get; set; }
 
+        [NinjaScriptProperty]
+        [Display(Name = "Use Breakeven", Description = "Move stop to entry-1t when MFE >= BE Trigger Ticks", Order = 7, GroupName = "AbsScalper")]
+        public bool UseBreakeven { get; set; }
+
         // ─────────────────────────────────────────────────────────────────────
         protected override void OnStateChange()
         {
@@ -126,12 +130,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 IsExitOnSessionCloseStrategy = true;
                 ExitOnSessionCloseSeconds    = 30;
                 TraceOrders                  = false;
-                MinPeak   = 100;
-                StopTks   = 6;
-                TgtTks    = 8;
-                BeTks     = 3;
-                TimeSecs  = 40;
-                EntryWin  = 10;
+                MinPeak      = 100;
+                StopTks      = 6;
+                TgtTks       = 8;
+                BeTks        = 3;
+                TimeSecs     = 40;
+                EntryWin     = 10;
+                UseBreakeven = true;
             }
             else if (State == State.Configure)
             {
@@ -258,11 +263,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (cur > _mfe) _mfe = cur;
                 if (cur < _mae) _mae = cur;
 
-                // Break-even: move stop to entry-1t when MFE >= BeTks
-                if (!_beReached && _mfe >= BeTks)
+                // Track when MFE first hit BeTks — always, for analysis log
+                if (_beTime == DateTime.MinValue && _mfe >= BeTks)
+                    _beTime = Time[0];
+
+                // Break-even: move stop to entry-1t when MFE >= BeTks (only when enabled)
+                if (UseBreakeven && !_beMoved && _mfe >= BeTks)
                 {
-                    _beReached = true;
-                    _beTime    = Time[0];
+                    _beMoved = true;
                     double beStp = Position.MarketPosition == MarketPosition.Long
                         ? _eFx - TickSize
                         : _eFx + TickSize;
@@ -273,8 +281,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Hard exit: wall was consumed (invalidation)
                 if (_consumed) { ForceExit("Consumed"); return; }
 
-                // Time-stop: exit at market if not at BE within TimeSecs
-                if (!_beReached && _eFt != DateTime.MinValue
+                // Time-stop: fires only when trade never reached BeTks (regardless of UseBreakeven)
+                if (_mfe < BeTks && _eFt != DateTime.MinValue
                     && (Time[0] - _eFt).TotalSeconds >= TimeSecs)
                     ForceExit("TimeStop");
             }
@@ -389,7 +397,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 && (o.OrderState == OrderState.Filled || o.OrderState == OrderState.PartFilled))
             {
                 _eFx = o.AverageFillPrice; _eFt = time;
-                _mfe = 0; _mae = 0; _beReached = false;
+                _mfe = 0; _mae = 0; _beMoved = false;
                 _exitSent = false; _tradeClosed = false;
                 _exitReason = null; _consumed = false;
                 _beTime = DateTime.MinValue;
@@ -475,7 +483,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void ResetTrade()
         {
             _ph          = PH_FLAT;
-            _exitSent    = _tradeClosed = _beReached = _consumed = false;
+            _exitSent    = _tradeClosed = _beMoved = _consumed = false;
             _eo = _so = _to = _fo = null;
         }
 
@@ -498,7 +506,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _log = new System.IO.StreamWriter(path, false);
                 _log.WriteLine(
                     "time,side,entryType,wallPrice,fillPrice,peakSize," +
-                    "mfeTicks,maeTicks,timeTo3tSecs,exitReason,pnlTicks");
+                    "mfeTicks,maeTicks,timeTo3tSecs,exitReason,pnlTicks,useBreakeven");
                 _log.Flush();
             }
             catch { }
@@ -513,9 +521,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     ? (_beTime - _eFt).TotalSeconds : -1;
                 _log.WriteLine(string.Format(
                     System.Globalization.CultureInfo.InvariantCulture,
-                    "{0},{1},StopConfirm,{2:0.00},{3:0.00},{4},{5:0.0},{6:0.0},{7:0.0},{8},{9:0.00}",
+                    "{0},{1},StopConfirm,{2:0.00},{3:0.00},{4},{5:0.0},{6:0.0},{7:0.0},{8},{9:0.00},{10}",
                     time.ToString("o"), side, _wallPx, exitPx, _wallPk,
-                    _mfe, _mae, t3, _exitReason ?? "Unknown", pnlTicks));
+                    _mfe, _mae, t3, _exitReason ?? "Unknown", pnlTicks, UseBreakeven));
                 _log.Flush();
             }
             catch { }
