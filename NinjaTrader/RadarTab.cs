@@ -46,6 +46,10 @@ namespace TradingRadar.NT
         private const double EwmaAlpha = 0.0017;      // ~60s smoothing at ~20Hz engine runs
         private TextBox  _minSizeBox;
         private CheckBox _autoChk;
+        private volatile bool _capture;
+        private System.IO.StreamWriter _capWriter;
+        private readonly Dictionary<long, NodeState> _prevStates = new Dictionary<long, NodeState>();
+        private DateTime _lastMidLog = DateTime.MinValue;
 
         public RadarTab()
         {
@@ -102,6 +106,32 @@ namespace TradingRadar.NT
             topBar.Children.Add(MakeCfgInput("Persist(ms)",
                 ((long)_cfg.T_persist.TotalMilliseconds).ToString(),
                 v => _cfg.T_persist = TimeSpan.FromMilliseconds(v)));
+            // Rec toggle — CSV capture for ES calibration (default unchecked).
+            var recChk = new CheckBox { Content = "Rec",
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(12, 0, 4, 0),
+                Foreground = new SolidColorBrush(Color.FromRgb(0xcf, 0xd6, 0xe2)),
+                FontFamily = new FontFamily("Segoe UI"), FontSize = 11 };
+            recChk.Checked += (o, e) =>
+            {
+                string dir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "NinjaTrader 8", "LiquidityRadar");
+                System.IO.Directory.CreateDirectory(dir);
+                string inst = _instrument != null ? _instrument.MasterInstrument.Name : "X";
+                string path = System.IO.Path.Combine(dir,
+                    "lr-capture-" + inst + "-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".csv");
+                _capWriter = new System.IO.StreamWriter(path, false);
+                _capWriter.WriteLine("time,type,side,price,peak,last,prevState,newState,conf,inWindow,age,mid,medBid,medAsk");
+                _capWriter.Flush();
+                _prevStates.Clear();
+                _capture = true;
+            };
+            recChk.Unchecked += (o, e) =>
+            {
+                _capture = false;
+                if (_capWriter != null) { _capWriter.Flush(); _capWriter.Dispose(); _capWriter = null; }
+            };
+            topBar.Children.Add(recChk);
             DockPanel.SetDock(topBar, Dock.Top);
             root.Children.Add(topBar);
             root.Children.Add(_visual);          // fills remaining space
