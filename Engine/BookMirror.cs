@@ -127,5 +127,19 @@ namespace TradingRadar.Engine
             }
             return sum;
         }
+
+        // Running order-flow imbalance: buy-aggressor volume minus sell-aggressor volume
+        // over retained trades with Time >= since. Side.Ask aggressor = buy (lifted offer).
+        public long AggressorDelta(DateTime since)
+        {
+            long buy = 0, sell = 0;
+            for (int i = 0; i < _trades.Count; i++)
+            {
+                Trade tr = _trades[i];
+                if (tr.Time < since) continue;
+                if (tr.Aggressor == Side.Ask) buy += tr.Volume; else sell += tr.Volume;
+            }
+            return buy - sell;
+        }
     }
 }

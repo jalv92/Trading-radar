@@ -106,4 +106,21 @@ public class BookMirrorTests
         b.ApplyTrade(new TradeEvent { Price = 21000.25, Volume = 5, Time = T0.AddSeconds(20) }); // prunes the first
         Assert.Equal(5, b.TradedAt(21000.25, T0, null));
     }
+
+    [Fact]
+    public void AggressorDelta_is_buy_volume_minus_sell_volume_since_cutoff()
+    {
+        var t0 = new DateTime(2026, 6, 28, 9, 30, 0, DateTimeKind.Utc);
+        var b = new BookMirror(0.25, TimeSpan.FromSeconds(30));
+        // Establish a book so InferAggressor has best bid/ask.
+        b.ApplyDepth(new DepthEvent { Side = Side.Bid, Op = DepthOp.Add, Position = 0, Price = 100.00, Volume = 50, Time = t0 });
+        b.ApplyDepth(new DepthEvent { Side = Side.Ask, Op = DepthOp.Add, Position = 0, Price = 100.25, Volume = 50, Time = t0 });
+        // Buy aggressors (print at/above ask): +70 total.
+        b.ApplyTrade(new TradeEvent { Price = 100.25, Volume = 40, Time = t0.AddMilliseconds(100) });
+        b.ApplyTrade(new TradeEvent { Price = 100.25, Volume = 30, Time = t0.AddMilliseconds(200) });
+        // Sell aggressors (print at/below bid): -25 total.
+        b.ApplyTrade(new TradeEvent { Price = 100.00, Volume = 25, Time = t0.AddMilliseconds(300) });
+        Assert.Equal(45L, b.AggressorDelta(t0));               // 70 buy - 25 sell
+        Assert.Equal(-25L, b.AggressorDelta(t0.AddMilliseconds(250))); // only the sell after cutoff
+    }
 }
