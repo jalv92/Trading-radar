@@ -49,7 +49,10 @@ namespace TradingRadar.NT
         private IReadOnlyList<DepthLevel> _bids;
         private IReadOnlyList<DepthLevel> _asks;
         private double _mid;
-        private double _tick      = 0.25;
+        private double _tick           = 0.25;
+        private double _anchorTop      = double.NaN;   // price of the top visible row; persists across frames
+        private const int    ANCHOR_GUARD_TICKS = 4;   // re-anchor when mid comes within this many ticks of an edge
+        private const double TARGET_ROW_PX      = 26.0;
 
         public void SetFrame(IReadOnlyList<RadarNode> nodes, IReadOnlyList<DepthLevel> bids,
                              IReadOnlyList<DepthLevel> asks, double mid, double tickSize)
@@ -72,16 +75,27 @@ namespace TradingRadar.NT
 
             if (_mid <= 0) return;
 
-            // Auto-fit band to live book only; off-screen remembered nodes use edge markers.
-            int half = 6;
-            if (_bids  != null) for (int i = 0; i < _bids.Count;  i++) { int t = (int)Math.Round(Math.Abs(_bids[i].Price  - _mid) / _tick); if (t > half) half = t; }
-            if (_asks  != null) for (int i = 0; i < _asks.Count;  i++) { int t = (int)Math.Round(Math.Abs(_asks[i].Price  - _mid) / _tick); if (t > half) half = t; }
-            if (half > 22) half = 22;
-            half += 1;
-            int    rows = 2 * half + 1;
+            // Stable row grid (anchored layout — rows derived from panel height, not book depth).
+            int    rows = (int)Math.Max(9, Math.Floor(h / TARGET_ROW_PX));
             double rowH = h / rows;
-            double centerY = h / 2.0;
-            double barX    = 88, barMaxW = w - barX - 96;
+            double barX = 88, barMaxW = w - barX - 96;
+
+            // (Re)initialise anchor on first frame, instrument change, or mid discontinuity.
+            if (double.IsNaN(_anchorTop)
+                || _mid > _anchorTop + _tick
+                || _mid < _anchorTop - (rows + 1) * _tick)
+                _anchorTop = RoundToTick(_mid) + (rows / 2) * _tick;
+
+            // Edge re-anchor: slide the price column only when mid nears the top/bottom edge.
+            double guard  = ANCHOR_GUARD_TICKS * _tick;
+            double bottom = _anchorTop - (rows - 1) * _tick;
+            int safety = 0;
+            while (_mid > _anchorTop - guard  && safety++ < rows) { _anchorTop += _tick; bottom += _tick; }
+            safety = 0;
+            while (_mid < bottom + guard && safety++ < rows) { _anchorTop -= _tick; bottom -= _tick; }
+
+            // Anchored y-mapping: price of the top row is _anchorTop; rows go downward by _tick each.
+            double Y(double price) { return ((_anchorTop - price) / _tick) * rowH; }
 
             // maxSize spans book levels + wall nodes so bar widths are proportional across both layers.
             long maxSize = 1;
@@ -101,7 +115,7 @@ namespace TradingRadar.NT
                 for (int i = 0; i < _bids.Count; i++)
                 {
                     if (liveNodeKeys.Contains((long)Math.Round(_bids[i].Price / _tick))) continue;
-                    double y = centerY - ((_bids[i].Price - _mid) / _tick) * rowH;
+                    double y = Y(_bids[i].Price);
                     if (y < 0 || y > h) continue;
                     double barW   = Math.Max(2.0, (_bids[i].Volume / (double)maxSize) * barMaxW);
                     double rowTop = y - rowH * 0.35, rowHt = rowH * 0.70;
@@ -113,7 +127,7 @@ namespace TradingRadar.NT
                 for (int i = 0; i < _asks.Count; i++)
                 {
                     if (liveNodeKeys.Contains((long)Math.Round(_asks[i].Price / _tick))) continue;
-                    double y = centerY - ((_asks[i].Price - _mid) / _tick) * rowH;
+                    double y = Y(_asks[i].Price);
                     if (y < 0 || y > h) continue;
                     double barW   = Math.Max(2.0, (_asks[i].Volume / (double)maxSize) * barMaxW);
                     double rowTop = y - rowH * 0.35, rowHt = rowH * 0.70;
@@ -128,7 +142,7 @@ namespace TradingRadar.NT
             {
                 RadarNode n    = _nodes[i];
                 if (!Visible(n)) continue;
-                double    y    = centerY - ((n.Price - _mid) / _tick) * rowH;
+                double    y    = Y(n.Price);
                 if (y < 0 || y > h) continue;
 
                 bool blind  = !n.InWindow || n.State == NodeState.Remembered;
@@ -188,14 +202,15 @@ namespace TradingRadar.NT
                 { DrawText(dc, badge, w - 70, y, 10, Sans, BadgeBrush(n.State, blind), dpi, op); lastBadgeY = y; }
             }
 
-            // Inside-market amber line + mid chip (chip covers line so text is readable).
-            dc.DrawLine(AmberLine, new Point(0, centerY), new Point(w, centerY));
+            // Inside-market amber line + mid chip — glide to Y(_mid) (anchored, not fixed center).
+            double midY = Y(_mid);
+            dc.DrawLine(AmberLine, new Point(0, midY), new Point(w, midY));
             var midFt = new FormattedText(_mid.ToString("0.00", CultureInfo.InvariantCulture),
                 CultureInfo.InvariantCulture, FlowDirection.LeftToRight, Mono, 16, AmberTxt, dpi);
             double chipW = midFt.Width + 10, chipH = midFt.Height + 4;
-            double chipY = centerY - chipH / 2.0;
+            double chipY = midY - chipH / 2.0;
             dc.DrawRoundedRectangle(MidChipBg, MidChipBorder, new Rect(2, chipY, chipW, chipH), 3, 3);
-            dc.DrawText(midFt, new Point(7, centerY - midFt.Height / 2.0));
+            dc.DrawText(midFt, new Point(7, midY - midFt.Height / 2.0));
 
             // Edge markers for Visible nodes whose row is off-screen (remembered walls outside the live band).
             if (_nodes != null)
@@ -205,7 +220,7 @@ namespace TradingRadar.NT
                 for (int i = 0; i < _nodes.Count; i++)
                 {
                     if (!Visible(_nodes[i])) continue;
-                    double ny = centerY - ((_nodes[i].Price - _mid) / _tick) * rowH;
+                    double ny = Y(_nodes[i].Price);
                     if      (ny < 0) above.Add(_nodes[i]);
                     else if (ny > h) below.Add(_nodes[i]);
                 }
@@ -234,6 +249,8 @@ namespace TradingRadar.NT
             }
 
         }
+
+        private double RoundToTick(double p) { return Math.Round(p / _tick) * _tick; }
 
         // ---- helpers ----
         private static string BadgeFor(NodeState s)
