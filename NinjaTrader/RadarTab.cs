@@ -48,6 +48,7 @@ namespace TradingRadar.NT
         private CheckBox _autoChk;
         private volatile bool _capture;
         private System.IO.StreamWriter _capWriter;
+        private System.IO.StreamWriter _sigWriter;
         private readonly Dictionary<long, NodeState> _prevStates = new Dictionary<long, NodeState>();
         private DateTime _lastMidLog = DateTime.MinValue;
 
@@ -124,12 +125,18 @@ namespace TradingRadar.NT
                 _capWriter.WriteLine("time,type,side,price,peak,last,prevState,newState,conf,inWindow,age,mid,medBid,medAsk");
                 _capWriter.Flush();
                 _prevStates.Clear();
+                string sigPath = System.IO.Path.Combine(dir,
+                    "lr-signals-" + inst + "-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".csv");
+                _sigWriter = new System.IO.StreamWriter(sigPath, false);
+                _sigWriter.WriteLine("time,mid,bidMass,askMass,bestBid,bestAsk,delta15s,wallFrac,wallAbove,wallPx");
+                _sigWriter.Flush();
                 _capture = true;
             };
             recChk.Unchecked += (o, e) =>
             {
                 _capture = false;
                 if (_capWriter != null) { _capWriter.Flush(); _capWriter.Dispose(); _capWriter = null; }
+                if (_sigWriter != null) { _sigWriter.Flush(); _sigWriter.Dispose(); _sigWriter = null; }
             };
             topBar.Children.Add(recChk);
             DockPanel.SetDock(topBar, Dock.Top);
@@ -333,6 +340,28 @@ namespace TradingRadar.NT
                             "{0},mid,,,,,,,,,,{1:0.00},{2},{3}",
                             now.ToString("o"), mid, medBid, medAsk));
                         _capWriter.Flush();
+                        // enhanced PressureInputs snapshot (Plan D measurement)
+                        if (_capture && _sigWriter != null)
+                        {
+                            var bids = _book.Levels(Side.Bid); var asks = _book.Levels(Side.Ask);
+                            long bidMass = 0, askMass = 0;
+                            for (int i = 0; i < bids.Count; i++) bidMass += bids[i].Volume;
+                            for (int i = 0; i < asks.Count; i++) askMass += asks[i].Volume;
+                            DepthLevel bb, ba;
+                            long bestBid = _book.TryBestBid(out bb) ? bb.Volume : 0;
+                            long bestAsk = _book.TryBestAsk(out ba) ? ba.Volume : 0;
+                            long delta15 = _book.AggressorDelta(now.AddSeconds(-15));
+                            // nearest wall erosion to the inside (max |frac|); 0 if none
+                            double wf = 0.0, wpx = 0.0; bool wabove = false;
+                            var er = _tracker.ErosionReads(_book, now);
+                            for (int i = 0; i < er.Count; i++)
+                                if (er[i].Approaching && er[i].Frac > wf)
+                                { wf = er[i].Frac; wpx = er[i].Price; wabove = er[i].Price > mid; }
+                            _sigWriter.WriteLine(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                                "{0},{1:0.00},{2},{3},{4},{5},{6},{7:0.000},{8},{9:0.00}",
+                                now.ToString("o"), mid, bidMass, askMass, bestBid, bestAsk, delta15, wf, wabove, wpx));
+                            _sigWriter.Flush();
+                        }
                     }
                 }
                 catch { }
@@ -384,6 +413,7 @@ namespace TradingRadar.NT
         {
             _capture = false;
             if (_capWriter != null) { _capWriter.Flush(); _capWriter.Dispose(); _capWriter = null; }
+            if (_sigWriter != null) { _sigWriter.Flush(); _sigWriter.Dispose(); _sigWriter = null; }
             _selector.InstrumentChanged -= OnSelectorChanged;
             if (_paintTimer != null) { _paintTimer.Stop(); _paintTimer = null; }
             Unsubscribe();

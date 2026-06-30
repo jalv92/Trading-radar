@@ -117,6 +117,12 @@ namespace TradingRadar.Engine
 
         public void OnReset(DateTime now) { _memory.MarkAllBlind(); }
 
+        // Partial-pull / wall-erosion reads (Plan B EpisodeClassifier.ErosionReads), surfaced for capture.
+        public IReadOnlyList<ErosionRead> ErosionReads(BookMirror book, DateTime now)
+        {
+            return _classifier.ErosionReads(book, now);
+        }
+
         public IReadOnlyList<RadarNode> GetSnapshot(DateTime now)
         {
             return _memory.Snapshot(_lastBestBid, _lastBestAsk, now);
