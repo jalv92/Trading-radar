@@ -44,8 +44,17 @@ namespace TradingRadar.Engine
         public double ActiveFloor = 0.12;     // |lean| below this = inactive
         public double ConvictionFloor = 0.30; // |lean| to count toward conviction (Task 4)
         public double GreenNet = 0.55;        // |net| threshold for a green-light (Task 4)
-        public int GreenConviction = 3;       // agreeing signals needed (Task 4)
+        public int GreenConviction = 4;       // agreeing signals needed (Task 4)
         public double OpposingVeto = 0.55;    // an opposing active lean above this blocks green (Task 4)
+    }
+
+    public struct PressureResult
+    {
+        public SignalRead[] Signals;
+        public double Net;
+        public int Conviction;
+        public int Sign;
+        public bool Green;
     }
 
     // Pure: takes a snapshot of the zone + flow, emits per-signal leans. No NT, no clock.
@@ -103,6 +112,34 @@ namespace TradingRadar.Engine
                 Mk(SignalId.Delta,       delta,    _cfg.WDelta,       true),
                 Mk(SignalId.WallErosion, wallLean, _cfg.WWallErosion, wallActive)
             };
+        }
+
+        public PressureResult Evaluate(PressureInputs inp)
+        {
+            SignalRead[] sig = Signals(inp);
+
+            double num = 0, den = 0;
+            for (int i = 0; i < sig.Length; i++)
+                if (sig[i].Active) { num += sig[i].Lean * sig[i].Weight; den += sig[i].Weight; }
+            double net = den > 0 ? Clamp(num / den, -1, 1) : 0;
+            int sign = net > 0 ? 1 : (net < 0 ? -1 : 0);
+
+            int conviction = 0;
+            bool opposed = false;
+            for (int i = 0; i < sig.Length; i++)
+            {
+                if (!sig[i].Active) continue;
+                int ls = sig[i].Lean > 0 ? 1 : (sig[i].Lean < 0 ? -1 : 0);
+                if (sign != 0 && ls == sign && Math.Abs(sig[i].Lean) > _cfg.ConvictionFloor) conviction++;
+                if (sign != 0 && ls == -sign && Math.Abs(sig[i].Lean) > _cfg.OpposingVeto) opposed = true;
+            }
+
+            bool green = sign != 0 && conviction >= _cfg.GreenConviction
+                         && Math.Abs(net) >= _cfg.GreenNet && !opposed;
+
+            PressureResult r;
+            r.Signals = sig; r.Net = net; r.Conviction = conviction; r.Sign = sign; r.Green = green;
+            return r;
         }
 
         private SignalRead Mk(SignalId id, double lean, double weight, bool baseActive)

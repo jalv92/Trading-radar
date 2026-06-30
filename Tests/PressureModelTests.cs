@@ -72,4 +72,48 @@ public class PressureModelTests
         };
         Assert.False(Find(Model().Signals(inp), SignalId.WallErosion).Active);
     }
+
+    // Captured ES state (asks heavy, thin bid, no flow, wall idle) => net SHORT, NOT a green-light.
+    [Fact]
+    public void Evaluate_captured_state_leans_short_without_trigger()
+    {
+        var inp = new PressureInputs {
+            Bids = new List<DepthLevel> { L(7589.00, 9), L(7588.75, 28), L(7588.50, 27) },
+            Asks = new List<DepthLevel> { L(7589.25, 29), L(7589.75, 47), L(7590.00, 65) },
+            BestBidSize = 9, BestAskSize = 29, AggressorDelta = 0, Wall = new WallErosion()
+        };
+        var r = Model().Evaluate(inp);
+        Assert.True(r.Net < 0);
+        Assert.False(r.Green);
+    }
+
+    // Ask wall erodes without trades + book lightens above + bid firms => green-light LONG.
+    [Fact]
+    public void Evaluate_eroding_ceiling_greenlights_long()
+    {
+        var inp = new PressureInputs {
+            Bids = new List<DepthLevel> { L(7589.00, 30), L(7588.75, 32), L(7588.50, 33) },
+            Asks = new List<DepthLevel> { L(7589.25, 6), L(7589.75, 10), L(7590.00, 16) },
+            BestBidSize = 30, BestAskSize = 6, AggressorDelta = 0,
+            Wall = new WallErosion { Active = true, Frac = 0.75, Above = true }
+        };
+        var r = Model().Evaluate(inp);
+        Assert.True(r.Green);
+        Assert.Equal(1, r.Sign);
+        Assert.True(r.Conviction >= 3);
+    }
+
+    // A strong opposing active signal blocks the green-light even if net clears the magnitude bar.
+    [Fact]
+    public void Evaluate_strong_opposing_signal_vetoes_green()
+    {
+        var inp = new PressureInputs {
+            Bids = new List<DepthLevel> { L(7589.00, 30), L(7588.75, 32), L(7588.50, 33) },
+            Asks = new List<DepthLevel> { L(7589.25, 6), L(7589.75, 10), L(7590.00, 16) },
+            BestBidSize = 30, BestAskSize = 6,
+            AggressorDelta = -20,  // heavy selling: strong SHORT lean opposing the LONG book
+            Wall = new WallErosion { Active = true, Frac = 0.75, Above = true }
+        };
+        Assert.False(Model().Evaluate(inp).Green);
+    }
 }
