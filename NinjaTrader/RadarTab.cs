@@ -23,12 +23,16 @@ namespace TradingRadar.NT
             public IReadOnlyList<DepthLevel> Asks;
             public double Mid;
             public double Tick;
+            public PressureInputs PInputs;
+            public PressureResult PResult;
         }
 
         private readonly RadarConfig _cfg = new RadarConfig();   // NQ defaults; later: per-instrument presets
         private BookMirror  _book;
         private WallTracker _tracker;
         private RadarVisual _visual;
+        private CockpitVisual _cockpit;
+        private PressureModel _pressure = new PressureModel(new PressureConfig());
         private InstrumentSelector _selector;
 
         private Instrument     _instrument;
@@ -61,6 +65,7 @@ namespace TradingRadar.NT
             _book    = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
             _tracker = new WallTracker(_cfg);
             _visual  = new RadarVisual();
+            _cockpit = new CockpitVisual();
 
             _selector = new InstrumentSelector();
             _selector.InstrumentChanged += OnSelectorChanged;
@@ -141,7 +146,12 @@ namespace TradingRadar.NT
             topBar.Children.Add(recChk);
             DockPanel.SetDock(topBar, Dock.Top);
             root.Children.Add(topBar);
-            root.Children.Add(_visual);          // fills remaining space
+            Grid split = new Grid();
+            split.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0, GridUnitType.Star) });
+            split.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.05, GridUnitType.Star) });
+            Grid.SetColumn(_visual, 0); split.Children.Add(_visual);
+            Grid.SetColumn(_cockpit, 1); split.Children.Add(_cockpit);
+            root.Children.Add(split);            // fills remaining space (DockPanel LastChildFill)
             Content = root;
 
             // UI-thread paint/animation clock — independent of data arrival.
@@ -152,7 +162,11 @@ namespace TradingRadar.NT
             _paintTimer.Tick += (o, e) =>
             {
                 Frame f = _latest;          // volatile read of the latest immutable frame
-                if (f != null) _visual.SetFrame(f.Nodes, f.Bids, f.Asks, f.Mid, f.Tick);
+                if (f != null)
+                {
+                    _visual.SetFrame(f.Nodes, f.Bids, f.Asks, f.Mid, f.Tick);
+                    _cockpit.SetFrame(f.PInputs, f.PResult);
+                }
                 _visual.AdvanceAnimation(); // sweep/fade clock
                 if (_minSizeBox != null)
                 {
@@ -292,13 +306,38 @@ namespace TradingRadar.NT
             if (m > 0) _medianEwma = _medianEwma <= 0 ? m : EwmaAlpha * m + (1 - EwmaAlpha) * _medianEwma;
             if (_autoCalib && _medianEwma > 0)
                 _cfg.MinAbsSize = Math.Max(1, (long)Math.Round(_autoFactor * _medianEwma));
+            // Cockpit pressure inputs (same assembly as the lr-signals capture).
+            var pBids = _book.Levels(Side.Bid); var pAsks = _book.Levels(Side.Ask);
+            long pBidMass = 0, pAskMass = 0;
+            for (int i = 0; i < pBids.Count; i++) pBidMass += pBids[i].Volume;
+            for (int i = 0; i < pAsks.Count; i++) pAskMass += pAsks[i].Volume;
+            DepthLevel pbb, pba;
+            long pBestBid = _book.TryBestBid(out pbb) ? pbb.Volume : 0;
+            long pBestAsk = _book.TryBestAsk(out pba) ? pba.Volume : 0;
+            double pMid = MidOf();
+            WallErosion pWall = new WallErosion();
+            double pWf = 0.0;
+            var pErr = _tracker.ErosionReads(_book, now);
+            for (int i = 0; i < pErr.Count; i++)
+                if (pErr[i].Approaching && pErr[i].Frac > pWf)
+                { pWf = pErr[i].Frac; pWall = new WallErosion { Active = true, Frac = pErr[i].Frac, Above = pErr[i].Price > pMid }; }
+            PressureInputs pin = new PressureInputs
+            {
+                Bids = new List<DepthLevel>(pBids),
+                Asks = new List<DepthLevel>(pAsks),
+                BestBidSize = pBestBid, BestAskSize = pBestAsk,
+                AggressorDelta = _book.AggressorDelta(now.AddSeconds(-15)),
+                Wall = pWall
+            };
             _latest = new Frame
             {
                 Nodes = _tracker.GetSnapshot(now),
-                Bids  = new List<DepthLevel>(_book.Levels(Side.Bid)),
-                Asks  = new List<DepthLevel>(_book.Levels(Side.Ask)),
-                Mid   = MidOf(),
-                Tick  = _cfg.TickSize
+                Bids  = new List<DepthLevel>(pBids),
+                Asks  = new List<DepthLevel>(pAsks),
+                Mid   = pMid,
+                Tick  = _cfg.TickSize,
+                PInputs = pin,
+                PResult = _pressure.Evaluate(pin)
             };
             MaybeDiag(now);
             if (_capture && _capWriter != null)

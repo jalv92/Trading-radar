@@ -23,6 +23,8 @@ namespace TradingRadar.Engine
         public double Lean;     // -1 short .. +1 long
         public double Weight;
         public bool Active;
+        // True when the signal is inactive AND near-zero lean (idle wall/flat delta) — display only.
+        public bool Idle() { return !Active && Math.Abs(Lean) <= 0.12; }
     }
 
     // PLACEHOLDER weights/thresholds (spec §6/§9 — measured in Plan D). No literal lives in logic.
