@@ -100,7 +100,27 @@ public class PressureModelTests
         var r = Model().Evaluate(inp);
         Assert.True(r.Green);
         Assert.Equal(1, r.Sign);
-        Assert.True(r.Conviction >= 3);
+        Assert.True(r.Conviction >= 4);
+    }
+
+    // Veto path in isolation: Sign=1, Conviction=4, |Net|≈0.64 all clear — only the opposing Delta veto blocks Green.
+    // Book: heavy bids+thin asks → Imbalance/InsideThin/AirPocket all LONG ≈1.0; Wall LONG 0.75 (4 signals agree).
+    // AggressorDelta=-9 → Delta lean ≈ −0.643 > OpposingVeto(0.55) but too small to drag |Net| below GreenNet.
+    [Fact]
+    public void Evaluate_opposing_veto_is_the_sole_blocker()
+    {
+        var inp = new PressureInputs {
+            Bids = new List<DepthLevel> { L(99.75, 80), L(99.50, 60), L(99.25, 50) },
+            Asks = new List<DepthLevel> { L(100.25, 4), L(100.50, 6), L(100.75, 8) },
+            BestBidSize = 80, BestAskSize = 4,
+            AggressorDelta = -9,  // lean ≈ −0.643 > OpposingVeto(0.55); book remains LONG net
+            Wall = new WallErosion { Active = true, Frac = 0.75, Above = true }
+        };
+        var r = Model().Evaluate(inp);
+        Assert.False(r.Green);
+        Assert.Equal(1, r.Sign);
+        Assert.True(r.Conviction >= 4);
+        Assert.True(System.Math.Abs(r.Net) >= 0.55);
     }
 
     // A strong opposing active signal blocks the green-light even if net clears the magnitude bar.
