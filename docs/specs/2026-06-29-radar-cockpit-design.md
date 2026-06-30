@@ -184,3 +184,14 @@ Reference = `docs/mockups/radar-cockpit-demo.html`. Tokens are the existing Auro
 5. **Chart Trader** UI → Account-API wiring (Sim/Playback) → `trading-risk-manager` gate before real.
 
 Implementation runs through the `trading-*` agents (NinjaScript dev → code-reviewer → backtest/measure → **risk-manager VETO** for the order-entry path).
+
+---
+
+## 15. Plan B → Plan D carry-forward (from the engine review, 2026-06-29)
+
+The pure-C# pressure engine (Plan B: `Engine/PressureModel.cs` + `BookMirror.AggressorDelta` + `EpisodeClassifier.ErosionReads`) is **built, tested (46/46), merged** with placeholder weights. The whole-branch review surfaced items the **signal-measurement (Plan D)** must account for so a measured edge isn't a model-shape artifact:
+
+1. **Book-skew correlation.** Imbalance (full band), AirPocket (near-3), and InsideThin (best quote) are **nested subsets of the same skew** — the model triple-counts it in both `Net` (additive weights) and `Conviction` (three votes). This is exactly what forced `GreenConviction` to **4** (require a non-book catalyst — Delta or WallErosion — to confirm). `GreenConviction=4` is only a *partial* guard; Plan D must **de-correlate** these in the weighting (and may collapse them to one book-skew factor + independent confirmers).
+2. **`GreenConviction = 4` semantics (default changed from the mockup's 3) — CONFIRMED by Javier 2026-06-29.** "Book-only signals cannot green-light; a catalyst (wall-erosion or delta) must co-fire." Confirmed sound by two reviews and accepted by Javier. Still a placeholder to re-measure in Plan D, but the ≥4 (catalyst-required) semantics is the intended gate.
+3. **AirPocket asymmetry.** `HasHole` is evaluated only on the bid side (a hole *below* price → short nudge), with no symmetric hole-above bonus, and uses a strict `<` threshold (a best bid of exactly `AirThinSize` does not register). Document this so the measured AirPocket edge isn't confounded by the model shape.
+4. **Optional hardening:** a one-time `PressureConfig` validation (`DeltaScale > 0`, weights ≥ 0) — cheapest place to kill the only unguarded divisor (a `DeltaScale=0` config typo would silently inactivate the Delta signal). Deferred to when weights are hand-edited in Plan D.
