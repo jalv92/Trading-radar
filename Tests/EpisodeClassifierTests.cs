@@ -81,6 +81,37 @@ public class EpisodeClassifierTests
     }
 
     [Fact]
+    public void ErosionReads_flags_cancellation_without_trades_while_quote_away()
+    {
+        var c = new EpisodeClassifier(new RadarConfig());
+        var book = BookAskWall(200);                 // ask wall 200 @ 21000.50, bid 21000.25 (1 tick away)
+        c.OnApproach(Side.Ask, 21000.50, 200, T0);
+        // Wall thins 200 -> 140 with NO trades (pure cancellation), quote still a tick away.
+        book.ApplyDepth(new DepthEvent { Side = Side.Ask, Op = DepthOp.Update, Position = 0, Price = 21000.50, Volume = 140, Time = T0.AddMilliseconds(300) });
+        var reads = c.ErosionReads(book, T0.AddMilliseconds(400));
+        Assert.Single(reads);
+        Assert.Equal(60L, reads[0].Cancelled);
+        Assert.Equal(0L, reads[0].Traded);
+        Assert.True(reads[0].Approaching);
+        Assert.InRange(reads[0].Frac, 0.29, 0.31);   // 60 / 200
+    }
+
+    [Fact]
+    public void ErosionReads_does_not_flag_drop_explained_by_trades()
+    {
+        var c = new EpisodeClassifier(new RadarConfig());
+        var book = BookAskWall(200);
+        c.OnApproach(Side.Ask, 21000.50, 200, T0);
+        // 60 traded at the wall (buy aggressors), level shows 140 — drop is explained by trades.
+        book.ApplyTrade(new TradeEvent { Price = 21000.50, Volume = 60, Time = T0.AddMilliseconds(100) });
+        book.ApplyDepth(new DepthEvent { Side = Side.Ask, Op = DepthOp.Update, Position = 0, Price = 21000.50, Volume = 140, Time = T0.AddMilliseconds(150) });
+        var reads = c.ErosionReads(book, T0.AddMilliseconds(200));
+        Assert.Single(reads);
+        Assert.Equal(0L, reads[0].Cancelled);        // drop fully attributed to trading
+        Assert.Equal(0.0, reads[0].Frac);
+    }
+
+    [Fact]
     public void Absorbed_bid_wall_when_sell_aggressors_explain_drop()
     {
         // Exercises ConsumingAggressor(Bid→Side.Bid), QuoteCrossed Bid branch, QuoteTicksAway Bid branch.

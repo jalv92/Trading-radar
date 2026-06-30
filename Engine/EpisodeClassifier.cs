@@ -13,6 +13,18 @@ namespace TradingRadar.Engine
         public DateTime ResolvedAt;
     }
 
+    public struct ErosionRead
+    {
+        public Side Side;
+        public double Price;
+        public long SizeAtOpen;
+        public long Displayed;
+        public long Traded;
+        public long Cancelled;
+        public double Frac;        // cancelled / sizeAtOpen — drop NOT explained by trades
+        public bool Approaching;   // quote still >= D_pull ticks away and not crossed
+    }
+
     // Attributes every size decrease at a tracked price by cross-referencing Last prints.
     // Stateful per open episode; pure (no clock, no NT).
     public class EpisodeClassifier
@@ -110,6 +122,30 @@ namespace TradingRadar.Engine
         {
             if (_resolved.Count > 0) { r = _resolved.Dequeue(); return true; }
             r = default(EpisodeResult); return false;
+        }
+
+        // Per open episode: how much of the size drop is unexplained by trades (cancellation)
+        // while the quote is still approaching. Frac>0 & Approaching = partial pull (spec §7).
+        public IReadOnlyList<ErosionRead> ErosionReads(BookMirror book, DateTime now)
+        {
+            var outl = new List<ErosionRead>();
+            foreach (var ep in _open.Values)
+            {
+                long displayed = CurrentVolume(book, ep.Side, ep.Price);
+                long drop = Math.Max(0, ep.SizeAtOpen - displayed);
+                long traded = book.TradedAt(ep.Price, ep.OpenTime, ConsumingAggressor(ep.Side));
+                long cancelled = Math.Max(0, drop - traded);
+                bool approaching = QuoteTicksAway(book, ep.Side, ep.Price) >= _cfg.D_pull
+                                   && !QuoteCrossed(book, ep.Side, ep.Price);
+                double frac = ep.SizeAtOpen > 0 ? (double)cancelled / ep.SizeAtOpen : 0.0;
+                outl.Add(new ErosionRead
+                {
+                    Side = ep.Side, Price = ep.Price, SizeAtOpen = ep.SizeAtOpen,
+                    Displayed = displayed, Traded = traded, Cancelled = cancelled,
+                    Frac = frac, Approaching = approaching
+                });
+            }
+            return outl;
         }
 
         private long CurrentVolume(BookMirror book, Side side, double price)
