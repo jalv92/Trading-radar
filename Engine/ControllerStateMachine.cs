@@ -83,8 +83,11 @@ namespace TradingRadar.Engine
             o.Fired = fired;
             // ponytail: while a side is latched Fired, keep reporting its FireEvent (not just on the
             // exact firing tick) — `fire` above is a fresh per-call local and would otherwise go back
-            // to default() the moment HoldCount stops advancing.
+            // to default() the moment HoldCount stops advancing. When both sides are latched, recency
+            // (FireEvent.Time) breaks the tie — otherwise Long's stale fire would shadow a live Short.
             o.Fire = fired ? fire
+                : _long.State == SideState.Fired && _short.State == SideState.Fired
+                    ? (_long.LastFire.Time >= _short.LastFire.Time ? _long.LastFire : _short.LastFire)
                 : _long.State == SideState.Fired ? _long.LastFire
                 : _short.State == SideState.Fired ? _short.LastFire
                 : default(FireEvent);
@@ -112,7 +115,8 @@ namespace TradingRadar.Engine
                     }
                     break;
                 case SideState.Armed:
-                    if (cur <= 0 || System.Math.Abs(price - c.WallPrice) >= _tick) { c.State = SideState.Waiting; break; }
+                    if (cur <= 0 || System.Math.Abs(price - c.WallPrice) >= _tick)
+                    { c.State = SideState.Waiting; c.Fraction = 0; c.HoldCount = 0; break; }
                     AdvanceArmedOrCountdown(c, Side.Ask, cur, inp);
                     break;
                 case SideState.Cooldown:
@@ -121,8 +125,11 @@ namespace TradingRadar.Engine
                 case SideState.Countdown:
                     return StepCountdown(c, Side.Ask, cur, inp, chop, ref fire);
                 case SideState.Fired:
-                    // Reset when the wall is gone or price has clearly crossed/held past it.
-                    if (cur <= 0 || inp.Mid > c.WallPrice + _cfg.AwayTicks * _tick)
+                    // Reset when the wall is gone, price confirms the break, OR the break failed and
+                    // reversed back past the wall (false break) — symmetric, same metric as StepCountdown's
+                    // away-band. No wall-identity check: after a fire the eaten wall vanishes and dominance
+                    // hops immediately, so an identity check would un-latch the SETUP indicator instantly.
+                    if (cur <= 0 || Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick)
                     { c.State = SideState.Waiting; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.Fraction = 0; }
                     break;
             }
@@ -133,6 +140,10 @@ namespace TradingRadar.Engine
         {
             double curWallPrice = wallSide == Side.Ask ? inp.WallAbovePrice : inp.WallBelowPrice;
             if (cur <= 0 || System.Math.Abs(curWallPrice - c.WallPrice) >= _tick)
+            { c.State = SideState.Waiting; c.Fraction = 0; c.HoldCount = 0; return false; }
+            // The trade ring can no longer prove trades back to ArmTime — re-baseline instead of
+            // silently under-counting Traded (which would misroute clean consumption into the pull veto).
+            if (inp.Now - c.ArmTime >= inp.Book.TradeRetention)
             { c.State = SideState.Waiting; c.Fraction = 0; c.HoldCount = 0; return false; }
             if (cur > c.Peak) c.Peak = cur;
             if (cur < c.Min) c.Min = cur;
@@ -170,6 +181,10 @@ namespace TradingRadar.Engine
 
         private void AdvanceArmedOrCountdown(Candidate c, Side wallSide, long cur, ControllerInputs inp)
         {
+            // The trade ring can no longer prove trades back to ArmTime — re-baseline instead of
+            // silently under-counting Traded (which would misroute clean consumption into the pull veto).
+            if (inp.Now - c.ArmTime >= inp.Book.TradeRetention)
+            { c.State = SideState.Waiting; c.Fraction = 0; c.HoldCount = 0; return; }
             if (cur > c.Peak) c.Peak = cur;
             if (cur < c.Min) c.Min = cur;
             ConsumptionRead r = ConsumptionTracker.Read(wallSide, c.WallPrice, c.Peak, cur, c.ArmTime, inp.Book);
@@ -198,7 +213,8 @@ namespace TradingRadar.Engine
                     }
                     break;
                 case SideState.Armed:
-                    if (cur <= 0 || System.Math.Abs(price - c.WallPrice) >= _tick) { c.State = SideState.Waiting; break; }
+                    if (cur <= 0 || System.Math.Abs(price - c.WallPrice) >= _tick)
+                    { c.State = SideState.Waiting; c.Fraction = 0; c.HoldCount = 0; break; }
                     AdvanceArmedOrCountdown(c, Side.Bid, cur, inp);
                     break;
                 case SideState.Cooldown:
@@ -207,8 +223,11 @@ namespace TradingRadar.Engine
                 case SideState.Countdown:
                     return StepCountdown(c, Side.Bid, cur, inp, chop, ref fire);
                 case SideState.Fired:
-                    // Reset when the wall is gone or price has clearly crossed/held past it (flipped direction).
-                    if (cur <= 0 || inp.Mid < c.WallPrice - _cfg.AwayTicks * _tick)
+                    // Reset when the wall is gone, price confirms the break, OR the break failed and
+                    // reversed back past the wall (false break) — symmetric, same metric as StepCountdown's
+                    // away-band. No wall-identity check: after a fire the eaten wall vanishes and dominance
+                    // hops immediately, so an identity check would un-latch the SETUP indicator instantly.
+                    if (cur <= 0 || Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick)
                     { c.State = SideState.Waiting; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.Fraction = 0; }
                     break;
             }

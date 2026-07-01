@@ -18,6 +18,7 @@ namespace TradingRadar.Engine
 
         public void Sample(double rate, DateTime now)
         {
+            if (double.IsNaN(rate) || double.IsInfinity(rate)) return; // boundary insurance — would poison _mean/_var forever
             if (_n == 0) { _mean = rate; _var = 0; _n = 1; ZScore = 0; return; }
             _n++;   // count this sample first so Ready and the ZScore gate flip on the same call
             // Score the new sample against the baseline BEFORE absorbing it (avoids the

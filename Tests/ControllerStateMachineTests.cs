@@ -231,4 +231,145 @@ public class ControllerStateMachineTests
         var o3 = m.Update(In(100.75, 60, 0, 0, 20, 2.0, 0, 100.00, 3, EmptyBook())); // wall hops to 100.75 mid-countdown
         Assert.Equal(SideState.Waiting, o3.Long);
     }
+
+    static BookMirror BookWithSells(double wallPrice, long vol, int sec)
+    {
+        var b = new BookMirror(0.25, TimeSpan.FromSeconds(60));
+        b.ApplyDepth(new DepthEvent { Side = Side.Ask, Op = DepthOp.Add, Position = 0, Price = wallPrice + 0.5, Volume = 20, Time = T(0) });
+        b.ApplyDepth(new DepthEvent { Side = Side.Bid, Op = DepthOp.Add, Position = 0, Price = wallPrice,       Volume = 5,  Time = T(0) });
+        b.ApplyTrade(new TradeEvent { Price = wallPrice, Volume = vol, Time = T(sec) }); // sell aggressor at the wall
+        return b;
+    }
+
+    // Fix 1 regression: a false break (price pokes past the wall, then reverses back through it) must
+    // NOT leave the Fired candidate latched forever — it has to reset via the symmetric away-band check.
+    [Fact]
+    public void Fired_long_resets_on_false_break_reversal_then_rearms_after_cooldown()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));
+        int fires = 0; ControllerOutput o = default(ControllerOutput);
+        for (int s = 2; s <= 8; s++) { var b = BookWithBuys(100.25, 90, s); o = m.Update(In(100.25, 30, 0, 0, 20, 2.0, 0, 100.00, s, b)); if (o.Fired) fires++; }
+        Assert.Equal(1, fires);
+        Assert.Equal(SideState.Fired, o.Long);
+        // False break: price reverses back below the wall by more than AwayTicks; wall still present (cur>0).
+        var oReversed = m.Update(In(100.25, 30, 0, 0, 0, 0, 0, 98.50, 9, EmptyBook()));
+        Assert.Equal(SideState.Waiting, oReversed.Long);
+        // Still cooling down (10s from the reset tick) -> a fresh big wall must not re-arm yet.
+        var oCooling = m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 98.50, 15, EmptyBook()));
+        Assert.Equal(SideState.Waiting, oCooling.Long);
+        // Cooldown elapsed -> re-arms.
+        var oRearm = m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 98.50, 20, EmptyBook()));
+        Assert.Equal(SideState.Armed, oRearm.Long);
+    }
+
+    // Fix 2 regression: when both candidates are latched Fired, the most recently-fired side's
+    // FireEvent must win, not Long unconditionally.
+    [Fact]
+    public void Fire_reports_most_recent_side_when_both_are_latched()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));                // arm Long
+        ControllerOutput o = default(ControllerOutput);
+        for (int s = 2; s <= 8; s++) { var b = BookWithBuys(100.25, 90, s); o = m.Update(In(100.25, 30, 0, 0, 20, 2.0, 0, 100.00, s, b)); }
+        Assert.Equal(SideState.Fired, o.Long);
+        Assert.Equal(Side.Ask, o.Fire.Side);
+
+        o = m.Update(In(100.25, 30, 99.75, 120, 0, 0, 0, 100.00, 9, EmptyBook()));        // arm Short, peak 120
+        var bs = BookWithSells(99.75, 60, 10);
+        o = m.Update(In(100.25, 30, 99.75, 60, -20, 2.0, 0, 100.00, 10, bs));             // Armed -> Countdown
+        for (int s = 11; s <= 14; s++)                                                    // fires at s=13, latches
+        {
+            var b = BookWithSells(99.75, 90, s);
+            o = m.Update(In(100.25, 30, 99.75, 30, delta: -20, z: 2.0, alt: 0, mid: 100.00, sec: s, book: b));
+        }
+        Assert.Equal(SideState.Fired, o.Short);
+        Assert.False(o.Fired);                    // s=14 is a non-firing tick after the fire
+        Assert.Equal(Side.Bid, o.Fire.Side);       // the more recent fire, not the stale Long event
+    }
+
+    // Fix 4 regression: abandoning Armed on a wall hop must zero the reported Fraction, not leak
+    // the last-eaten value while the candidate sits Waiting.
+    [Fact]
+    public void Armed_abandon_on_wall_hop_resets_output_fraction()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));            // arm peak 120
+        var o1 = m.Update(In(100.25, 119, 0, 0, 0, 0, 0, 100.00, 2, EmptyBook()));   // small drop, stays Armed, Fraction>0
+        Assert.Equal(SideState.Armed, o1.Long);
+        Assert.True(o1.LongFraction > 0);
+        var o2 = m.Update(In(100.50, 119, 0, 0, 0, 0, 0, 100.00, 3, EmptyBook()));   // wall hops >= 1 tick -> abandon
+        Assert.Equal(SideState.Waiting, o2.Long);
+        Assert.Equal(0, o2.LongFraction);
+    }
+
+    // Fix 3 regression: a hold that outlives BookMirror's trade retention must re-baseline to Waiting
+    // (not silently misread Traded and fall into the pull-veto Cooldown).
+    [Fact]
+    public void Armed_candidate_rebaselines_when_hold_outlives_trade_retention()
+    {
+        var m = Machine();
+        var book = EmptyBook(); // retention = 30s
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, book));                  // arm at T(1)
+        var o = m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 35, book));         // T(35): 34s held, past 30s retention
+        Assert.Equal(SideState.Waiting, o.Long);
+        Assert.NotEqual(SideState.Cooldown, o.Long);
+        var oRearm = m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 36, book));    // re-arms next tick (fresh ArmTime)
+        Assert.Equal(SideState.Armed, oRearm.Long);
+    }
+
+    // K-debounce regression: a single snapshot that breaks a fire pre-condition must reset HoldCount
+    // to 0 — firing requires K CONSECUTIVE snapshots, not K total across an interruption.
+    [Fact]
+    public void K_debounce_resets_on_a_single_broken_snapshot()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));            // arm peak 120
+        var b2 = BookWithBuys(100.25, 60, 2);
+        m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2));                    // -> Countdown
+
+        int fires = 0; ControllerOutput o = default(ControllerOutput);
+        // Two good snapshots (HoldCount 1, 2) — one short of firing (K=3).
+        for (int s = 3; s <= 4; s++)
+        {
+            var b = BookWithBuys(100.25, 90, s);
+            o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: 2.0, alt: 0, mid: 100.00, sec: s, book: b));
+            if (o.Fired) fires++;
+        }
+        Assert.Equal(SideState.Countdown, o.Long);
+        Assert.Equal(0, fires);
+
+        // Interrupt: delta drops below the floor for one snapshot -> HoldCount resets to 0.
+        var bBad = BookWithBuys(100.25, 90, 5);
+        o = m.Update(In(100.25, 30, 0, 0, delta: 0, z: 2.0, alt: 0, mid: 100.00, sec: 5, book: bBad));
+        Assert.False(o.Fired);
+
+        // One good snapshot after the interruption must NOT fire — the counter restarted.
+        var bGood1 = BookWithBuys(100.25, 90, 6);
+        o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: 2.0, alt: 0, mid: 100.00, sec: 6, book: bGood1));
+        Assert.False(o.Fired);
+
+        // Two more consecutive good snapshots complete a fresh K=3 -> fires.
+        var bGood2 = BookWithBuys(100.25, 90, 7);
+        o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: 2.0, alt: 0, mid: 100.00, sec: 7, book: bGood2));
+        Assert.False(o.Fired);
+        var bGood3 = BookWithBuys(100.25, 90, 8);
+        o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: 2.0, alt: 0, mid: 100.00, sec: 8, book: bGood3));
+        Assert.True(o.Fired);
+    }
+
+    // Countdown wall-vanish abandon must reset to Waiting with a zeroed fraction and no fire.
+    [Fact]
+    public void Countdown_abandons_to_waiting_when_wall_vanishes()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));
+        var b2 = BookWithBuys(100.25, 60, 2);
+        var o2 = m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2));
+        Assert.Equal(SideState.Countdown, o2.Long);
+        var o3 = m.Update(In(100.25, 0, 0, 0, 20, 2.0, 0, 100.00, 3, EmptyBook())); // wall gone
+        Assert.Equal(SideState.Waiting, o3.Long);
+        Assert.Equal(0, o3.LongFraction);
+        Assert.False(o3.Fired);
+    }
 }

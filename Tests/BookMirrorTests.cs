@@ -152,4 +152,33 @@ public class BookMirrorTests
         b.ApplyTrade(new TradeEvent { Price = 100.25, Volume = 1, Time = T(3) }); // buy   -> alt 2
         Assert.Equal(2, b.RecentAlternations(3));
     }
+
+    // Fix 6 regression: lookback=0 must mean "none", not "all" — contract says "last lookback retained trades".
+    [Fact]
+    public void RecentAlternations_zero_lookback_returns_zero()
+    {
+        var b = new BookMirror(0.25, System.TimeSpan.FromSeconds(10));
+        b.ApplyDepth(new DepthEvent { Side = Side.Bid, Op = DepthOp.Add, Position = 0, Price = 99.75, Volume = 50, Time = T(0) });
+        b.ApplyDepth(new DepthEvent { Side = Side.Ask, Op = DepthOp.Add, Position = 0, Price = 100.25, Volume = 50, Time = T(0) });
+        b.ApplyTrade(new TradeEvent { Price = 100.25, Volume = 1, Time = T(1) }); // buy
+        b.ApplyTrade(new TradeEvent { Price = 99.75,  Volume = 1, Time = T(2) }); // sell -> alt
+        b.ApplyTrade(new TradeEvent { Price = 100.25, Volume = 1, Time = T(3) }); // buy  -> alt
+        Assert.Equal(0, b.RecentAlternations(0));
+    }
+
+    // Fix 6 regression: lookback must truncate to the last N trades, not silently fall back to full history.
+    [Fact]
+    public void RecentAlternations_lookback_truncates_to_the_last_n_trades()
+    {
+        var b = new BookMirror(0.25, System.TimeSpan.FromSeconds(30));
+        b.ApplyDepth(new DepthEvent { Side = Side.Bid, Op = DepthOp.Add, Position = 0, Price = 99.75, Volume = 50, Time = T(0) });
+        b.ApplyDepth(new DepthEvent { Side = Side.Ask, Op = DepthOp.Add, Position = 0, Price = 100.25, Volume = 50, Time = T(0) });
+        b.ApplyTrade(new TradeEvent { Price = 100.25, Volume = 1, Time = T(1) }); // buy
+        b.ApplyTrade(new TradeEvent { Price = 99.75,  Volume = 1, Time = T(2) }); // sell -> alt
+        b.ApplyTrade(new TradeEvent { Price = 100.25, Volume = 1, Time = T(3) }); // buy  -> alt
+        b.ApplyTrade(new TradeEvent { Price = 100.25, Volume = 1, Time = T(4) }); // buy
+        b.ApplyTrade(new TradeEvent { Price = 100.25, Volume = 1, Time = T(5) }); // buy
+        Assert.Equal(2, b.RecentAlternations(100));  // full history: buy,sell,buy,buy,buy -> 2 alternations
+        Assert.Equal(0, b.RecentAlternations(3));    // last 3 trades: buy,buy,buy -> 0 alternations
+    }
 }

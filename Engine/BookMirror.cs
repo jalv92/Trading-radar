@@ -22,6 +22,8 @@ namespace TradingRadar.Engine
             _tradeRetention = tradeRetention;
         }
 
+        public TimeSpan TradeRetention { get { return _tradeRetention; } }
+
         private List<DepthLevel> SideList(Side s) { return s == Side.Bid ? _bids : _asks; }
         private bool SamePrice(double a, double b) { return Math.Abs(a - b) < _tick / 2.0; }
 
@@ -162,8 +164,9 @@ namespace TradingRadar.Engine
         // Aggressor sign changes across the last `lookback` retained trades (oldest->newest).
         public int RecentAlternations(int lookback)
         {
+            if (lookback <= 0) return 0;
             int n = _trades.Count;
-            int start = lookback <= 0 || lookback >= n ? 0 : n - lookback;
+            int start = lookback >= n ? 0 : n - lookback;
             int alts = 0;
             bool have = false; Side prev = Side.Ask;
             for (int i = start; i < n; i++)

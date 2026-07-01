@@ -48,4 +48,18 @@ public class TapeSpeedTests
         Assert.True(ts.Ready);
         Assert.NotEqual(0.0, ts.ZScore);     // must be computable on the same call
     }
+
+    // Fix 5 regression: a NaN/Infinity sample must be ignored, not absorbed into _mean/_var
+    // (which would poison every future ZScore for the rest of the session).
+    [Fact]
+    public void NaN_or_infinite_sample_does_not_poison_the_baseline()
+    {
+        var ts = new TapeSpeed(0.1);
+        for (int i = 0; i < 80; i++) ts.Sample(10.0 + (i % 2 == 0 ? 1.0 : -1.0), T(i * 50));
+        ts.Sample(double.NaN, T(4000));
+        ts.Sample(double.PositiveInfinity, T(4050));
+        Assert.False(double.IsNaN(ts.ZScore) || double.IsInfinity(ts.ZScore));
+        ts.Sample(11.0, T(4100));            // within the noise band — must still read sane, not poisoned
+        Assert.True(ts.ZScore < 2.0);
+    }
 }
