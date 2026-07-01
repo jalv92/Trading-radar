@@ -141,5 +141,38 @@ namespace TradingRadar.Engine
             }
             return buy - sell;
         }
+
+        public Side AggressorOf(double price) { return InferAggressor(price); }
+
+        public struct TapeWindow { public int Prints; public long BuyVol; public long SellVol; }
+
+        public TapeWindow WindowSince(DateTime since)
+        {
+            TapeWindow w = new TapeWindow();
+            for (int i = 0; i < _trades.Count; i++)
+            {
+                Trade tr = _trades[i];
+                if (tr.Time < since) continue;
+                w.Prints++;
+                if (tr.Aggressor == Side.Ask) w.BuyVol += tr.Volume; else w.SellVol += tr.Volume;
+            }
+            return w;
+        }
+
+        // Aggressor sign changes across the last `lookback` retained trades (oldest->newest).
+        public int RecentAlternations(int lookback)
+        {
+            int n = _trades.Count;
+            int start = lookback <= 0 || lookback >= n ? 0 : n - lookback;
+            int alts = 0;
+            bool have = false; Side prev = Side.Ask;
+            for (int i = start; i < n; i++)
+            {
+                Side a = _trades[i].Aggressor;
+                if (have && a != prev) alts++;
+                prev = a; have = true;
+            }
+            return alts;
+        }
     }
 }

@@ -6,6 +6,7 @@ using Xunit;
 public class BookMirrorTests
 {
     static readonly DateTime T0 = new DateTime(2026, 6, 28, 9, 30, 0, DateTimeKind.Utc);
+    static System.DateTime T(int s) => new System.DateTime(2026, 1, 1, 0, 0, 0, System.DateTimeKind.Utc).AddSeconds(s);
     static BookMirror NewBook() => new BookMirror(0.25, TimeSpan.FromSeconds(10));
 
     static DepthEvent Dep(Side s, DepthOp op, int pos, double px, long vol, double secs) =>
@@ -122,5 +123,33 @@ public class BookMirrorTests
         b.ApplyTrade(new TradeEvent { Price = 100.00, Volume = 25, Time = t0.AddMilliseconds(300) });
         Assert.Equal(45L, b.AggressorDelta(t0));               // 70 buy - 25 sell
         Assert.Equal(-25L, b.AggressorDelta(t0.AddMilliseconds(250))); // only the sell after cutoff
+    }
+
+    [Fact]
+    public void WindowSince_counts_prints_and_splits_buy_sell_volume()
+    {
+        var b = new BookMirror(0.25, System.TimeSpan.FromSeconds(10));
+        // Establish an inside so aggressor inference is well-defined.
+        b.ApplyDepth(new DepthEvent { Side = Side.Bid, Op = DepthOp.Add, Position = 0, Price = 99.75, Volume = 50, Time = T(0) });
+        b.ApplyDepth(new DepthEvent { Side = Side.Ask, Op = DepthOp.Add, Position = 0, Price = 100.25, Volume = 50, Time = T(0) });
+        b.ApplyTrade(new TradeEvent { Price = 100.25, Volume = 3, Time = T(1) }); // buy (lifted ask)
+        b.ApplyTrade(new TradeEvent { Price = 100.25, Volume = 2, Time = T(2) }); // buy
+        b.ApplyTrade(new TradeEvent { Price = 99.75,  Volume = 4, Time = T(3) }); // sell (hit bid)
+        var w = b.WindowSince(T(0));
+        Assert.Equal(3, w.Prints);
+        Assert.Equal(5, w.BuyVol);
+        Assert.Equal(4, w.SellVol);
+    }
+
+    [Fact]
+    public void RecentAlternations_counts_aggressor_sign_changes()
+    {
+        var b = new BookMirror(0.25, System.TimeSpan.FromSeconds(10));
+        b.ApplyDepth(new DepthEvent { Side = Side.Bid, Op = DepthOp.Add, Position = 0, Price = 99.75, Volume = 50, Time = T(0) });
+        b.ApplyDepth(new DepthEvent { Side = Side.Ask, Op = DepthOp.Add, Position = 0, Price = 100.25, Volume = 50, Time = T(0) });
+        b.ApplyTrade(new TradeEvent { Price = 100.25, Volume = 1, Time = T(1) }); // buy
+        b.ApplyTrade(new TradeEvent { Price = 99.75,  Volume = 1, Time = T(2) }); // sell  -> alt 1
+        b.ApplyTrade(new TradeEvent { Price = 100.25, Volume = 1, Time = T(3) }); // buy   -> alt 2
+        Assert.Equal(2, b.RecentAlternations(3));
     }
 }
