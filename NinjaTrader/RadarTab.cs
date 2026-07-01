@@ -32,6 +32,7 @@ namespace TradingRadar.NT
         private WallTracker _tracker;
         private RadarVisual _visual;
         private CockpitVisual _cockpit;
+        private RadarChartTrader _chartTrader;
         private PressureModel _pressure = new PressureModel(new PressureConfig());
         private InstrumentSelector _selector;
 
@@ -146,11 +147,19 @@ namespace TradingRadar.NT
             topBar.Children.Add(recChk);
             DockPanel.SetDock(topBar, Dock.Top);
             root.Children.Add(topBar);
+            // Right column: Cockpit fills, Chart Trader docked at the bottom (spec §8).
+            _chartTrader = new RadarChartTrader();
+            Grid rightCol = new Grid();
+            rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1.0, GridUnitType.Star) });
+            rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(200) });
+            Grid.SetRow(_cockpit, 0);     rightCol.Children.Add(_cockpit);
+            Grid.SetRow(_chartTrader, 1); rightCol.Children.Add(_chartTrader);
+
             Grid split = new Grid();
             split.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0, GridUnitType.Star) });
             split.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.05, GridUnitType.Star) });
             Grid.SetColumn(_visual, 0); split.Children.Add(_visual);
-            Grid.SetColumn(_cockpit, 1); split.Children.Add(_cockpit);
+            Grid.SetColumn(rightCol, 1); split.Children.Add(rightCol);
             root.Children.Add(split);            // fills remaining space (DockPanel LastChildFill)
             Content = root;
 
@@ -166,6 +175,7 @@ namespace TradingRadar.NT
                 {
                     _visual.SetFrame(f.Nodes, f.Bids, f.Asks, f.Mid, f.Tick);
                     _cockpit.SetFrame(f.PInputs, f.PResult);
+                    _chartTrader.SetLastPrice(f.Mid);  // reuse the already-marshaled book mid for live PnL
                 }
                 _visual.AdvanceAnimation(); // sweep/fade clock
                 if (_minSizeBox != null)
@@ -207,6 +217,7 @@ namespace TradingRadar.NT
                 _book    = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
                 _tracker = new WallTracker(_cfg);
                 _latest  = null;
+                if (_chartTrader != null) _chartTrader.Instrument = value;
                 Subscribe();
                 RefreshHeader();
             }
@@ -455,6 +466,7 @@ namespace TradingRadar.NT
             if (_sigWriter != null) { _sigWriter.Flush(); _sigWriter.Dispose(); _sigWriter = null; }
             _selector.InstrumentChanged -= OnSelectorChanged;
             if (_paintTimer != null) { _paintTimer.Stop(); _paintTimer = null; }
+            if (_chartTrader != null) _chartTrader.Cleanup();
             Unsubscribe();
         }
 
