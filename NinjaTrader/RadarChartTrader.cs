@@ -606,13 +606,16 @@ namespace TradingRadar.NT
         private double LimitAnchorPrice(bool isBuy)
         {
             double tick = EffectiveTick();
+            // Rest just IN FRONT of the wall (toward price): BUY = 1 tick ABOVE the support wall below mid,
+            // SELL = 1 tick BELOW the resistance wall above mid. Both stay non-marketable when the wall is
+            // >1 tick from mid (the normal case). ponytail: F14 — no fresh-quote clamp on submit yet.
             if (isBuy)
             {
-                if (_wallBelow > 0) return RoundToTick(_wallBelow - tick, tick);
+                if (_wallBelow > 0) return RoundToTick(_wallBelow + tick, tick);
                 Diag("BUY LMT: no wall below mid — anchoring at mid - 1 tick (best-bid proxy).");
                 return RoundToTick(_lastPrice - tick, tick);
             }
-            if (_wallAbove > 0) return RoundToTick(_wallAbove + tick, tick);
+            if (_wallAbove > 0) return RoundToTick(_wallAbove - tick, tick);
             Diag("SELL LMT: no wall above mid — anchoring at mid + 1 tick (best-ask proxy).");
             return RoundToTick(_lastPrice + tick, tick);
         }
