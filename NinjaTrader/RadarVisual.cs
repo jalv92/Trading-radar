@@ -96,6 +96,11 @@ namespace TradingRadar.NT
             // Anchored y-mapping: price of the top row is _anchorTop; rows go downward by _tick each.
             double Y(double price) { return ((_anchorTop - price) / _tick) * rowH; }
 
+            // A row is drawn only if its whole cell fits on-screen — never render a bar the
+            // top/bottom edge would clip. Rows that don't fit surface as edge markers instead.
+            double halfRow = rowH * 0.5;
+            bool RowVisible(double y) { return y - halfRow >= 0 && y + halfRow <= h; }
+
             // maxSize spans book levels + wall nodes so bar widths are proportional across both layers.
             long maxSize = 1;
             if (_nodes != null) for (int i = 0; i < _nodes.Count; i++) if (_nodes[i].LastKnownSize > maxSize) maxSize = _nodes[i].LastKnownSize;
@@ -115,7 +120,7 @@ namespace TradingRadar.NT
                 {
                     if (liveNodeKeys.Contains((long)Math.Round(_bids[i].Price / _tick))) continue;
                     double y = Y(_bids[i].Price);
-                    if (y < 0 || y > h) continue;
+                    if (!RowVisible(y)) continue;
                     double barW   = Math.Max(2.0, (_bids[i].Volume / (double)maxSize) * barMaxW);
                     double rowTop = y - rowH * 0.35, rowHt = rowH * 0.70;
                     dc.DrawRoundedRectangle(BidBook, null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
@@ -127,7 +132,7 @@ namespace TradingRadar.NT
                 {
                     if (liveNodeKeys.Contains((long)Math.Round(_asks[i].Price / _tick))) continue;
                     double y = Y(_asks[i].Price);
-                    if (y < 0 || y > h) continue;
+                    if (!RowVisible(y)) continue;
                     double barW   = Math.Max(2.0, (_asks[i].Volume / (double)maxSize) * barMaxW);
                     double rowTop = y - rowH * 0.35, rowHt = rowH * 0.70;
                     dc.DrawRoundedRectangle(AskBook, null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
@@ -142,7 +147,7 @@ namespace TradingRadar.NT
                 RadarNode n    = _nodes[i];
                 if (!Visible(n)) continue;
                 double    y    = Y(n.Price);
-                if (y < 0 || y > h) continue;
+                if (!RowVisible(y)) continue;
 
                 bool blind  = !n.InWindow || n.State == NodeState.Remembered;
                 bool isBid  = n.Side == Side.Bid;
@@ -220,8 +225,8 @@ namespace TradingRadar.NT
                 {
                     if (!Visible(_nodes[i])) continue;
                     double ny = Y(_nodes[i].Price);
-                    if      (ny < 0) above.Add(_nodes[i]);
-                    else if (ny > h) below.Add(_nodes[i]);
+                    if      (ny < halfRow)     above.Add(_nodes[i]);   // off-screen OR top row that would clip
+                    else if (ny > h - halfRow) below.Add(_nodes[i]);
                 }
                 // Above: ascending price = index 0 is nearest to the top edge.
                 above.Sort((a, b) => a.Price.CompareTo(b.Price));
