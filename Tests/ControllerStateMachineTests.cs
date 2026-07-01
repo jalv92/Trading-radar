@@ -192,7 +192,7 @@ public class ControllerStateMachineTests
         Assert.Equal(SideState.Fired, o.Long);
         // Price breaks up and holds well past the wall -> reset to Waiting.
         var oReset = m.Update(In(100.25, 0, 0, 0, 0, 0, 0, 102.00, 9, EmptyBook())); // cur<=0 AND mid far above wall
-        Assert.NotEqual(SideState.Fired, oReset.Long);
+        Assert.Equal(SideState.Waiting, oReset.Long);
         // A fresh dominant wall appears above the new price, after the post-fire Cooldown (10s) elapses -> re-arms.
         var oRearm = m.Update(In(103.00, 120, 0, 0, 0, 0, 0, 102.75, 20, EmptyBook()));
         Assert.Equal(SideState.Armed, oRearm.Long);
@@ -206,5 +206,29 @@ public class ControllerStateMachineTests
         m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));            // arm peak 120
         var o = m.Update(In(100.25, 119, 0, 0, 0, 0, 0, 100.00, 2, EmptyBook()));    // 1-lot drop, no trades, < MinDropBand -> stay Armed
         Assert.Equal(SideState.Armed, o.Long);
+    }
+
+    // Wall-identity guard: if NT's dominant ask wall hops to a different price after arming,
+    // the armed Long candidate abandons to Waiting rather than mixing two walls' size history.
+    [Fact]
+    public void Wall_hop_abandons_armed_candidate()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));         // arm Long at 100.25
+        var o = m.Update(In(100.50, 120, 0, 0, 0, 0, 0, 100.00, 2, EmptyBook())); // dominant wall now 100.50 (>=1 tick away)
+        Assert.Equal(SideState.Waiting, o.Long);
+    }
+
+    // Same guard, but the hop happens while in Countdown.
+    [Fact]
+    public void Wall_hop_during_countdown_abandons()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));         // arm at 100.25
+        var b2 = BookWithBuys(100.25, 60, 2);
+        var o2 = m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2));       // -> Countdown
+        Assert.Equal(SideState.Countdown, o2.Long);
+        var o3 = m.Update(In(100.75, 60, 0, 0, 20, 2.0, 0, 100.00, 3, EmptyBook())); // wall hops to 100.75 mid-countdown
+        Assert.Equal(SideState.Waiting, o3.Long);
     }
 }
