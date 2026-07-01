@@ -56,6 +56,12 @@ namespace TradingRadar.NT
         private double _tick;
         private Order _activeLimit;     // the one working limit order this control currently has resting
         private readonly HashSet<Order> _workingOrders = new HashSet<Order>(); // in-flight orders this control submitted
+        // Durable ownership: every Order this control ever created via SubmitRaw, kept until terminal.
+        // OnOrderUpdate gates on this FIRST — an ATM's stop/target legs (or any other order on the same
+        // account/instrument, e.g. AbsorptionScalper) are never ours and must never become _activeLimit.
+        private readonly HashSet<Order> _ownOrders = new HashSet<Order>();
+        private bool _atmUserPicked;    // true only once the user has actually opened+closed the ATM dropdown
+                                         // with a template selected — a stale/auto-selected item never attaches
 
         // A same-side LMT re-anchor uses Account.Change() directly (atomic). An opposite-side flip must
         // cancel the old order first and only THEN submit the new one — stashed here and fired from
@@ -92,11 +98,16 @@ namespace TradingRadar.NT
             FontWeight = FontWeights.SemiBold, Foreground = Muted, Text = "FLAT" };
         private readonly TextBlock _pnlText = new TextBlock { FontFamily = new FontFamily("Consolas"), FontSize = 12,
             Foreground = Muted };
+        // The real platform control (NinjaTrader.Gui.dll, confirmed via decompile: "AtmStrategySelector : ComboBox"
+        // with settable Account/Instrument props) — it self-populates from the templates available for
+        // Account+Instrument, so no manual template enumeration is needed. Unselected = "None" (no ATM).
+        private readonly NinjaTrader.Gui.NinjaScript.AtmStrategy.AtmStrategySelector _atmSelector =
+            new NinjaTrader.Gui.NinjaScript.AtmStrategy.AtmStrategySelector();
 
         public RadarChartTrader()
         {
             Background = Panel;
-            for (int i = 0; i < 6; i++) RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            for (int i = 0; i < 7; i++) RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
             _buyBtn     = MakeNeonButton("BUY MKT",  BuyFill,    BuyHover,    BuyBorder,  BuyText,  40, 14, 9, Emerald.Color);
             _sellBtn    = MakeNeonButton("SELL MKT", SellFill,   SellHover,   SellBorder, SellText, 40, 14, 9, Coral.Color);
@@ -144,9 +155,10 @@ namespace TradingRadar.NT
             // Row 2: ▲ / ▼ — move the active working limit 1 tick; disabled when none is working.
             AddRow(2, TwoColRow(_upBtn, _dnBtn, 8, 0));
 
-            // Row 3: Rev / Close / Flat — 3 equal columns, evenly spread.
+            // Row 3: Rev / Close / Flat — 3 equal columns, wrapped in a bordered card (same treatment as
+            // the PnL bar below) so it reads as a grouped panel like the rest of the surface, not bare.
             {
-                var row = new Grid { Margin = new Thickness(8, 4, 8, 4) };
+                var row = new Grid();
                 for (int c = 0; c < 3; c++) row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
                 _revBtn.Margin   = new Thickness(0, 0, 3, 0);
                 _closeBtn.Margin = new Thickness(3, 0, 3, 0);
@@ -154,7 +166,9 @@ namespace TradingRadar.NT
                 SetColumn(_revBtn, 0);   row.Children.Add(_revBtn);
                 SetColumn(_closeBtn, 1); row.Children.Add(_closeBtn);
                 SetColumn(_flatBtn, 2);  row.Children.Add(_flatBtn);
-                AddRow(3, row);
+                AddRow(3, new Border { Background = PnlBarBg, BorderBrush = PanelLine, BorderThickness = new Thickness(1),
+                    CornerRadius = new CornerRadius(8), Padding = new Thickness(8, 6, 8, 6),
+                    Margin = new Thickness(8, 4, 8, 4), Child = row });
             }
 
             // Row 4: account (stretches left) + qty stepper (right), like NT8; ARM/warn wrap below.
@@ -180,7 +194,27 @@ namespace TradingRadar.NT
                 AddRow(4, new StackPanel { Children = { acctQty, armWrap } });
             }
 
-            // Row 5: position + PnL readout — bordered bar (position left, PnL right).
+            // Row 5: ATM strategy selector — optional bracket attach on MKT/LMT entries; default None
+            // (nothing selected). Styled like the account combo (Ink/TextCol/PanelLine border).
+            {
+                var atmLbl = new TextBlock { Text = "ATM", Margin = new Thickness(8, 0, 6, 0),
+                    VerticalAlignment = VerticalAlignment.Center, FontFamily = new FontFamily("Segoe UI"),
+                    FontSize = 11, Foreground = Muted };
+                DockPanel.SetDock(atmLbl, Dock.Left);
+                _atmSelector.Background = Ink;
+                _atmSelector.Foreground = TextCol;
+                _atmSelector.BorderBrush = PanelLine;
+                _atmSelector.HorizontalAlignment = HorizontalAlignment.Stretch;
+                // F16: only DropDownClosed (a real open+close by the user) can arm ATM attach — the
+                // control's own async repopulation (on Account/Instrument push) never fires this event.
+                _atmSelector.DropDownClosed += (o, e) => { _atmUserPicked = _atmSelector.SelectedAtmStrategy != null; };
+                var atmRow = new DockPanel { Margin = new Thickness(0, 4, 8, 0) };
+                atmRow.Children.Add(atmLbl);
+                atmRow.Children.Add(_atmSelector);
+                AddRow(5, atmRow);
+            }
+
+            // Row 6: position + PnL readout — bordered bar (position left, PnL right).
             {
                 _posText.VerticalAlignment = VerticalAlignment.Center;
                 _pnlText.VerticalAlignment = VerticalAlignment.Center;
@@ -190,13 +224,13 @@ namespace TradingRadar.NT
                 pnlGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                 SetColumn(_posText, 0); pnlGrid.Children.Add(_posText);
                 SetColumn(_pnlText, 1); pnlGrid.Children.Add(_pnlText);
-                AddRow(5, new Border { Background = PnlBarBg, BorderBrush = PanelLine, BorderThickness = new Thickness(1),
+                AddRow(6, new Border { Background = PnlBarBg, BorderBrush = PanelLine, BorderThickness = new Thickness(1),
                     CornerRadius = new CornerRadius(8), Padding = new Thickness(11, 7, 11, 7),
                     Margin = new Thickness(8, 4, 8, 8), Child = pnlGrid });
             }
 
-            // ponytail: no TifSelector / AtmStrategySelector / Entry button / bracket SL-TP here —
-            // MKT+LMT-only v1 per spec. TimeInForce hardcoded to Day; no ATM.
+            // ponytail: no TifSelector / Entry button / bracket SL-TP editor here — MKT+LMT(+optional
+            // ATM) v1 per spec. TimeInForce hardcoded to Day.
 
             Account.AccountStatusUpdate += OnAccountStatusUpdate;
             PopulateAccounts();
@@ -283,6 +317,10 @@ namespace TradingRadar.NT
                 _activeLimit = null;
                 _pendingReplace = null;
                 _workingOrders.Clear();
+                _ownOrders.Clear();
+                _atmSelector.Instrument = value;
+                _atmSelector.SelectedItem = null;   // force "None" — don't trust the control's own default
+                _atmUserPicked = false;             // F16: switching instrument disarms ATM attach again
                 RefreshArmUi();
                 RefreshPositionUi();
             }
@@ -363,6 +401,10 @@ namespace TradingRadar.NT
             _activeLimit = null;        // order tracking is per-account (orders/positions differ)
             _pendingReplace = null;
             _workingOrders.Clear();
+            _ownOrders.Clear();
+            _atmSelector.Account = _account;
+            _atmSelector.SelectedItem = null;   // force "None" — don't trust the control's own default
+            _atmUserPicked = false;             // F16: switching account disarms ATM attach again
             SubscribeAccount();
             RefreshArmUi();
             RefreshPositionUi();
@@ -400,7 +442,10 @@ namespace TradingRadar.NT
         {
             Instrument inst = _instrument;   // snapshot once — avoid a concurrent reassignment race
             Order ord = e.Order;
-            if (ord == null || ord.Instrument != inst) return;   // ignore other instruments
+            // F15: gate on ownership FIRST — an ATM's own stop/target legs (or anything else on this
+            // account/instrument, e.g. AbsorptionScalper) are never ours and must never reach the
+            // tracking below. _ownOrders is seeded the moment SubmitRaw creates an order.
+            if (ord == null || ord.Instrument != inst || !_ownOrders.Contains(ord)) return;
             if (e.OrderState == OrderState.Rejected)
                 Diag("order rejected: " + e.Error + " " + e.Comment);
             OrderState state = e.OrderState;
@@ -410,6 +455,7 @@ namespace TradingRadar.NT
                 if (Order.IsTerminalState(state))
                 {
                     _workingOrders.Remove(ord);   // HashSet.Remove is a no-op if already gone
+                    _ownOrders.Remove(ord);
                     if (ReferenceEquals(_activeLimit, ord)) _activeLimit = null;
                     // Opposite-side flip: the old order we cancelled just reached its terminal state —
                     // fire the stashed replacement now (only if it actually got Cancelled, not Filled/Rejected).
@@ -418,7 +464,7 @@ namespace TradingRadar.NT
                         PendingReplace p = _pendingReplace;
                         _pendingReplace = null;
                         if (state == OrderState.Cancelled)
-                            SubmitRaw(p.Action, OrderType.Limit, p.Qty, p.Price, p.Tag);
+                            SubmitRaw(p.Action, OrderType.Limit, p.Qty, p.Price, p.Tag, isEntry: true);
                         else
                             Diag("pending replace dropped — old order reached " + state + " instead of Cancelled.");
                     }
@@ -532,7 +578,7 @@ namespace TradingRadar.NT
         private void SubmitMarket(OrderAction action, string tag)
         {
             if (!ValidateForSubmit()) return;
-            SubmitRaw(action, OrderType.Market, GetQty(), 0, tag);
+            SubmitRaw(action, OrderType.Market, GetQty(), 0, tag, isEntry: true);
         }
 
         private double EffectiveTick()
@@ -607,7 +653,7 @@ namespace TradingRadar.NT
                 return;
             }
 
-            SubmitRaw(action, OrderType.Limit, qty, price, tag);
+            SubmitRaw(action, OrderType.Limit, qty, price, tag, isEntry: true);
         }
 
         // Change()'s the active working limit to a new price — used by both the ▲/▼ move and a
@@ -689,17 +735,50 @@ namespace TradingRadar.NT
         }
 
         // Single choke point for every order this control sends — guarded, try/catch, diagnostic on failure.
-        // ponytail: bracket SL/TP / ATM deferred (spec §8/§12). MKT + LMT only.
-        private void SubmitRaw(OrderAction action, OrderType type, int qty, double limitPrice, string tag)
+        // ponytail: bracket SL/TP editor / TIF selector deferred. MKT + LMT (+ optional ATM) only.
+        // isEntry=true (MKT/LMT buttons only — never Rev/Close) is the only path allowed to attach the
+        // selected ATM template; Rev/Close always submit plain regardless of what's in the ATM selector.
+        private void SubmitRaw(OrderAction action, OrderType type, int qty, double limitPrice, string tag, bool isEntry = false)
         {
             if (qty < 1) { Diag("blocked — qty < 1."); return; }
+            // F16: ATM only attaches once the user has actually picked one via the dropdown (DropDownClosed) —
+            // a stale/auto-selected SelectedAtmStrategy from the control's own async repopulate never attaches.
+            NinjaTrader.NinjaScript.AtmStrategy atm = (isEntry && _atmUserPicked) ? _atmSelector.SelectedAtmStrategy : null;
+            // ATM requires the entry order's CreateOrder "name" argument to be EXACTLY "Entry" (NT8 docs).
+            string orderName = atm != null ? "Entry" : tag;
             try
             {
                 // gtd is unused for TimeInForce.Day, but must be a real, in-range DateTime — NT8 adds an
                 // exchange/UTC offset during order processing, so DateTime.MaxValue can overflow and throw.
                 Order o = _account.CreateOrder(_instrument, action, type, OrderEntry.Manual,
-                    TimeInForce.Day, qty, limitPrice, 0, string.Empty, tag, NinjaTrader.Core.Globals.MaxDate, null);
-                _account.Submit(new[] { o });
+                    TimeInForce.Day, qty, limitPrice, 0, string.Empty, orderName, NinjaTrader.Core.Globals.MaxDate, null);
+                _ownOrders.Add(o);   // F15: seed ownership the moment we create it — every order this control originates
+                if (atm != null)
+                {
+                    try
+                    {
+                        // StartAtmStrategy submits the entry order itself — do not also call Account.Submit.
+                        NinjaTrader.NinjaScript.AtmStrategy.StartAtmStrategy(atm, o);
+                    }
+                    catch (Exception atmEx)
+                    {
+                        // F17: only fall back to a plain submit if the entry was never actually sent —
+                        // if StartAtmStrategy already dispatched it before throwing, resubmitting would duplicate it.
+                        if (o.OrderState == OrderState.Initialized)
+                        {
+                            Diag("ATM attach failed (" + atm.Name + "): " + atmEx.Message + " — submitting plain entry instead.");
+                            _account.Submit(new[] { o });
+                        }
+                        else
+                        {
+                            Diag("ATM attach failed after entry was already sent (" + o.OrderState + ") — NOT resubmitting (avoid duplicate).");
+                        }
+                    }
+                }
+                else
+                {
+                    _account.Submit(new[] { o });
+                }
                 _workingOrders.Add(o);   // synchronous in-flight guard — closes the double-click window
                 RefreshArmUi();
             }
@@ -712,6 +791,8 @@ namespace TradingRadar.NT
         public void Cleanup()
         {
             CancelActiveLimitIfWorking("cleanup");   // don't leave a live order orphaned on teardown
+            _workingOrders.Clear();
+            _ownOrders.Clear();
             Account.AccountStatusUpdate -= OnAccountStatusUpdate;
             UnsubscribeAccount();
         }

@@ -153,7 +153,7 @@ namespace TradingRadar.NT
             _chartTrader = new RadarChartTrader();
             Grid rightCol = new Grid();
             rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1.0, GridUnitType.Star) });
-            rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(280) });
+            rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(340) });
             Grid.SetRow(_cockpit, 0);     rightCol.Children.Add(_cockpit);
             Grid.SetRow(_chartTrader, 1); rightCol.Children.Add(_chartTrader);
 
