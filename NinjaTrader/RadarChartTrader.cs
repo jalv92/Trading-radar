@@ -171,33 +171,22 @@ namespace TradingRadar.NT
                     Margin = new Thickness(8, 4, 8, 4), Child = row });
             }
 
-            // Row 4: account (stretches left) + qty stepper (right), like NT8; ARM/warn wrap below.
+            // Row 4: account + qty (top row) with the ATM selector directly below the account, sharing the
+            // same left column width (not full-width). Qty controls enlarged for a uniform, structured look.
             {
-                var qtyLbl = new TextBlock { Text = "Qty:", Margin = new Thickness(8, 0, 4, 0),
+                var qtyLbl = new TextBlock { Text = "Qty:", Margin = new Thickness(0, 0, 6, 0),
                     VerticalAlignment = VerticalAlignment.Center, FontFamily = new FontFamily("Segoe UI"),
-                    FontSize = 11, Foreground = Muted };
-                var minus = MakeManageButton("−"); minus.Width = 22; minus.Margin = new Thickness(0, 0, 2, 0);
-                var plus  = MakeManageButton("+");  plus.Width = 22; plus.Margin  = new Thickness(2, 0, 0, 0);
+                    FontSize = 12, Foreground = Muted };
+                var minus = MakeManageButton("−"); minus.Width = 34; minus.Height = 30; minus.FontSize = 16; minus.Margin = new Thickness(0, 0, 3, 0);
+                var plus  = MakeManageButton("+");  plus.Width  = 34; plus.Height  = 30; plus.FontSize  = 16; plus.Margin  = new Thickness(3, 0, 0, 0);
                 minus.Click += (o, e) => StepQty(-1);
                 plus.Click  += (o, e) => StepQty(1);
-                var qtyGroup = new StackPanel { Orientation = Orientation.Horizontal,
+                _qtyBox.Width = 54; _qtyBox.Height = 30; _qtyBox.FontSize = 15;
+                var qtyGroup = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center,
                     Children = { qtyLbl, minus, _qtyBox, plus } };
-                DockPanel.SetDock(qtyGroup, Dock.Right);
 
-                var acctQty = new DockPanel { Margin = new Thickness(8, 4, 8, 0) };
-                acctQty.Children.Add(qtyGroup);
-                acctQty.Children.Add(_accountCombo);   // last child fills remaining width (stretches left)
-
-                var armWrap = new WrapPanel { Margin = new Thickness(8, 0, 8, 4),
-                    Children = { _armChk, _warnText } };
-
-                AddRow(4, new StackPanel { Children = { acctQty, armWrap } });
-            }
-
-            // Row 5: ATM strategy selector — optional bracket attach on MKT/LMT entries; default None
-            // (nothing selected). Styled like the account combo (Ink/TextCol/PanelLine border).
-            {
-                var atmLbl = new TextBlock { Text = "ATM", Margin = new Thickness(8, 0, 6, 0),
+                // ATM label + selector — fills the account's (left) column so it matches the account width.
+                var atmLbl = new TextBlock { Text = "ATM", Margin = new Thickness(0, 0, 6, 0),
                     VerticalAlignment = VerticalAlignment.Center, FontFamily = new FontFamily("Segoe UI"),
                     FontSize = 11, Foreground = Muted };
                 DockPanel.SetDock(atmLbl, Dock.Left);
@@ -208,10 +197,25 @@ namespace TradingRadar.NT
                 // F16: only DropDownClosed (a real open+close by the user) can arm ATM attach — the
                 // control's own async repopulation (on Account/Instrument push) never fires this event.
                 _atmSelector.DropDownClosed += (o, e) => { _atmUserPicked = _atmSelector.SelectedAtmStrategy != null; };
-                var atmRow = new DockPanel { Margin = new Thickness(0, 4, 8, 0) };
+                var atmRow = new DockPanel();
                 atmRow.Children.Add(atmLbl);
                 atmRow.Children.Add(_atmSelector);
-                AddRow(5, atmRow);
+
+                _accountCombo.Margin = new Thickness(0, 0, 10, 6);   // gap to qty (right) + gap above ATM
+
+                var grid = new Grid { Margin = new Thickness(8, 4, 8, 0) };
+                grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                Grid.SetColumn(_accountCombo, 0); Grid.SetRow(_accountCombo, 0); grid.Children.Add(_accountCombo);
+                Grid.SetColumn(qtyGroup, 1);      Grid.SetRow(qtyGroup, 0);      grid.Children.Add(qtyGroup);
+                Grid.SetColumn(atmRow, 0);        Grid.SetRow(atmRow, 1);        grid.Children.Add(atmRow);
+
+                var armWrap = new WrapPanel { Margin = new Thickness(8, 4, 8, 4),
+                    Children = { _armChk, _warnText } };
+
+                AddRow(4, new StackPanel { Children = { grid, armWrap } });
             }
 
             // Row 6: position + PnL readout — bordered bar (position left, PnL right).
