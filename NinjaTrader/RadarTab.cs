@@ -40,6 +40,7 @@ namespace TradingRadar.NT
 
         private Instrument     _instrument;
         private volatile Frame _latest;       // immutable snapshot + mid + tick, swapped from instrument thread
+        private volatile bool _replayResetPending;  // set on instrument thread by HandleReplayReset; consumed on the UI paint tick
         private DispatcherTimer _paintTimer;
         private bool _subscribed;
         private int      _depthEvents;
@@ -47,6 +48,7 @@ namespace TradingRadar.NT
         private DateTime _lastDiag      = DateTime.MinValue;
         private DateTime _lastEngineRun = DateTime.MinValue;
         private const double EngineIntervalMs = 50;   // run engine+snapshot at most ~20Hz
+        private const double ReplayResetBackwardMs = 2000;  // Playback rewind trip: real rewinds jump seconds-minutes; feed jitter is a few ms
         private volatile bool _autoCalib;
         private double _medianEwma;
         private double _autoFactor = 1.8;
@@ -172,6 +174,7 @@ namespace TradingRadar.NT
             };
             _paintTimer.Tick += (o, e) =>
             {
+                if (_replayResetPending) { _replayResetPending = false; _visual.ResetLadderMemory(); }  // post-replay-reset (UI thread)
                 Frame f = _latest;          // volatile read of the latest immutable frame
                 if (f != null)
                 {
@@ -316,8 +319,17 @@ namespace TradingRadar.NT
 
         private void MaybeRunEngine(DateTime now)
         {
-            if (_lastEngineRun != DateTime.MinValue && (now - _lastEngineRun).TotalMilliseconds < EngineIntervalMs)
-                return;
+            if (_lastEngineRun != DateTime.MinValue)
+            {
+                double deltaMs = (now - _lastEngineRun).TotalMilliseconds;
+                // Market Replay was rewound/restarted: e.Time jumped far backward past our high-water
+                // mark. Rebuild the stale book+tracker, then fall through and run the engine for this
+                // event (do NOT return — the old guard's negative-diff path froze the radar here).
+                if (deltaMs < -ReplayResetBackwardMs)
+                    HandleReplayReset(now);
+                else if (deltaMs < EngineIntervalMs)
+                    return;                       // normal ~20Hz throttle
+            }
             _lastEngineRun = now;
             _tracker.Update(_book, now);
             double m = (_book.MedianSize(Side.Bid) + _book.MedianSize(Side.Ask)) / 2.0;
@@ -435,6 +447,27 @@ namespace TradingRadar.NT
                 }
                 catch { }
             }
+        }
+
+        // NT8 exposes no "replay was reset" event for add-ons, so a large backward jump in the replay
+        // clock (e.Time) is the most reliable, mechanism-agnostic signal that Market Replay was rewound
+        // or restarted. Rebuild book + tracker exactly like a fresh Subscribe() would (reusing the same
+        // ctors + SeedFromSnapshot), which clears every piece of pre-rewind state that would otherwise
+        // freeze or corrupt the radar (stale trade ring, wall/episode/confidence memory, EWMA bias).
+        // Runs on the instrument dispatcher thread — same as its caller — so no lock is needed.
+        private void HandleReplayReset(DateTime now)
+        {
+            _book = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
+            if (_instrument != null) SeedFromSnapshot(_instrument);   // re-seed L2 from the platform's current snapshot
+            _tracker    = new WallTracker(_cfg);                      // drop stale wall/episode/confidence memory
+            _lastDiag   = DateTime.MinValue;
+            _lastMidLog = DateTime.MinValue;
+            _medianEwma = 0;
+            _latest     = null;
+            _replayResetPending = true;   // paint tick (UI thread) drops RadarVisual's ladder memory + anchor
+            NinjaTrader.Code.Output.Process(
+                string.Format("[Radar] replay reset detected @ {0:HH:mm:ss} — book+tracker reseeded", now),
+                NinjaTrader.NinjaScript.PrintTo.OutputTab1);
         }
 
         private void MaybeDiag(DateTime now)

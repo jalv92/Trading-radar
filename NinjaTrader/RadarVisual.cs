@@ -84,6 +84,15 @@ namespace TradingRadar.NT
 
         public void AdvanceAnimation() { }
 
+        // Called on the UI thread (from RadarTab's paint timer) after a Market Replay reset — drops the
+        // ghost-row memory + anchor so no pre-rewind bars linger if price lands near where it left off.
+        public void ResetLadderMemory()
+        {
+            _ladderMem.Clear();
+            _memEvict.Clear();
+            _anchorTop = double.NaN;   // forces a re-center on the next OnRender from the fresh mid
+        }
+
         // Pushed each paint tick by RadarTab from the Chart Trader's active working limit order (if any).
         // SetFrame already repaints every tick regardless, so skip the redundant InvalidateVisual when
         // nothing about the order actually changed since the last call.
