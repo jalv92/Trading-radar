@@ -109,7 +109,7 @@ namespace TradingRadar.NT
             // height → constant per frame, changes only when the user resizes → no jitter.
             double rowH = Math.Min(MAX_ROW_PX, Math.Max(MIN_ROW_PX, h / DESIRED_ROWS));
             int    rows = Math.Max(9, (int)Math.Floor(h / rowH));
-            double barX = 88, barMaxW = w - barX - 96;
+            double barX = 88, barMaxW = w - barX - 112;   // right reserve holds the size number + the state badge apart
 
             // Anchor so mid sits centered, snapped to the tick grid. Re-anchor (recenter)
             // ONLY when mid drifts out of the middle band, or on first frame / instrument
@@ -260,7 +260,14 @@ namespace TradingRadar.NT
                 string badge = BadgeFor(n.State);
                 if (blind) badge = "· " + Math.Round(n.AgeSeconds) + "s";
                 if (!string.IsNullOrEmpty(badge) && (double.IsNaN(lastBadgeY) || Math.Abs(y - lastBadgeY) >= 12))
-                { DrawText(dc, badge, w - 70, y, 10, Sans, BadgeBrush(n.State, blind), dpi, op); lastBadgeY = y; }
+                {
+                    // Right-align the badge to the panel edge so it never overlaps the size number,
+                    // however wide the bar/number gets (uses the empty space on the right).
+                    var bft = new FormattedText(badge, CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
+                        Sans, 10, BadgeBrush(n.State, blind), dpi);
+                    DrawText(dc, badge, w - bft.Width - 8, y, 10, Sans, BadgeBrush(n.State, blind), dpi, op);
+                    lastBadgeY = y;
+                }
             }
 
             // Inside-market amber line + mid chip — glide to Y(_mid) (anchored, not fixed center).
