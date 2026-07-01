@@ -126,6 +126,25 @@ public class ControllerStateMachineTests
         }
     }
 
+    // Isolates the `!chop` term: config puts ChopSlowZ (3.0) ABOVE ZFloor (1.5), so z=2.0 passes the
+    // fire z-gate AND trips CHOP (z <= 3.0 && alt >= ChopAltCount). Deleting `!chop` from the engine's
+    // fire conjunction would let this fire (fires>0) — so this is a real regression guard for CHOP.
+    [Fact]
+    public void Chop_blocks_fire_even_when_z_passes_the_fire_gate()
+    {
+        var m = new ControllerStateMachine(new ControllerConfig { ChopSlowZ = 3.0 }, 0.25);
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook())); // arm at peak 120
+        int fires = 0;
+        for (int s = 2; s <= 8; s++)
+        {
+            var b = BookWithBuys(100.25, 90, s);                          // 75% eaten, fully trade-backed
+            var o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: 2.0, alt: 4, mid: 100.00, sec: s, book: b));
+            if (o.Fired) fires++;
+            Assert.True(o.Chop);        // z=2.0 <= ChopSlowZ=3.0 AND alt=4 >= ChopAltCount=3
+        }
+        Assert.Equal(0, fires);         // blocked solely by !chop (z=2.0 >= ZFloor=1.5 would otherwise fire)
+    }
+
     // THE anti-flip gate: an input stream whose book skew flips every tick must produce NO fire and
     // never leave a stable non-firing state. Walls are intact (no consumption), delta/skew oscillate.
     [Fact]
