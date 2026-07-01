@@ -27,11 +27,25 @@ namespace TradingRadar.NT
             public double WallBelow;   // price of the biggest wall below mid this run (0 = none found)
             public PressureInputs PInputs;
             public PressureResult PResult;
+            // Task 10: Controller spine + tape-speed reads, rendered by CockpitVisual (Task 11) and
+            // delivered to RadarChartTrader (Task 12).
+            public ControllerOutput Ctrl;
+            public bool Fired;
+            public FireEvent Fire;
+            public double BuyPerSec;
+            public double SellPerSec;
+            public double TapeZ;
         }
 
         private readonly RadarConfig _cfg = new RadarConfig();   // NQ defaults; later: per-instrument presets
         private BookMirror  _book;
         private WallTracker _tracker;
+        private TapeSpeed   _tape;
+        private ControllerStateMachine _controller;
+        // Previous engine run's ControllerOutput — read (never written) BEFORE calling _controller.Update()
+        // this run, to decide the ARMED-WALL IDENTITY CONTRACT feed below. Default(Waiting/Waiting) on the
+        // very first run correctly falls through to "feed the freshly computed dominant wall".
+        private ControllerOutput _lastCtrl;
         private RadarVisual _visual;
         private CockpitVisual _cockpit;
         private RadarChartTrader _chartTrader;
@@ -74,6 +88,8 @@ namespace TradingRadar.NT
             _autoCalib       = true;
             _book    = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
             _tracker = new WallTracker(_cfg);
+            _tape       = new TapeSpeed(0.1);
+            _controller = new ControllerStateMachine(new ControllerConfig(), _cfg.TickSize);
             _visual  = new RadarVisual();
             _cockpit = new CockpitVisual();
 
@@ -143,7 +159,9 @@ namespace TradingRadar.NT
                 string sigPath = System.IO.Path.Combine(dir,
                     "lr-signals-" + inst + "-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".csv");
                 _sigWriter = new System.IO.StreamWriter(sigPath, false);
-                _sigWriter.WriteLine("time,mid,bidMass,askMass,bestBid,bestAsk,delta15s,wallFrac,wallAbove,wallPx");
+                _sigWriter.WriteLine("time,mid,bidMass,askMass,bestBid,bestAsk,delta15s,wallFrac,wallAbove,wallPx," +
+                    "wallAbovePx,wallAboveCur,wallBelowPx,wallBelowCur,consumeFracLong,tradeBackedLong," +
+                    "consumeFracShort,tradeBackedShort,printsPerSec,buyVolPerSec,sellVolPerSec,tapeZ,ctrlLong,ctrlShort");
                 _sigWriter.Flush();
                 _capture = true;
             };
@@ -192,6 +210,10 @@ namespace TradingRadar.NT
                     _cockpit.SetFrame(f.PInputs, f.PResult);
                     // reuse the already-marshaled book mid + biggest-wall prices for live PnL + LMT anchoring
                     _chartTrader.SetContext(f.Mid, f.WallAbove, f.WallBelow, f.Tick);
+                    // ControllerOutput.Fired is one-shot by engine contract (see ControllerStateMachine),
+                    // so this delivers exactly once per fire even though the paint tick re-reads f.Fired
+                    // every ~33ms — the next Frame swap carries Fired=false again.
+                    if (f.Fired) _chartTrader.OnSetupFire(f.Fire);
                 }
                 // Push the Chart Trader's active working limit order onto the ladder as an overlay marker.
                 double ordPx; bool ordBuy; int ordQty;
@@ -238,9 +260,14 @@ namespace TradingRadar.NT
                     _instrument = value;
                     if (_instrument != null)
                         _cfg.TickSize = _instrument.MasterInstrument.TickSize;
-                    // Rebuild engine for the new instrument's tick size.
-                    _book    = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
-                    _tracker = new WallTracker(_cfg);
+                    // Rebuild engine for the new instrument's tick size. _tape/_controller carry EWMA
+                    // baseline + state-machine memory keyed to the OLD instrument/tick — must be rebuilt
+                    // alongside _book/_tracker, or a switch leaks a stale Armed/Countdown into the new one.
+                    _book       = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
+                    _tracker    = new WallTracker(_cfg);
+                    _tape       = new TapeSpeed(0.1);
+                    _controller = new ControllerStateMachine(new ControllerConfig(), _cfg.TickSize);
+                    _lastCtrl   = default(ControllerOutput);
                     _latest  = null;
                     _lastEngineRun = DateTime.MinValue;   // don't carry the old instrument's engine clock
                     _medianEwma    = 0;                   // (a stale high-water would spuriously reset/throttle)
@@ -306,6 +333,32 @@ namespace TradingRadar.NT
             if (hb) return bb.Price;
             if (ha) return ba.Price;
             return 0;
+        }
+
+        // Live resting size at a specific price, by identity (0 if that level is gone). Backs the
+        // ARMED-WALL IDENTITY CONTRACT in MaybeRunEngine: an armed candidate must keep seeing ITS wall's
+        // size, not whichever wall happens to be biggest this run once its own wall is partway eaten.
+        private long SizeAtPrice(IReadOnlyList<RadarNode> nodes, Side side, double price)
+        {
+            if (price <= 0) return 0;
+            for (int i = 0; i < nodes.Count; i++)
+                if (nodes[i].Side == side && Math.Abs(nodes[i].Price - price) < _cfg.TickSize / 2.0)
+                    return nodes[i].LastKnownSize;
+            return 0;
+        }
+
+        // Shared by the Long/Ask and Short/Bid identity-contract feeds below — mirrors
+        // ControllerStateMachine's own Side-parameterized StepLong/StepShort pairing instead of
+        // duplicating the branch per side.
+        private void ResolveWallFeed(SideState armedState, double armedPrice, Side wallSide,
+            double domPx, long domSz, IReadOnlyList<RadarNode> nodes, out double px, out long sz)
+        {
+            if (armedState == SideState.Armed || armedState == SideState.Countdown)
+            {
+                px = armedPrice;
+                sz = SizeAtPrice(nodes, wallSide, armedPrice);
+            }
+            else { px = domPx; sz = domSz; }
         }
 
         // ---- instrument-thread handlers: map -> engine -> swap frame ----
@@ -393,12 +446,13 @@ namespace TradingRadar.NT
             for (int i = 0; i < pErr.Count; i++)
                 if (pErr[i].Approaching && pErr[i].Frac > pWf)
                 { pWf = pErr[i].Frac; pWall = new WallErosion { Active = true, Frac = pErr[i].Frac, Above = pErr[i].Price > pMid }; }
+            long aggDelta15 = _book.AggressorDelta(now.AddSeconds(-15));   // shared by pin below and cin further down
             PressureInputs pin = new PressureInputs
             {
                 Bids = new List<DepthLevel>(pBids),
                 Asks = new List<DepthLevel>(pAsks),
                 BestBidSize = pBestBid, BestAskSize = pBestAsk,
-                AggressorDelta = _book.AggressorDelta(now.AddSeconds(-15)),
+                AggressorDelta = aggDelta15,
                 Wall = pWall
             };
             var snapNodes = _tracker.GetSnapshot(now);
@@ -411,6 +465,36 @@ namespace TradingRadar.NT
                 if (wn.Price > pMid && wn.LastKnownSize > wallAboveSz) { wallAboveSz = wn.LastKnownSize; wallAbovePx = wn.Price; }
                 if (wn.Price < pMid && wn.LastKnownSize > wallBelowSz) { wallBelowSz = wn.LastKnownSize; wallBelowPx = wn.Price; }
             }
+
+            // ARMED-WALL IDENTITY CONTRACT: the Controller's wall-identity guard abandons Armed/Countdown
+            // whenever the fed wall price moves >= 1 tick from the armed WallPrice (see
+            // ControllerStateMachine). Recomputing "biggest wall above/below" from scratch every run (as
+            // wallAbovePx/wallBelowPx above do) would look like the wall hopping the moment the armed wall
+            // is partially eaten and stops being the single biggest level — aborting the countdown exactly
+            // when the setup matures. So: per side, if the PREVIOUS run's ControllerOutput has that side
+            // Armed/Countdown, feed the LIVE size AT that armed price (looked up by price identity in this
+            // run's wall snapshot; 0 if the level is gone) instead of the freshly recomputed dominant wall.
+            // Waiting/Fired/Cooldown have no armed identity to preserve, so they use the dominant wall.
+            double ctrlWallAbovePx, ctrlWallBelowPx; long ctrlWallAboveSz, ctrlWallBelowSz;
+            ResolveWallFeed(_lastCtrl.Long, _lastCtrl.LongWallPrice, Side.Ask, wallAbovePx, wallAboveSz, snapNodes, out ctrlWallAbovePx, out ctrlWallAboveSz);
+            ResolveWallFeed(_lastCtrl.Short, _lastCtrl.ShortWallPrice, Side.Bid, wallBelowPx, wallBelowSz, snapNodes, out ctrlWallBelowPx, out ctrlWallBelowSz);
+
+            // Tape speed: sample the 1s print rate into the EWMA baseline (also feeds the Rec CSV below).
+            var win1s = _book.WindowSince(now.AddSeconds(-1));
+            _tape.Sample(win1s.Prints, now);
+
+            ControllerInputs cin = new ControllerInputs
+            {
+                WallAbovePrice = ctrlWallAbovePx, WallAboveCurrent = ctrlWallAboveSz,
+                WallBelowPrice = ctrlWallBelowPx, WallBelowCurrent = ctrlWallBelowSz,
+                AggressorDelta = aggDelta15,
+                TapeZScore = _tape.ZScore,
+                TapeAlternations = _book.RecentAlternations(8),
+                Mid = pMid, Now = now, Book = _book
+            };
+            ControllerOutput cout = _controller.Update(cin);
+            _lastCtrl = cout;   // read by the identity-contract lookup above on the NEXT engine run
+
             _latest = new Frame
             {
                 Nodes = snapNodes,
@@ -421,7 +505,9 @@ namespace TradingRadar.NT
                 WallAbove = wallAbovePx,
                 WallBelow = wallBelowPx,
                 PInputs = pin,
-                PResult = _pressure.Evaluate(pin)
+                PResult = _pressure.Evaluate(pin),
+                Ctrl = cout, Fired = cout.Fired, Fire = cout.Fire,
+                BuyPerSec = win1s.BuyVol, SellPerSec = win1s.SellVol, TapeZ = _tape.ZScore
             };
             MaybeDiag(now);
             if (_capture && _capWriter != null)
@@ -480,9 +566,23 @@ namespace TradingRadar.NT
                             for (int i = 0; i < er.Count; i++)
                                 if (er[i].Approaching && er[i].Frac > wf)
                                 { wf = er[i].Frac; wpx = er[i].Price; wabove = er[i].Price > mid; }
+                            // consumeFracLong/Short are the Controller's own authoritative fraction (already
+                            // correctly zeroed on abandon — see ControllerStateMachine). A genuine
+                            // tradeBackedLong/Short read needs the candidate's internal Peak/ArmTime, which
+                            // the engine doesn't expose (only the armed WallPrice, Task 10's identity-contract
+                            // field) — feeding the identity-contract's live size as both peak and current to
+                            // ConsumptionTracker.Read would make Drop, and so TradeBackedFraction, always 0.
+                            // ponytail: log the literal until ControllerOutput exposes enough state for a real
+                            // read; consumeFracLong/Short above are the authoritative calibration signal.
                             _sigWriter.WriteLine(string.Format(System.Globalization.CultureInfo.InvariantCulture,
-                                "{0},{1:0.00},{2},{3},{4},{5},{6},{7:0.000},{8},{9:0.00}",
-                                now.ToString("o"), mid, bidMass, askMass, bestBid, bestAsk, delta15, wf, wabove, wpx));
+                                "{0},{1:0.00},{2},{3},{4},{5},{6},{7:0.000},{8},{9:0.00}," +
+                                "{10:0.00},{11},{12:0.00},{13},{14:0.000},{15:0.000},{16:0.000},{17:0.000}," +
+                                "{18},{19},{20},{21:0.000},{22},{23}",
+                                now.ToString("o"), mid, bidMass, askMass, bestBid, bestAsk, delta15, wf, wabove, wpx,
+                                wallAbovePx, wallAboveSz, wallBelowPx, wallBelowSz,
+                                cout.LongFraction, 0.0, cout.ShortFraction, 0.0,
+                                win1s.Prints, win1s.BuyVol, win1s.SellVol, _tape.ZScore,
+                                cout.Long, cout.Short));
                             _sigWriter.Flush();
                         }
                     }
@@ -502,6 +602,11 @@ namespace TradingRadar.NT
             _book = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
             if (_instrument != null) SeedFromSnapshot(_instrument);   // re-seed L2 from the platform's current snapshot
             _tracker    = new WallTracker(_cfg);                      // drop stale wall/episode/confidence memory
+            // A rewind must not leave stale EWMA/state-machine memory: a Countdown armed against the
+            // pre-rewind tape would otherwise survive into replayed history it never actually saw.
+            _tape       = new TapeSpeed(0.1);
+            _controller = new ControllerStateMachine(new ControllerConfig(), _cfg.TickSize);
+            _lastCtrl   = default(ControllerOutput);
             _lastDiag   = DateTime.MinValue;
             _lastMidLog = DateTime.MinValue;
             _medianEwma = 0;

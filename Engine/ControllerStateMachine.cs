@@ -24,6 +24,13 @@ namespace TradingRadar.Engine
         public SideState Long; public double LongFraction;
         public SideState Short; public double ShortFraction;
         public bool Fired; public FireEvent Fire;
+        // The armed wall's identity price per side — valid (non-zero) whenever that side is
+        // Armed/Countdown/Fired, 0 otherwise. The NT layer feeds THIS run's live size back in at THIS
+        // price (looked up by identity), not the recomputed "current dominant wall above/below" — a
+        // wall being eaten loses dominance mid-consumption, and feeding a different price would trip
+        // the wall-identity guard (>= 1 tick move => abandon) exactly when the setup matures.
+        public double LongWallPrice;
+        public double ShortWallPrice;
     }
 
     // All placeholders — measured from Rec CSV (spec §9). No literal threshold lives in logic.
@@ -91,7 +98,16 @@ namespace TradingRadar.Engine
                 : _long.State == SideState.Fired ? _long.LastFire
                 : _short.State == SideState.Fired ? _short.LastFire
                 : default(FireEvent);
+            o.LongWallPrice = IsIdentityHeld(_long.State) ? _long.WallPrice : 0;
+            o.ShortWallPrice = IsIdentityHeld(_short.State) ? _short.WallPrice : 0;
             return o;
+        }
+
+        // The wall price is meaningful (an identity the NT layer must feed back by-price) only while
+        // the candidate still owns an armed wall: Armed, Countdown, or the just-fired/latched Fired.
+        private static bool IsIdentityHeld(SideState s)
+        {
+            return s == SideState.Armed || s == SideState.Countdown || s == SideState.Fired;
         }
 
         private bool Chop(ControllerInputs inp)

@@ -358,6 +358,22 @@ public class ControllerStateMachineTests
         Assert.True(o.Fired);
     }
 
+    // Task 10 identity contract: ControllerOutput exposes the armed wall's price while Armed/Countdown,
+    // and clears it back to 0 once the candidate abandons to Waiting. The NT layer keys its by-price
+    // lookup off this field, not off whatever the recomputed "dominant wall" says this run.
+    [Fact]
+    public void Exposes_armed_wall_price_while_armed_then_clears_on_abandon()
+    {
+        var m = Machine();
+        var o1 = m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));   // arms Long at 100.25
+        Assert.Equal(SideState.Armed, o1.Long);
+        Assert.Equal(100.25, o1.LongWallPrice);
+        Assert.Equal(0, o1.ShortWallPrice);                                          // Short never armed
+        var o2 = m.Update(In(100.25, 0, 0, 0, 0, 0, 0, 100.00, 2, EmptyBook()));     // wall vanishes -> abandon
+        Assert.Equal(SideState.Waiting, o2.Long);
+        Assert.Equal(0, o2.LongWallPrice);
+    }
+
     // Countdown wall-vanish abandon must reset to Waiting with a zeroed fraction and no fire.
     [Fact]
     public void Countdown_abandons_to_waiting_when_wall_vanishes()

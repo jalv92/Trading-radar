@@ -7,6 +7,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Effects;
 using NinjaTrader.Cbi;
+using TradingRadar.Engine;
 
 namespace TradingRadar.NT
 {
@@ -340,6 +341,10 @@ namespace TradingRadar.NT
             if (tick > 0) _tick = tick;
             RefreshPositionUi();
         }
+
+        // Called by RadarTab's UI-thread paint tick when the Controller fires (Task 10, one-shot per
+        // FireEvent.Fired-per-engine-contract). ponytail: filled by Task 12 (pre-stage break-direction limit).
+        public void OnSetupFire(FireEvent f) { }
 
         // Exposes the one active working limit order for RadarVisual's ladder marker.
         public bool TryGetActiveOrder(out double price, out bool isBuy, out int qty)
