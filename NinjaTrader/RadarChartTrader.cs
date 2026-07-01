@@ -23,7 +23,24 @@ namespace TradingRadar.NT
         private static readonly SolidColorBrush TextCol  = Brush(0xcf, 0xd6, 0xe2);
         private static readonly SolidColorBrush BorderBr = new SolidColorBrush(Color.FromArgb(30, 0xff, 0xff, 0xff));
 
+        // Neon Aurora tokens — translucent tint fill + glowing colored border + glowing colored text
+        // (matches docs/mockups/radar-cockpit-demo.html .bigbtn.buy/.sell). NOT solid fills.
+        private static readonly Brush BuyFill   = Frozen(Color.FromArgb(33,  0x34, 0xd3, 0x99));  // ~.13
+        private static readonly Brush BuyHover  = Frozen(Color.FromArgb(61,  0x34, 0xd3, 0x99));  // ~.24
+        private static readonly Brush BuyBorder = Frozen(Color.FromArgb(140, 0x34, 0xd3, 0x99));  // ~.55
+        private static readonly Brush BuyText   = Frozen(Color.FromRgb(0x7e, 0xf0, 0xc0));
+        private static readonly Brush SellFill  = Frozen(Color.FromArgb(33,  0xfb, 0x71, 0x85));
+        private static readonly Brush SellHover = Frozen(Color.FromArgb(61,  0xfb, 0x71, 0x85));
+        private static readonly Brush SellBorder= Frozen(Color.FromArgb(140, 0xfb, 0x71, 0x85));
+        private static readonly Brush SellText  = Frozen(Color.FromRgb(0xff, 0xb0, 0xbb));
+        private static readonly Brush MgFill    = Frozen(Color.FromArgb(8,   0xff, 0xff, 0xff));  // ~.03
+        private static readonly Brush MgHover   = Frozen(Color.FromArgb(18,  0xff, 0xff, 0xff));  // ~.07
+        private static readonly Brush MgText    = Frozen(Color.FromRgb(0xc3, 0xca, 0xd6));
+        private static readonly Brush PanelLine = Frozen(Color.FromArgb(28,  0xff, 0xff, 0xff));
+        private static readonly Brush PnlBarBg  = Frozen(Color.FromArgb(6,   0xff, 0xff, 0xff));
+
         private static SolidColorBrush Brush(byte r, byte g, byte b) => new SolidColorBrush(Color.FromRgb(r, g, b));
+        private static Brush Frozen(Color c) { var b = new SolidColorBrush(c); b.Freeze(); return b; }
 
         private Instrument _instrument;
         private Account _account;
@@ -55,8 +72,8 @@ namespace TradingRadar.NT
             Background = Panel;
             for (int i = 0; i < 5; i++) RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-            _buyBtn  = MakePrimaryButton("BUY MKT", Emerald);
-            _sellBtn = MakePrimaryButton("SELL MKT", Coral);
+            _buyBtn  = MakePrimaryButton("BUY MKT",  BuyFill,  BuyHover,  BuyBorder,  BuyText,  Emerald.Color);
+            _sellBtn = MakePrimaryButton("SELL MKT", SellFill, SellHover, SellBorder, SellText, Coral.Color);
             _revBtn   = MakeManageButton("Rev");
             _closeBtn = MakeManageButton("Close");
             _flatBtn  = MakeManageButton("Flat");
@@ -83,9 +100,15 @@ namespace TradingRadar.NT
             _qtyBox.LostFocus += (o, e) => commitQty();
             _qtyBox.KeyDown   += (o, e) => { if (e.Key == Key.Enter) commitQty(); };
 
-            // Row 0: account + arm gate
-            AddRow(0, new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(6, 6, 6, 2),
-                Children = { _accountCombo, _armChk, _warnText } });
+            // Row 0: header + account + arm gate
+            {
+                var hdr = new TextBlock { Text = "CHART TRADER",
+                    FontFamily = new FontFamily("Segoe UI"), FontSize = 10.5, FontWeight = FontWeights.SemiBold,
+                    Foreground = Muted, Margin = new Thickness(2, 6, 0, 6) };
+                var acctRow = new StackPanel { Orientation = Orientation.Horizontal,
+                    Children = { _accountCombo, _armChk, _warnText } };
+                AddRow(0, new StackPanel { Margin = new Thickness(8, 4, 8, 2), Children = { hdr, acctRow } });
+            }
 
             // Row 1: qty stepper
             {
@@ -96,13 +119,13 @@ namespace TradingRadar.NT
                 var plus  = MakeManageButton("+");  plus.Width = 22;
                 minus.Click += (o, e) => StepQty(-1);
                 plus.Click  += (o, e) => StepQty(1);
-                AddRow(1, new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(6, 2, 6, 2),
+                AddRow(1, new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 2, 8, 2),
                     Children = { lbl, minus, _qtyBox, plus } });
             }
 
             // Row 2: BUY / SELL
             {
-                var row = new Grid { Margin = new Thickness(6, 4, 6, 4) };
+                var row = new Grid { Margin = new Thickness(8, 4, 8, 4) };
                 row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
                 row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
                 _buyBtn.Margin = new Thickness(0, 0, 3, 0);
@@ -113,12 +136,23 @@ namespace TradingRadar.NT
             }
 
             // Row 3: Rev / Close / Flat
-            AddRow(3, new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(6, 0, 6, 4),
+            AddRow(3, new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 0, 8, 4),
                 Children = { _revBtn, _closeBtn, _flatBtn } });
 
-            // Row 4: position + PnL readout
-            AddRow(4, new StackPanel { Margin = new Thickness(6, 2, 6, 6),
-                Children = { _posText, _pnlText } });
+            // Row 4: position + PnL readout — bordered bar (position left, PnL right)
+            {
+                _posText.VerticalAlignment = VerticalAlignment.Center;
+                _pnlText.VerticalAlignment = VerticalAlignment.Center;
+                _pnlText.HorizontalAlignment = HorizontalAlignment.Right;
+                var pnlGrid = new Grid();
+                pnlGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                pnlGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                SetColumn(_posText, 0); pnlGrid.Children.Add(_posText);
+                SetColumn(_pnlText, 1); pnlGrid.Children.Add(_pnlText);
+                AddRow(4, new Border { Background = PnlBarBg, BorderBrush = PanelLine, BorderThickness = new Thickness(1),
+                    CornerRadius = new CornerRadius(8), Padding = new Thickness(11, 7, 11, 7),
+                    Margin = new Thickness(8, 4, 8, 8), Child = pnlGrid });
+            }
 
             // ponytail: no TifSelector / AtmStrategySelector / Entry button / SL-TP lines here —
             // MKT-only v1 per spec §8/§12. TimeInForce hardcoded to Day in SubmitRaw().
@@ -133,37 +167,57 @@ namespace TradingRadar.NT
             Children.Add(content);
         }
 
-        private Button MakePrimaryButton(string text, SolidColorBrush glowColor)
+        // Rounded neon button template — overrides the default WPF button chrome so the translucent
+        // fill / glowing border render cleanly; hover brightens the fill, disabled dims to 0.4.
+        private static ControlTemplate PillTemplate(Brush hover, double radius)
+        {
+            var t  = new ControlTemplate(typeof(Button));
+            var bd = new FrameworkElementFactory(typeof(Border)) { Name = "bd" };
+            bd.SetValue(Border.BackgroundProperty,      new System.Windows.TemplateBindingExtension(Control.BackgroundProperty));
+            bd.SetValue(Border.BorderBrushProperty,     new System.Windows.TemplateBindingExtension(Control.BorderBrushProperty));
+            bd.SetValue(Border.BorderThicknessProperty, new System.Windows.TemplateBindingExtension(Control.BorderThicknessProperty));
+            bd.SetValue(Border.CornerRadiusProperty,    new CornerRadius(radius));
+            var cp = new FrameworkElementFactory(typeof(ContentPresenter));
+            cp.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+            cp.SetValue(ContentPresenter.VerticalAlignmentProperty,   VerticalAlignment.Center);
+            bd.AppendChild(cp);
+            t.VisualTree = bd;
+            var hov = new Trigger { Property = UIElement.IsMouseOverProperty, Value = true };
+            hov.Setters.Add(new Setter(Border.BackgroundProperty, hover, "bd"));
+            t.Triggers.Add(hov);
+            var dis = new Trigger { Property = UIElement.IsEnabledProperty, Value = false };
+            dis.Setters.Add(new Setter(UIElement.OpacityProperty, 0.4));
+            t.Triggers.Add(dis);
+            return t;
+        }
+
+        private static Button MakeNeonButton(string text, Brush fill, Brush hover, Brush border, Brush fg,
+                                             double height, double fontSize, double radius, Color? glow)
         {
             var b = new Button
             {
-                Content = text,
-                Height = 34,
-                FontFamily = new FontFamily("Segoe UI"),
-                FontSize = 13,
-                FontWeight = FontWeights.Bold,
-                Foreground = Ink,
-                Background = glowColor,
-                BorderThickness = new Thickness(0),
-                Effect = new DropShadowEffect { Color = glowColor.Color, BlurRadius = 10, ShadowDepth = 0, Opacity = 0.5 }
+                Content = text, Height = height,
+                FontFamily = new FontFamily("Segoe UI"), FontSize = fontSize, FontWeight = FontWeights.Bold,
+                Foreground = fg, Background = fill, BorderBrush = border, BorderThickness = new Thickness(1),
+                Template = PillTemplate(hover, radius),
+                SnapsToDevicePixels = true, Cursor = Cursors.Hand
             };
+            if (glow.HasValue)
+                b.Effect = new DropShadowEffect { Color = glow.Value, BlurRadius = 16, ShadowDepth = 0, Opacity = 0.55 };
             return b;
+        }
+
+        private Button MakePrimaryButton(string text, Brush fill, Brush hover, Brush border, Brush fg, Color glow)
+        {
+            return MakeNeonButton(text, fill, hover, border, fg, 40, 14, 9, glow);
         }
 
         private Button MakeManageButton(string text)
         {
-            return new Button
-            {
-                Content = text,
-                Height = 24,
-                MinWidth = 50,
-                Margin = new Thickness(0, 0, 6, 0),
-                FontFamily = new FontFamily("Segoe UI"),
-                FontSize = 11,
-                Foreground = TextCol,
-                Background = Ink,
-                BorderBrush = BorderBr
-            };
+            var b = MakeNeonButton(text, MgFill, MgHover, BorderBr, MgText, 26, 11, 8, null);
+            b.MinWidth = 50;
+            b.Margin = new Thickness(0, 0, 6, 0);
+            return b;
         }
 
         // Pushed by RadarTab whenever the tab's instrument changes (selector or Restore()).
