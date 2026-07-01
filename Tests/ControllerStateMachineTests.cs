@@ -374,6 +374,26 @@ public class ControllerStateMachineTests
         Assert.Equal(0, o2.LongWallPrice);
     }
 
+    // Fix 3 regression: ControllerOutput.LongTradeBacked mirrors LongFraction's lifecycle — 0 while
+    // just-Armed (no drop read yet), > 0 once a trade-backed drop is read, 0 again after abandon.
+    [Fact]
+    public void Exposes_trade_backed_fraction_while_armed_then_clears_on_abandon()
+    {
+        var m = Machine();
+        var o1 = m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));   // arm, no drop yet
+        Assert.Equal(SideState.Armed, o1.Long);
+        Assert.Equal(0, o1.LongTradeBacked);
+
+        var book = BookWithBuys(100.25, 60, 2);                                      // 60 bought at the wall
+        var o2 = m.Update(In(100.25, 60, 0, 0, 0, 0, 0, 100.00, 2, book));           // drop fully trade-backed
+        Assert.Equal(SideState.Countdown, o2.Long);
+        Assert.True(o2.LongTradeBacked > 0);
+
+        var o3 = m.Update(In(100.50, 60, 0, 0, 0, 0, 0, 100.00, 3, book));           // wall hops -> abandon
+        Assert.Equal(SideState.Waiting, o3.Long);
+        Assert.Equal(0, o3.LongTradeBacked);
+    }
+
     // Countdown wall-vanish abandon must reset to Waiting with a zeroed fraction and no fire.
     [Fact]
     public void Countdown_abandons_to_waiting_when_wall_vanishes()

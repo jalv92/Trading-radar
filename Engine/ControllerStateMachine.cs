@@ -21,8 +21,8 @@ namespace TradingRadar.Engine
     public struct ControllerOutput
     {
         public bool Chop;
-        public SideState Long; public double LongFraction;
-        public SideState Short; public double ShortFraction;
+        public SideState Long; public double LongFraction; public double LongTradeBacked;
+        public SideState Short; public double ShortFraction; public double ShortTradeBacked;
         public bool Fired; public FireEvent Fire;
         // The armed wall's identity price per side — valid (non-zero) whenever that side is
         // Armed/Countdown/Fired, 0 otherwise. The NT layer feeds THIS run's live size back in at THIS
@@ -63,6 +63,7 @@ namespace TradingRadar.Engine
             public int HoldCount;
             public DateTime CooldownUntil = DateTime.MinValue;
             public double Fraction;
+            public double TradeBackedFraction;
             // ponytail: latches the firing FireEvent so it stays readable on o.Fire for as long as
             // State == Fired (the per-call `fire` local in Update() resets to default every tick).
             public FireEvent LastFire;
@@ -85,8 +86,8 @@ namespace TradingRadar.Engine
 
             ControllerOutput o;
             o.Chop = chop;
-            o.Long = _long.State; o.LongFraction = _long.Fraction;
-            o.Short = _short.State; o.ShortFraction = _short.Fraction;
+            o.Long = _long.State; o.LongFraction = _long.Fraction; o.LongTradeBacked = _long.TradeBackedFraction;
+            o.Short = _short.State; o.ShortFraction = _short.Fraction; o.ShortTradeBacked = _short.TradeBackedFraction;
             o.Fired = fired;
             // ponytail: while a side is latched Fired, keep reporting its FireEvent (not just on the
             // exact firing tick) — `fire` above is a fresh per-call local and would otherwise go back
@@ -127,16 +128,17 @@ namespace TradingRadar.Engine
                     if (cur >= _cfg.SignificanceBand && inp.Now >= c.CooldownUntil)
                     {
                         c.State = SideState.Armed; c.WallPrice = price;
-                        c.Peak = cur; c.Min = cur; c.ArmTime = inp.Now; c.HoldCount = 0; c.Fraction = 0;
+                        c.Peak = cur; c.Min = cur; c.ArmTime = inp.Now; c.HoldCount = 0;
+                        c.Fraction = 0; c.TradeBackedFraction = 0;
                     }
                     break;
                 case SideState.Armed:
                     if (cur <= 0 || System.Math.Abs(price - c.WallPrice) >= _tick)
-                    { c.State = SideState.Waiting; c.Fraction = 0; c.HoldCount = 0; break; }
+                    { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; break; }
                     AdvanceArmedOrCountdown(c, Side.Ask, cur, inp);
                     break;
                 case SideState.Cooldown:
-                    if (inp.Now >= c.CooldownUntil) { c.State = SideState.Waiting; c.Fraction = 0; }
+                    if (inp.Now >= c.CooldownUntil) { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; }
                     break;
                 case SideState.Countdown:
                     return StepCountdown(c, Side.Ask, cur, inp, chop, ref fire);
@@ -146,7 +148,7 @@ namespace TradingRadar.Engine
                     // away-band. No wall-identity check: after a fire the eaten wall vanishes and dominance
                     // hops immediately, so an identity check would un-latch the SETUP indicator instantly.
                     if (cur <= 0 || Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick)
-                    { c.State = SideState.Waiting; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.Fraction = 0; }
+                    { c.State = SideState.Waiting; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.Fraction = 0; c.TradeBackedFraction = 0; }
                     break;
             }
             return false;
@@ -156,24 +158,26 @@ namespace TradingRadar.Engine
         {
             double curWallPrice = wallSide == Side.Ask ? inp.WallAbovePrice : inp.WallBelowPrice;
             if (cur <= 0 || System.Math.Abs(curWallPrice - c.WallPrice) >= _tick)
-            { c.State = SideState.Waiting; c.Fraction = 0; c.HoldCount = 0; return false; }
+            { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; return false; }
             // The trade ring can no longer prove trades back to ArmTime — re-baseline instead of
             // silently under-counting Traded (which would misroute clean consumption into the pull veto).
             if (inp.Now - c.ArmTime >= inp.Book.TradeRetention)
-            { c.State = SideState.Waiting; c.Fraction = 0; c.HoldCount = 0; return false; }
+            { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; return false; }
             if (cur > c.Peak) c.Peak = cur;
             if (cur < c.Min) c.Min = cur;
 
-            // Reload veto: refilled well above the running min (someone defending).
+            // Reload veto: refilled well above the running min (someone defending). Fraction/TradeBackedFraction
+            // are deliberately NOT zeroed here — Cooldown->Waiting (above) zeroes them once the veto elapses,
+            // and the frozen value stays readable through Cooldown by the same design as c.Fraction.
             if (cur - c.Min >= _cfg.ReloadFrac * c.Peak)
             { c.State = SideState.Cooldown; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.HoldCount = 0; return false; }
 
             // Price fell away from the wall (mid too far) => abandon.
             if (Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick)
-            { c.State = SideState.Waiting; c.HoldCount = 0; c.Fraction = 0; return false; }
+            { c.State = SideState.Waiting; c.HoldCount = 0; c.Fraction = 0; c.TradeBackedFraction = 0; return false; }
 
             ConsumptionRead r = ConsumptionTracker.Read(wallSide, c.WallPrice, c.Peak, cur, c.ArmTime, inp.Book);
-            c.Fraction = r.Fraction;
+            c.Fraction = r.Fraction; c.TradeBackedFraction = r.TradeBackedFraction;
 
             bool deltaOk = wallSide == Side.Ask ? inp.AggressorDelta >= _cfg.DeltaFloor
                                                 : inp.AggressorDelta <= -_cfg.DeltaFloor;
@@ -200,11 +204,11 @@ namespace TradingRadar.Engine
             // The trade ring can no longer prove trades back to ArmTime — re-baseline instead of
             // silently under-counting Traded (which would misroute clean consumption into the pull veto).
             if (inp.Now - c.ArmTime >= inp.Book.TradeRetention)
-            { c.State = SideState.Waiting; c.Fraction = 0; c.HoldCount = 0; return; }
+            { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; return; }
             if (cur > c.Peak) c.Peak = cur;
             if (cur < c.Min) c.Min = cur;
             ConsumptionRead r = ConsumptionTracker.Read(wallSide, c.WallPrice, c.Peak, cur, c.ArmTime, inp.Book);
-            c.Fraction = r.Fraction;
+            c.Fraction = r.Fraction; c.TradeBackedFraction = r.TradeBackedFraction;
             if (r.Fraction <= 0 || r.Drop < _cfg.MinDropBand) return; // nothing eaten yet, or sub-band jitter — stay Armed
             if (r.TradeBackedFraction >= _cfg.MinTradeBackedRatio)
                 c.State = SideState.Countdown;
@@ -225,16 +229,17 @@ namespace TradingRadar.Engine
                     if (cur >= _cfg.SignificanceBand && inp.Now >= c.CooldownUntil)
                     {
                         c.State = SideState.Armed; c.WallPrice = price;
-                        c.Peak = cur; c.Min = cur; c.ArmTime = inp.Now; c.HoldCount = 0; c.Fraction = 0;
+                        c.Peak = cur; c.Min = cur; c.ArmTime = inp.Now; c.HoldCount = 0;
+                        c.Fraction = 0; c.TradeBackedFraction = 0;
                     }
                     break;
                 case SideState.Armed:
                     if (cur <= 0 || System.Math.Abs(price - c.WallPrice) >= _tick)
-                    { c.State = SideState.Waiting; c.Fraction = 0; c.HoldCount = 0; break; }
+                    { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; break; }
                     AdvanceArmedOrCountdown(c, Side.Bid, cur, inp);
                     break;
                 case SideState.Cooldown:
-                    if (inp.Now >= c.CooldownUntil) { c.State = SideState.Waiting; c.Fraction = 0; }
+                    if (inp.Now >= c.CooldownUntil) { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; }
                     break;
                 case SideState.Countdown:
                     return StepCountdown(c, Side.Bid, cur, inp, chop, ref fire);
@@ -244,7 +249,7 @@ namespace TradingRadar.Engine
                     // away-band. No wall-identity check: after a fire the eaten wall vanishes and dominance
                     // hops immediately, so an identity check would un-latch the SETUP indicator instantly.
                     if (cur <= 0 || Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick)
-                    { c.State = SideState.Waiting; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.Fraction = 0; }
+                    { c.State = SideState.Waiting; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.Fraction = 0; c.TradeBackedFraction = 0; }
                     break;
             }
             return false;

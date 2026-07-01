@@ -161,7 +161,8 @@ namespace TradingRadar.NT
                 _sigWriter = new System.IO.StreamWriter(sigPath, false);
                 _sigWriter.WriteLine("time,mid,bidMass,askMass,bestBid,bestAsk,delta15s,wallFrac,wallAbove,wallPx," +
                     "wallAbovePx,wallAboveCur,wallBelowPx,wallBelowCur,consumeFracLong,tradeBackedLong," +
-                    "consumeFracShort,tradeBackedShort,printsPerSec,buyVolPerSec,sellVolPerSec,tapeZ,ctrlLong,ctrlShort");
+                    "consumeFracShort,tradeBackedShort,printsPerSec,buyVolPerSec,sellVolPerSec,tapeZ,ctrlLong,ctrlShort," +
+                    "ctrlWallAbovePx,ctrlWallAboveSz,ctrlWallBelowPx,ctrlWallBelowSz");
                 _sigWriter.Flush();
                 _capture = true;
             };
@@ -342,7 +343,7 @@ namespace TradingRadar.NT
         {
             if (price <= 0) return 0;
             for (int i = 0; i < nodes.Count; i++)
-                if (nodes[i].Side == side && Math.Abs(nodes[i].Price - price) < _cfg.TickSize / 2.0)
+                if (nodes[i].InWindow && nodes[i].Side == side && Math.Abs(nodes[i].Price - price) < _cfg.TickSize / 2.0)
                     return nodes[i].LastKnownSize;
             return 0;
         }
@@ -462,6 +463,7 @@ namespace TradingRadar.NT
             for (int i = 0; i < snapNodes.Count; i++)
             {
                 RadarNode wn = snapNodes[i];
+                if (!wn.InWindow) continue;   // blind/remembered node — frozen size, must not count as a live dominant wall
                 if (wn.Price > pMid && wn.LastKnownSize > wallAboveSz) { wallAboveSz = wn.LastKnownSize; wallAbovePx = wn.Price; }
                 if (wn.Price < pMid && wn.LastKnownSize > wallBelowSz) { wallBelowSz = wn.LastKnownSize; wallBelowPx = wn.Price; }
             }
@@ -566,23 +568,25 @@ namespace TradingRadar.NT
                             for (int i = 0; i < er.Count; i++)
                                 if (er[i].Approaching && er[i].Frac > wf)
                                 { wf = er[i].Frac; wpx = er[i].Price; wabove = er[i].Price > mid; }
-                            // consumeFracLong/Short are the Controller's own authoritative fraction (already
-                            // correctly zeroed on abandon — see ControllerStateMachine). A genuine
-                            // tradeBackedLong/Short read needs the candidate's internal Peak/ArmTime, which
-                            // the engine doesn't expose (only the armed WallPrice, Task 10's identity-contract
-                            // field) — feeding the identity-contract's live size as both peak and current to
-                            // ConsumptionTracker.Read would make Drop, and so TradeBackedFraction, always 0.
-                            // ponytail: log the literal until ControllerOutput exposes enough state for a real
-                            // read; consumeFracLong/Short above are the authoritative calibration signal.
+                            // consumeFracLong/Short and tradeBackedLong/Short are both the Controller's own
+                            // authoritative reads (ControllerOutput.LongFraction/LongTradeBacked etc — already
+                            // correctly zeroed on abandon, see ControllerStateMachine). wallAbovePx/wallBelowPx
+                            // above are the raw recomputed dominant wall, which during Armed/Countdown is a
+                            // DIFFERENT price level than the one the fractions describe (the identity-pinned
+                            // armed wall) — log that identity-pinned feed too (ctrlWallAbove*/ctrlWallBelow*,
+                            // the exact values passed to _controller.Update this run) so calibration can tell
+                            // the two apart instead of silently mixing levels.
                             _sigWriter.WriteLine(string.Format(System.Globalization.CultureInfo.InvariantCulture,
                                 "{0},{1:0.00},{2},{3},{4},{5},{6},{7:0.000},{8},{9:0.00}," +
                                 "{10:0.00},{11},{12:0.00},{13},{14:0.000},{15:0.000},{16:0.000},{17:0.000}," +
-                                "{18},{19},{20},{21:0.000},{22},{23}",
+                                "{18},{19},{20},{21:0.000},{22},{23}," +
+                                "{24:0.00},{25},{26:0.00},{27}",
                                 now.ToString("o"), mid, bidMass, askMass, bestBid, bestAsk, delta15, wf, wabove, wpx,
                                 wallAbovePx, wallAboveSz, wallBelowPx, wallBelowSz,
-                                cout.LongFraction, 0.0, cout.ShortFraction, 0.0,
+                                cout.LongFraction, cout.LongTradeBacked, cout.ShortFraction, cout.ShortTradeBacked,
                                 win1s.Prints, win1s.BuyVol, win1s.SellVol, _tape.ZScore,
-                                cout.Long, cout.Short));
+                                cout.Long, cout.Short,
+                                ctrlWallAbovePx, ctrlWallAboveSz, ctrlWallBelowPx, ctrlWallBelowSz));
                             _sigWriter.Flush();
                         }
                     }
