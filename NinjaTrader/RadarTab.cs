@@ -48,7 +48,8 @@ namespace TradingRadar.NT
         private DateTime _lastDiag      = DateTime.MinValue;
         private DateTime _lastEngineRun = DateTime.MinValue;
         private const double EngineIntervalMs = 50;   // run engine+snapshot at most ~20Hz
-        private const double ReplayResetBackwardMs = 2000;  // Playback rewind trip: real rewinds jump seconds-minutes; feed jitter is a few ms
+        private const double ReplayResetBackwardMs = 2000;   // Playback rewind trip: real rewinds jump seconds-minutes; feed jitter is a few ms
+        private const double ReplayResetForwardMs  = 60000;  // Playback scrub-ahead / session-rollover trip: bigger than any real quiet-market gap
         private volatile bool _autoCalib;
         private double _medianEwma;
         private double _autoFactor = 1.8;
@@ -322,10 +323,11 @@ namespace TradingRadar.NT
             if (_lastEngineRun != DateTime.MinValue)
             {
                 double deltaMs = (now - _lastEngineRun).TotalMilliseconds;
-                // Market Replay was rewound/restarted: e.Time jumped far backward past our high-water
-                // mark. Rebuild the stale book+tracker, then fall through and run the engine for this
-                // event (do NOT return — the old guard's negative-diff path froze the radar here).
-                if (deltaMs < -ReplayResetBackwardMs)
+                // Market Replay discontinuity: e.Time jumped far BACKWARD (rewind/restart — the old
+                // guard's negative-diff path froze the radar here) OR far FORWARD past any real
+                // quiet-market gap (scrub-ahead / session rollover, which would otherwise paint a stale
+                // book as live). Rebuild the stale book+tracker, then fall through and run the engine.
+                if (deltaMs < -ReplayResetBackwardMs || deltaMs > ReplayResetForwardMs)
                     HandleReplayReset(now);
                 else if (deltaMs < EngineIntervalMs)
                     return;                       // normal ~20Hz throttle
