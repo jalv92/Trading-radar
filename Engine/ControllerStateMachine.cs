@@ -101,14 +101,30 @@ namespace TradingRadar.Engine
                     }
                     break;
                 case SideState.Armed:
-                    // Suppression: an INTACT wall never advances on book skew. Track peak/min only.
                     if (cur <= 0) { c.State = SideState.Waiting; break; }
-                    if (cur > c.Peak) c.Peak = cur;
-                    if (cur < c.Min) c.Min = cur;
-                    // Countdown transition added in Task 5.
+                    AdvanceArmedOrCountdown(c, Side.Ask, cur, inp);
+                    break;
+                case SideState.Cooldown:
+                    if (inp.Now >= c.CooldownUntil) { c.State = SideState.Waiting; c.Fraction = 0; }
                     break;
             }
             return false;
+        }
+
+        private void AdvanceArmedOrCountdown(Candidate c, Side wallSide, long cur, ControllerInputs inp)
+        {
+            if (cur > c.Peak) c.Peak = cur;
+            if (cur < c.Min) c.Min = cur;
+            ConsumptionRead r = ConsumptionTracker.Read(wallSide, c.WallPrice, c.Peak, cur, c.ArmTime, inp.Book);
+            c.Fraction = r.Fraction;
+            if (r.Fraction <= 0) return; // nothing eaten yet
+            if (r.TradeBackedFraction >= _cfg.MinTradeBackedRatio)
+                c.State = SideState.Countdown;
+            else
+            {
+                // Thinning NOT explained by trades = pull/spoof: veto + cooldown.
+                c.State = SideState.Cooldown; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.HoldCount = 0;
+            }
         }
 
         private bool StepShort(ControllerInputs inp, bool chop, ref FireEvent fire)
@@ -126,8 +142,10 @@ namespace TradingRadar.Engine
                     break;
                 case SideState.Armed:
                     if (cur <= 0) { c.State = SideState.Waiting; break; }
-                    if (cur > c.Peak) c.Peak = cur;
-                    if (cur < c.Min) c.Min = cur;
+                    AdvanceArmedOrCountdown(c, Side.Bid, cur, inp);
+                    break;
+                case SideState.Cooldown:
+                    if (inp.Now >= c.CooldownUntil) { c.State = SideState.Waiting; c.Fraction = 0; }
                     break;
             }
             return false;
