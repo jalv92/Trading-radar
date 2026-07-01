@@ -243,6 +243,7 @@ namespace TradingRadar.Engine
         public void Sample(double rate, DateTime now)
         {
             if (_n == 0) { _mean = rate; _var = 0; _n = 1; ZScore = 0; return; }
+            _n++;   // count this sample first so Ready and the ZScore gate flip on the same call
             // Score the new sample against the baseline BEFORE absorbing it. Scoring against
             // post-update stats saturates z at sqrt((1-alpha)/alpha) for any large spike (a 2x
             // and a 100x spike would read the same). Pre-update scoring keeps z unbounded.
@@ -252,7 +253,6 @@ namespace TradingRadar.Engine
             _mean = _alpha * rate + (1 - _alpha) * _mean;
             // EWMA variance (West/Welford-style incremental for exponential weighting).
             _var = (1 - _alpha) * (_var + _alpha * (rate - prevMean) * (rate - prevMean));
-            _n++;
         }
     }
 }
