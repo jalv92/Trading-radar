@@ -165,4 +165,46 @@ public class ControllerStateMachineTests
         }
         Assert.Equal(0, fires);
     }
+
+    // Reload veto: a wall being consumed that REFILLS above its running min (someone defending) -> Cooldown, not fire.
+    [Fact]
+    public void Reload_refill_vetoes_countdown_to_cooldown()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));           // arm peak 120
+        var b2 = BookWithBuys(100.25, 40, 2);
+        var o2 = m.Update(In(100.25, 80, 0, 0, 20, 2.0, 0, 100.00, 2, b2));          // eaten 120->80 (min=80), trade-backed -> Countdown
+        Assert.Equal(SideState.Countdown, o2.Long);
+        var b3 = BookWithBuys(100.25, 40, 3);
+        var o3 = m.Update(In(100.25, 120, 0, 0, 20, 2.0, 0, 100.00, 3, b3));         // refilled 80->120 (>= min + ReloadFrac*peak) -> reload veto
+        Assert.Equal(SideState.Cooldown, o3.Long);
+    }
+
+    // Fire -> reset (price crosses past the wall) -> the side can re-arm on a fresh wall.
+    [Fact]
+    public void Fires_then_resets_then_can_rearm()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));            // arm
+        int fires = 0; ControllerOutput o = default(ControllerOutput);
+        for (int s = 2; s <= 8; s++) { var b = BookWithBuys(100.25, 90, s); o = m.Update(In(100.25, 30, 0, 0, 20, 2.0, 0, 100.00, s, b)); if (o.Fired) fires++; }
+        Assert.Equal(1, fires);
+        Assert.Equal(SideState.Fired, o.Long);
+        // Price breaks up and holds well past the wall -> reset to Waiting.
+        var oReset = m.Update(In(100.25, 0, 0, 0, 0, 0, 0, 102.00, 9, EmptyBook())); // cur<=0 AND mid far above wall
+        Assert.NotEqual(SideState.Fired, oReset.Long);
+        // A fresh dominant wall appears above the new price, after the post-fire Cooldown (10s) elapses -> re-arms.
+        var oRearm = m.Update(In(103.00, 120, 0, 0, 0, 0, 0, 102.75, 20, EmptyBook()));
+        Assert.Equal(SideState.Armed, oRearm.Long);
+    }
+
+    // Sub-band jitter (1-lot cancel, not trade-backed) must NOT trip the pull-veto (stays Armed).
+    [Fact]
+    public void Sub_band_jitter_does_not_trip_pull_veto()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));            // arm peak 120
+        var o = m.Update(In(100.25, 119, 0, 0, 0, 0, 0, 100.00, 2, EmptyBook()));    // 1-lot drop, no trades, < MinDropBand -> stay Armed
+        Assert.Equal(SideState.Armed, o.Long);
+    }
 }

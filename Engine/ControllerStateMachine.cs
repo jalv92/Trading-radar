@@ -40,6 +40,7 @@ namespace TradingRadar.Engine
         public double ChopSlowZ = -0.3;          // z at/below this = quiet tape
         public int ChopAltCount = 3;             // aggressor sign changes over the window => chop
         public TimeSpan Cooldown = TimeSpan.FromSeconds(10);
+        public long MinDropBand = 3;             // ignore sub-band size jitter before the pull-veto decision — MEASURED
     }
 
     // The anti-flip spine. Two per-side candidates + a global CHOP gate. Pure: time via inp.Now.
@@ -111,7 +112,7 @@ namespace TradingRadar.Engine
                     }
                     break;
                 case SideState.Armed:
-                    if (cur <= 0) { c.State = SideState.Waiting; break; }
+                    if (cur <= 0 || System.Math.Abs(price - c.WallPrice) >= _tick) { c.State = SideState.Waiting; break; }
                     AdvanceArmedOrCountdown(c, Side.Ask, cur, inp);
                     break;
                 case SideState.Cooldown:
@@ -130,7 +131,9 @@ namespace TradingRadar.Engine
 
         private bool StepCountdown(Candidate c, Side wallSide, long cur, ControllerInputs inp, bool chop, ref FireEvent fire)
         {
-            if (cur <= 0) { c.State = SideState.Waiting; c.Fraction = 0; return false; }
+            double curWallPrice = wallSide == Side.Ask ? inp.WallAbovePrice : inp.WallBelowPrice;
+            if (cur <= 0 || System.Math.Abs(curWallPrice - c.WallPrice) >= _tick)
+            { c.State = SideState.Waiting; c.Fraction = 0; c.HoldCount = 0; return false; }
             if (cur > c.Peak) c.Peak = cur;
             if (cur < c.Min) c.Min = cur;
 
@@ -171,7 +174,7 @@ namespace TradingRadar.Engine
             if (cur < c.Min) c.Min = cur;
             ConsumptionRead r = ConsumptionTracker.Read(wallSide, c.WallPrice, c.Peak, cur, c.ArmTime, inp.Book);
             c.Fraction = r.Fraction;
-            if (r.Fraction <= 0) return; // nothing eaten yet
+            if (r.Fraction <= 0 || r.Drop < _cfg.MinDropBand) return; // nothing eaten yet, or sub-band jitter — stay Armed
             if (r.TradeBackedFraction >= _cfg.MinTradeBackedRatio)
                 c.State = SideState.Countdown;
             else
@@ -195,7 +198,7 @@ namespace TradingRadar.Engine
                     }
                     break;
                 case SideState.Armed:
-                    if (cur <= 0) { c.State = SideState.Waiting; break; }
+                    if (cur <= 0 || System.Math.Abs(price - c.WallPrice) >= _tick) { c.State = SideState.Waiting; break; }
                     AdvanceArmedOrCountdown(c, Side.Bid, cur, inp);
                     break;
                 case SideState.Cooldown:
