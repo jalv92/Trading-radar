@@ -368,6 +368,17 @@ namespace TradingRadar.NT
             }
         }
 
+        // Narrower than IsSimAccount on purpose: ONLY the Market Replay Playback account has its orders wiped
+        // by a rewind/restart. A Simulator (Sim101) or real account runs against a LIVE feed, where the
+        // replay-reset heuristic (a big e.Time gap) is a false trip, not an account reset. Fail-closed on any
+        // account whose Provider can't be read.
+        private static bool IsPlaybackAccount(Account acct)
+        {
+            if (acct == null) return false;
+            try { return acct.Provider == Provider.Playback; }
+            catch { return false; }
+        }
+
         private bool CanTrade()
         {
             if (_instrument == null || _account == null) return false;
@@ -412,6 +423,53 @@ namespace TradingRadar.NT
             SubscribeAccount();
             RefreshArmUi();
             RefreshPositionUi();
+        }
+
+        // Called on the UI thread (RadarTab's paint tick) after a Market Replay rewind/restart. The
+        // Playback account is reset — working orders vanish and the position flattens — but NT8 doesn't
+        // reliably fire a terminal OrderUpdate for each, which can leave _activeLimit a phantom that paints
+        // a ladder marker for an order that no longer exists. Drop any tracked order that isn't provably
+        // still working, and clear the in-flight guards the reset invalidated. Runs on the UI thread, same
+        // as every other mutation of this state, so no marshaling/lock is needed.
+        //
+        // FAIL CLOSED to the Playback account: the trigger is a market-DATA-clock heuristic (a big gap in
+        // e.Time), fired independently of which account is selected here. ONLY the Market Replay Playback
+        // account (Provider.Playback) has its orders wiped by a rewind/restart. A Simulator (Sim101) or real
+        // account runs against a LIVE feed, where a >60s quiet-market gap is NOT an account reset — touching
+        // its order tracking there would re-enable the buttons mid-flight (double-submit) and silently drop a
+        // pending opposite-side flip. So gate specifically on Provider.Playback, NOT the broader IsSimAccount
+        // (which answers a different question — "does this account need ARM LIVE?").
+        public void OnReplayReset()
+        {
+            if (!IsPlaybackAccount(_account)) return;
+            _pendingReplace = null;
+            _workingOrders.Clear();   // any in-flight submit is void after a Playback reset — re-enable the buttons
+            Order ord = _activeLimit;
+            if (ord != null)
+            {
+                if (!IsStillWorking(ord))
+                {
+                    _ownOrders.Remove(ord);
+                    _activeLimit = null;   // TryGetActiveOrder now returns false → the paint tick clears the marker
+                }
+                else
+                    // Still present + non-terminal after a reset trip: either a false trip (order genuinely
+                    // still resting — keep it, don't orphan the marker) or NT8 left a stale phantom in
+                    // Account.Orders. Log so the Market Replay pass can tell which (see docs checklist).
+                    Diag("replay reset: active limit still in Account.Orders (" + ord.OrderState + ") — kept.");
+            }
+            RefreshArmUi();
+            RefreshPositionUi();
+        }
+
+        // True only if the order is non-terminal AND still present in the account's live order collection.
+        // After a Playback rewind the order is gone from Account.Orders even if its cached OrderState still
+        // reads Working, so membership — not just state — is what actually kills the phantom marker.
+        private bool IsStillWorking(Order ord)
+        {
+            if (ord == null || _account == null || Order.IsTerminalState(ord.OrderState)) return false;
+            lock (_account.Orders)
+                return _account.Orders.Contains(ord);
         }
 
         // Cancels the currently-tracked working limit if it's still alive — used on teardown/context

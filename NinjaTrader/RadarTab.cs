@@ -38,7 +38,11 @@ namespace TradingRadar.NT
         private PressureModel _pressure = new PressureModel(new PressureConfig());
         private InstrumentSelector _selector;
 
-        private Instrument     _instrument;
+        // Serializes the engine-state swap (instrument switch / replay reset, done from the UI or
+        // instrument thread) against the instrument-thread depth/trade handlers. Monitor is reentrant, so
+        // HandleReplayReset -> SeedFromSnapshot re-entering under the same lock is fine.
+        private readonly object _engineLock = new object();
+        private volatile Instrument _instrument;   // volatile: read in the handler guard on the instrument thread
         private volatile Frame _latest;       // immutable snapshot + mid + tick, swapped from instrument thread
         private volatile bool _replayResetPending;  // set on instrument thread by HandleReplayReset; consumed on the UI paint tick
         private DispatcherTimer _paintTimer;
@@ -175,7 +179,12 @@ namespace TradingRadar.NT
             };
             _paintTimer.Tick += (o, e) =>
             {
-                if (_replayResetPending) { _replayResetPending = false; _visual.ResetLadderMemory(); }  // post-replay-reset (UI thread)
+                if (_replayResetPending)   // post-replay-reset (UI thread)
+                {
+                    _replayResetPending = false;
+                    _visual.ResetLadderMemory();
+                    if (_chartTrader != null) _chartTrader.OnReplayReset();   // drop a phantom limit-order marker if the Playback account was reset
+                }
                 Frame f = _latest;          // volatile read of the latest immutable frame
                 if (f != null)
                 {
@@ -221,13 +230,21 @@ namespace TradingRadar.NT
             {
                 if (_instrument == value) return;
                 Unsubscribe();
-                _instrument = value;
-                if (_instrument != null)
-                    _cfg.TickSize = _instrument.MasterInstrument.TickSize;
-                // Rebuild engine for the new instrument's tick size.
-                _book    = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
-                _tracker = new WallTracker(_cfg);
-                _latest  = null;
+                // Swap the whole engine state atomically w.r.t. the instrument-thread handlers: a late
+                // depth/trade event from the OLD instrument (still queued on its thread) is dropped by the
+                // e.Instrument guard, and can never apply to the NEW book mid-swap.
+                lock (_engineLock)
+                {
+                    _instrument = value;
+                    if (_instrument != null)
+                        _cfg.TickSize = _instrument.MasterInstrument.TickSize;
+                    // Rebuild engine for the new instrument's tick size.
+                    _book    = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
+                    _tracker = new WallTracker(_cfg);
+                    _latest  = null;
+                    _lastEngineRun = DateTime.MinValue;   // don't carry the old instrument's engine clock
+                    _medianEwma    = 0;                   // (a stale high-water would spuriously reset/throttle)
+                }
                 if (_chartTrader != null) _chartTrader.Instrument = value;
                 Subscribe();
                 RefreshHeader();
@@ -244,7 +261,11 @@ namespace TradingRadar.NT
                 {
                     inst.MarketDepth.Update += OnMarketDepth;
                     inst.MarketData.Update  += OnMarketData;
-                    SeedFromSnapshot(inst);     // prime the book with the current ladder
+                    // Guard identity too: a rapid A→B→C switch can leave this action (queued on B's own
+                    // dispatcher thread) running AFTER _book was already swapped to C, seeding C's book with
+                    // B's levels. SeedFromSnapshot reads the _book field at exec time, so only seed when
+                    // `inst` is still the current instrument — the same guard the depth/trade handlers use.
+                    lock (_engineLock) { if (inst == _instrument) SeedFromSnapshot(inst); }   // prime the book under the engine lock
                 });
                 _subscribed = true;
             }
@@ -304,18 +325,26 @@ namespace TradingRadar.NT
                 Time     = e.Time,
                 IsReset  = false
             };
-            _book.ApplyDepth(de);
-            _depthEvents++;
-            MaybeRunEngine(e.Time);
+            lock (_engineLock)
+            {
+                if (e.Instrument != _instrument) return;   // stale event from a prior instrument (mid-switch) — drop before touching the book
+                _book.ApplyDepth(de);
+                _depthEvents++;
+                MaybeRunEngine(e.Time);
+            }
         }
 
         private void OnMarketData(object sender, MarketDataEventArgs e)
         {
             if (e.MarketDataType != MarketDataType.Last || e.Price <= 0) return;
             TradeEvent te = new TradeEvent { Price = e.Price, Volume = e.Volume, Time = e.Time };
-            _book.ApplyTrade(te);
-            _tradeEvents++;
-            MaybeRunEngine(e.Time);
+            lock (_engineLock)
+            {
+                if (e.Instrument != _instrument) return;   // stale event from a prior instrument (mid-switch) — drop before touching the book
+                _book.ApplyTrade(te);
+                _tradeEvents++;
+                MaybeRunEngine(e.Time);
+            }
         }
 
         private void MaybeRunEngine(DateTime now)
@@ -329,8 +358,19 @@ namespace TradingRadar.NT
                 // book as live). Rebuild the stale book+tracker, then fall through and run the engine.
                 if (deltaMs < -ReplayResetBackwardMs || deltaMs > ReplayResetForwardMs)
                     HandleReplayReset(now);
+                else if (deltaMs < 0)
+                {
+                    // Small BACKWARD step (a sub-2s rewind, or an out-of-order feed tick): don't run this
+                    // frame, but DO re-base the engine clock down to `now`. The old code left
+                    // _lastEngineRun at the forward high-water mark and early-returned, so every later
+                    // event still saw a negative delta and the engine stayed frozen until replay time
+                    // climbed back past it. Re-basing lets the very next forward tick resume normally —
+                    // without bypassing the throttle on every jittery backward tick (which running here would).
+                    _lastEngineRun = now;
+                    return;
+                }
                 else if (deltaMs < EngineIntervalMs)
-                    return;                       // normal ~20Hz throttle
+                    return;                       // normal ~20Hz forward throttle (keep _lastEngineRun at the last actual run)
             }
             _lastEngineRun = now;
             _tracker.Update(_book, now);
