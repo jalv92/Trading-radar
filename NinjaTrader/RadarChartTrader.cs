@@ -77,6 +77,19 @@ namespace TradingRadar.NT
         }
         private PendingReplace _pendingReplace;
 
+        // Task 12: a Controller fire pre-stages (never submits) a break-direction limit for the NEXT
+        // manual BUY/SELL LMT click — price+side only, no Order object, nothing touches the Account.
+        private sealed class PendingSetup
+        {
+            public bool IsBuy;
+            public double Price;
+        }
+        private PendingSetup _pendingSetup;
+        // Dedupe guard: ControllerOutput.Fired is one-shot per engine run (~20Hz), but the UI paint tick
+        // (~30Hz) can read the same _latest Frame more than once before the engine swaps it in, so
+        // OnSetupFire can be called twice with the IDENTICAL FireEvent. FireEvent.Time is unique per fire.
+        private DateTime _lastFireTime = DateTime.MinValue;
+
         private readonly ComboBox _accountCombo = new ComboBox { Margin = new Thickness(0, 0, 6, 0) };
         private readonly CheckBox _armChk = new CheckBox { Content = "ARM LIVE", Visibility = Visibility.Collapsed,
             Foreground = Coral, FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
@@ -86,6 +99,11 @@ namespace TradingRadar.NT
         private readonly TextBox _qtyBox = new TextBox { Text = "1", Width = 40, TextAlignment = TextAlignment.Center,
             Background = Ink, Foreground = TextCol, BorderBrush = BorderBr,
             VerticalContentAlignment = VerticalAlignment.Center };
+        // "SETUP LONG/SHORT listo" indicator for a pending Controller-fire pre-stage (Task 12). Doubles
+        // as the manual-clear affordance — click it to drop the pre-stage without touching either button.
+        private readonly TextBlock _setupText = new TextBlock { FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
+            FontWeight = FontWeights.SemiBold, HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 0, 0, 2), Visibility = Visibility.Collapsed, Cursor = Cursors.Hand };
         private readonly Button _buyBtn;
         private readonly Button _sellBtn;
         private readonly Button _buyLmtBtn;
@@ -129,6 +147,7 @@ namespace TradingRadar.NT
             _revBtn.Click     += (o, e) => Reverse();
             _closeBtn.Click   += (o, e) => ClosePosition(false);
             _flatBtn.Click    += (o, e) => ClosePosition(true);
+            _setupText.MouseLeftButtonDown += (o, e) => ClearPendingSetup();   // manual clear affordance
 
             _accountCombo.DisplayMemberPath = "Name";
             _accountCombo.Background = Ink;
@@ -150,8 +169,9 @@ namespace TradingRadar.NT
             // Row 0: BUY MKT / SELL MKT — the primary order entry, at the very top (like NT8's Chart Trader).
             AddRow(0, TwoColRow(_buyBtn, _sellBtn, 8, 4));
 
-            // Row 1: BUY LMT / SELL LMT — wall-anchored (see LimitAnchorPrice()).
-            AddRow(1, TwoColRow(_buyLmtBtn, _sellLmtBtn, 8, 0));
+            // Row 1: BUY LMT / SELL LMT — wall-anchored (see LimitAnchorPrice()), plus the "listo"
+            // pre-stage indicator (Task 12) directly underneath — same row slot, stacked content.
+            AddRow(1, new StackPanel { Children = { TwoColRow(_buyLmtBtn, _sellLmtBtn, 8, 0), _setupText } });
 
             // Row 2: ▲ / ▼ — move the active working limit 1 tick; disabled when none is working.
             AddRow(2, TwoColRow(_upBtn, _dnBtn, 8, 0));
@@ -323,6 +343,7 @@ namespace TradingRadar.NT
                 _pendingReplace = null;
                 _workingOrders.Clear();
                 _ownOrders.Clear();
+                ClearPendingSetup();                // a pre-stage for the old instrument no longer applies
                 _atmSelector.Instrument = value;
                 _atmSelector.SelectedItem = null;   // force "None" — don't trust the control's own default
                 _atmUserPicked = false;             // F16: switching instrument disarms ATM attach again
@@ -342,9 +363,74 @@ namespace TradingRadar.NT
             RefreshPositionUi();
         }
 
-        // Called by RadarTab's UI-thread paint tick when the Controller fires (Task 10, one-shot per
-        // FireEvent.Fired-per-engine-contract). ponytail: filled by Task 12 (pre-stage break-direction limit).
-        public void OnSetupFire(FireEvent f) { }
+        // Placeholder join-tolerance for the break pre-stage price, in ticks — MEASURED later from Rec
+        // CSV (spec §9), like every other Controller threshold.
+        private const int SetupJoinToleranceTicks = 1;
+
+        // Called by RadarTab's UI-thread paint tick (same thread as SetContext/Instrument — no Dispatcher
+        // marshal needed) when the Controller fires. PRE-STAGES ONLY: pre-fills price+side for the next
+        // manual BUY/SELL LMT click and lights that button's "listo" indicator. No Order is created and
+        // nothing reaches the Account here — submission still goes through the existing, Sim/Playback-
+        // gated SubmitLimit -> SubmitRaw path untouched. No new NT8 Account/Order API is introduced by
+        // this method, so no ilspycmd verification is needed for this task.
+        //
+        // Dedupe: ControllerOutput.Fired is one-shot per ENGINE run (~20Hz), but the UI paint tick
+        // (~30Hz) can read the same _latest Frame more than once before the engine swaps it in — RadarTab
+        // would then call this twice with the IDENTICAL FireEvent. Guard on FireEvent.Time (unique per
+        // fire) so a re-delivery is a no-op instead of re-arming/re-flashing the indicator.
+        //
+        // Placement is a JOIN-NEAR-INSIDE limit in the break direction (spec §8) — the OPPOSITE intent of
+        // LimitAnchorPrice's wall-anchored reversion LMT (which rests AT the wall to fade it, commit
+        // ed46c76). A break enters WITH the move, so resting past the wall would be marketable while
+        // price still sits on the near side. Real L2 best bid/ask aren't piped into this control (same
+        // gap LimitAnchorPrice already documents — F14); reuse its mid ± 1 tick proxy convention.
+        public void OnSetupFire(FireEvent f)
+        {
+            if (f.Time == _lastFireTime) return;
+            _lastFireTime = f.Time;
+
+            bool isBuy = f.Side == Side.Ask;   // ask wall above consumed by buys -> long break; bid wall below -> short
+            double tick = EffectiveTick();
+            double tol = tick * SetupJoinToleranceTicks;
+            double price;
+            if (_lastPrice <= 0)
+                price = f.WallPrice;   // stale/no inside context yet — human re-checks the ticket before clicking anyway
+            else if (isBuy)
+                price = Math.Min(_lastPrice + tick + tol, f.WallPrice);    // never above the wall (would be marketable below it)
+            else
+                price = Math.Max(_lastPrice - tick - tol, f.WallPrice);    // never below the wall
+
+            _pendingSetup = new PendingSetup { IsBuy = isBuy, Price = RoundToTick(price, tick) };
+            ApplyPendingSetupUi();
+        }
+
+        // Lights the pre-staged LMT button in the Aurora fire color (same glow the MKT buttons already
+        // use — LMT buttons are built with glow:null, so no Effect competes) and shows/hides the "listo"
+        // text. Never touches SetActiveOrder — that marker is for a LIVE working order, not a suggestion.
+        private void ApplyPendingSetupUi()
+        {
+            bool buyLive = _pendingSetup != null && _pendingSetup.IsBuy;
+            bool sellLive = _pendingSetup != null && !_pendingSetup.IsBuy;
+            _buyLmtBtn.Effect = buyLive ? SetupGlow(Emerald.Color) : null;
+            _sellLmtBtn.Effect = sellLive ? SetupGlow(Coral.Color) : null;
+            _setupText.Visibility = _pendingSetup != null ? Visibility.Visible : Visibility.Collapsed;
+            _setupText.Text = buyLive ? "SETUP LONG listo" : sellLive ? "SETUP SHORT listo" : string.Empty;
+            _setupText.Foreground = buyLive ? Emerald : Coral;
+        }
+
+        private static DropShadowEffect SetupGlow(Color c)
+        {
+            return new DropShadowEffect { Color = c, BlurRadius = 16, ShadowDepth = 0, Opacity = 0.55 };
+        }
+
+        // Clears the pre-stage + its glow/text — consumed by a matching LMT click, invalidated by the
+        // opposite one, or dropped by account/instrument switch, a Replay reset, or clicking _setupText.
+        private void ClearPendingSetup()
+        {
+            if (_pendingSetup == null) return;
+            _pendingSetup = null;
+            ApplyPendingSetupUi();
+        }
 
         // Exposes the one active working limit order for RadarVisual's ladder marker.
         public bool TryGetActiveOrder(out double price, out bool isBuy, out int qty)
@@ -422,6 +508,7 @@ namespace TradingRadar.NT
             _pendingReplace = null;
             _workingOrders.Clear();
             _ownOrders.Clear();
+            ClearPendingSetup();        // a pre-stage for the old account no longer applies
             _atmSelector.Account = _account;
             _atmSelector.SelectedItem = null;   // force "None" — don't trust the control's own default
             _atmUserPicked = false;             // F16: switching account disarms ATM attach again
@@ -448,6 +535,7 @@ namespace TradingRadar.NT
         {
             if (!IsPlaybackAccount(_account)) return;
             _pendingReplace = null;
+            ClearPendingSetup();      // a pre-stage keyed off the pre-reset book/wall is stale after a rewind
             _workingOrders.Clear();   // any in-flight submit is void after a Playback reset — re-enable the buttons
             Order ord = _activeLimit;
             if (ord != null)
@@ -687,7 +775,13 @@ namespace TradingRadar.NT
         {
             if (!ValidateForSubmit()) return;
             if (_lastPrice <= 0) { Diag("blocked — no price context yet."); return; }
-            double price = LimitAnchorPrice(isBuy);
+
+            // A live pre-stage for THIS side (Task 12) wins over the wall-anchored default and is
+            // consumed by this one click. A pre-stage for the OTHER side is stale the moment its
+            // opposite button is clicked — drop it either way.
+            PendingSetup setup = _pendingSetup;
+            double price = (setup != null && setup.IsBuy == isBuy) ? setup.Price : LimitAnchorPrice(isBuy);
+            if (setup != null) ClearPendingSetup();
             if (price <= 0) { Diag("blocked — invalid anchor price."); return; }
             OrderAction action = isBuy ? OrderAction.Buy : OrderAction.Sell;
             string tag = isBuy ? "BuyLmt" : "SellLmt";
