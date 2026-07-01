@@ -55,6 +55,16 @@ namespace TradingRadar.NT
         private const double MIN_ROW_PX   = 16.0;      // ponytail: row-height clamp; widen the band if bars look too thin/fat
         private const double MAX_ROW_PX   = 40.0;
 
+        // Ladder memory: last-known size at every price the market passed through (tickKey → size).
+        // Fills the rows above/below the live 10-level book with ghost bars so the price column is
+        // never blank — a resting-liquidity remnant held until the book reveals that level again.
+        // UI-thread confined (only touched inside OnRender). Bounded to the visible band around mid.
+        private readonly Dictionary<long, long> _ladderMem = new Dictionary<long, long>();
+        private readonly List<long>              _memEvict = new List<long>();
+        static readonly Brush GhostBid = FrozenBrush(Color.FromArgb(58, 0x34, 0xd3, 0x99));  // ~.23
+        static readonly Brush GhostAsk = FrozenBrush(Color.FromArgb(58, 0xfb, 0x71, 0x85));
+        static readonly Brush GhostTxt = FrozenBrush(Color.FromArgb(96, 0xcf, 0xd6, 0xe2));
+
         public void SetFrame(IReadOnlyList<RadarNode> nodes, IReadOnlyList<DepthLevel> bids,
                              IReadOnlyList<DepthLevel> asks, double mid, double tickSize)
         {
@@ -101,11 +111,26 @@ namespace TradingRadar.NT
             double halfRow = rowH * 0.5;
             bool RowVisible(double y) { return y - halfRow >= 0 && y + halfRow <= h; }
 
-            // maxSize spans book levels + wall nodes so bar widths are proportional across both layers.
+            // ---- ladder memory: refresh from the live book, then evict what fell out of range ----
+            long midKey   = (long)Math.Round(_mid / _tick);
+            long memRange = rows + 6;                     // keep only what the visible column could show
+            if (_bids != null) for (int i = 0; i < _bids.Count; i++) _ladderMem[(long)Math.Round(_bids[i].Price / _tick)] = _bids[i].Volume;
+            if (_asks != null) for (int i = 0; i < _asks.Count; i++) _ladderMem[(long)Math.Round(_asks[i].Price / _tick)] = _asks[i].Volume;
+            _memEvict.Clear();
+            foreach (var kv in _ladderMem) if (Math.Abs(kv.Key - midKey) > memRange) _memEvict.Add(kv.Key);
+            for (int i = 0; i < _memEvict.Count; i++) _ladderMem.Remove(_memEvict[i]);
+
+            // maxSize spans book levels + wall nodes + remembered sizes so bar widths stay proportional.
             long maxSize = 1;
             if (_nodes != null) for (int i = 0; i < _nodes.Count; i++) if (_nodes[i].LastKnownSize > maxSize) maxSize = _nodes[i].LastKnownSize;
             if (_bids  != null) for (int i = 0; i < _bids.Count;  i++) if (_bids[i].Volume  > maxSize) maxSize = _bids[i].Volume;
             if (_asks  != null) for (int i = 0; i < _asks.Count;  i++) if (_asks[i].Volume  > maxSize) maxSize = _asks[i].Volume;
+            foreach (var kv in _ladderMem) if (kv.Value > maxSize) maxSize = kv.Value;
+
+            // Live price keys (book + wall nodes) — remembered ghost rows skip these so the live layer wins.
+            var liveKeys = new HashSet<long>();
+            if (_bids != null) for (int i = 0; i < _bids.Count; i++) liveKeys.Add((long)Math.Round(_bids[i].Price / _tick));
+            if (_asks != null) for (int i = 0; i < _asks.Count; i++) liveKeys.Add((long)Math.Round(_asks[i].Price / _tick));
 
             // Live-node price keys — skip book levels that coincide with a live wall node (prevents double bar + double size label).
             var liveNodeKeys = new HashSet<long>();
@@ -113,6 +138,20 @@ namespace TradingRadar.NT
                 for (int i = 0; i < _nodes.Count; i++)
                     if (_nodes[i].InWindow)
                         liveNodeKeys.Add((long)Math.Round(_nodes[i].Price / _tick));
+
+            // ---- remembered ladder (ghost) — fills the rows the live book doesn't reach ----
+            foreach (var kv in _ladderMem)
+            {
+                if (liveKeys.Contains(kv.Key) || liveNodeKeys.Contains(kv.Key)) continue;
+                double price = kv.Key * _tick;
+                double y = Y(price);
+                if (!RowVisible(y)) continue;
+                double barW   = Math.Max(2.0, (kv.Value / (double)maxSize) * barMaxW);
+                double rowTop = y - rowH * 0.35, rowHt = rowH * 0.70;
+                dc.DrawRoundedRectangle(price >= _mid ? GhostAsk : GhostBid, null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
+                DrawText(dc, price.ToString("0.00", CultureInfo.InvariantCulture), 4, y, 14, Mono, GhostTxt, dpi, 1.0);
+                DrawText(dc, kv.Value.ToString(), barX + barW + 6, y, 13, Mono, GhostTxt, dpi, 1.0);
+            }
 
             // ---- faint book ladder (drawn first; wall nodes overlay on top) ----
             if (_bids != null)
