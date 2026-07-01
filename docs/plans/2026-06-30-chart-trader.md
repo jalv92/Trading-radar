@@ -39,7 +39,18 @@ Order ticket docked under the Cockpit in RadarTab's right column. **Layout (NT8-
 - **F13 — MAJOR (deferred):** no wall on the required side → LMT silently rests at mid±1 tick (near market). Before real: block or require explicit confirm (ties to F10). `ponytail:` note at `LimitAnchorPrice`.
 - **F14 — MAJOR (deferred):** LMT submit + move key off the possibly-stale `_lastPrice` mid. A frozen mid (feed stall) defeats the non-marketable clamp. Before real: gate on fresh-quote/`Connection.Status == Connected` and clamp/anchor against the real best bid/ask (needs L2 quotes piped into the ticket).
 
-**Real-money VETO stands; preconditions are now F1–F14** (F11/F12 done; F1/F2/F6 widened; F13/F14 + F1/F2/F9/F10 deferred). Re-submit for VETO review once F1–F8 and F13/F14 (plus F9 if prop) are implemented. Until then: **Sim/Playback testing only.**
+### Added by the ATM re-review (2026-06-30) — real-account only
+- **F1 — re-scoped (still top blocker).** ATM *optionally* attaches a server-resting SL/TP bracket (partially implements F1) but is None-default + optional + degrades to plain on attach-failure. On real: mandate a bracket (ATM or code SL/TP), block the plain-entry path, and hard-block the degrade-to-plain fallback.
+- **F15 (BLOCKER) — DONE:** own-order tracking. `_ownOrders` (seeded at `CreateOrder`) gates `OnOrderUpdate`, so ATM bracket legs / other account orders can never be captured as `_activeLimit` (the marker / ▲▼ / one-limit logic only ever act on orders this control submitted). Also closes F7 for the marker path.
+- **F16 (MAJOR) — DONE:** ATM attaches only on explicit user selection (`DropDownClosed` gate, reset on account/instrument change) — never from the selector's async auto-populate.
+- **F17 (MAJOR) — DONE:** ATM-attach-failure only falls back to `Submit` when the order is still `Initialized` — no duplicate entry.
+
+**Real-money VETO stands; preconditions are now F1(re-scoped)–F17** (F11/F12/F15/F16/F17 done; F1/F2/F6/F7 widened; F13/F14 + F1(bracket-mandate)/F2/F9/F10 deferred). Re-submit for VETO review once F1(re-scoped)–F8 and F13/F14 (plus F9 if prop) are implemented. Until then: **Sim/Playback testing only.**
+
+### Sim test checklist for the ATM path (before trusting it)
+1. Open the tab, pick a Sim/Playback account + instrument → confirm the **ATM box shows nothing pre-selected** (blank), i.e. no auto-picked template.
+2. Select an ATM template, take a bracketed BUY/SELL MKT → let it fill → confirm the ATM's stop/target appear at the broker AND that the **ladder marker / ▲▼ do NOT latch onto the ATM's target** (F15 check — they should stay tied only to your own manual LMT, if any).
+3. With an ATM position open, click **Close** → confirm the position flattens and the ATM bracket legs don't leave an orphaned stop.
 
 ## How to test (Sim/Playback)
 F5 compile in NT8 → **close & reopen** the Liquidity Radar window (open Add-Ons don't refresh on recompile). Select **Sim101** (or a Playback connection) → the ticket is live; BUY/SELL/Rev/Close/Flat operate on the Sim position with live PnL. Selecting a real account disables the buttons and shows ARM LIVE (leave it OFF).
