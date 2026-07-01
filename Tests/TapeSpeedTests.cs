@@ -35,4 +35,17 @@ public class TapeSpeedTests
         ts.Sample(100.0, T(4100));  // ~10x baseline
         Assert.True(ts.ZScore > 5.0);
     }
+
+    // Boundary: on the exact call where Ready first flips true, ZScore must be computable,
+    // not force-zeroed by a one-sample gate desync.
+    [Fact]
+    public void ZScore_is_computable_on_the_call_that_first_reports_ready()
+    {
+        var ts = new TapeSpeed(0.1);
+        for (int i = 0; i < 19; i++) ts.Sample(10.0 + (i % 2 == 0 ? 1.0 : -1.0), T(i * 50));
+        Assert.False(ts.Ready);              // 19 samples: not yet ready
+        ts.Sample(40.0, T(2000));            // 20th sample -> Ready flips true THIS call
+        Assert.True(ts.Ready);
+        Assert.NotEqual(0.0, ts.ZScore);     // must be computable on the same call
+    }
 }

@@ -19,15 +19,14 @@ namespace TradingRadar.Engine
         public void Sample(double rate, DateTime now)
         {
             if (_n == 0) { _mean = rate; _var = 0; _n = 1; ZScore = 0; return; }
-            // Score the new sample against the baseline BEFORE absorbing it. Scoring against
-            // post-update stats saturates z at sqrt((1-alpha)/alpha) for any large spike, so a
-            // 2x and a 100x spike would read the same. Pre-update scoring keeps z unbounded.
+            _n++;   // count this sample first so Ready and the ZScore gate flip on the same call
+            // Score the new sample against the baseline BEFORE absorbing it (avoids the
+            // sqrt((1-alpha)/alpha) saturation of post-update scoring).
             double std = Math.Sqrt(_var);
             ZScore = _n >= MinSamples && std > 1e-9 ? (rate - _mean) / std : 0.0;
             double prevMean = _mean;
             _mean = _alpha * rate + (1 - _alpha) * _mean;
             _var = (1 - _alpha) * (_var + _alpha * (rate - prevMean) * (rate - prevMean));
-            _n++;
         }
     }
 }
