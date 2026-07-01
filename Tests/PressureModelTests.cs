@@ -136,4 +136,16 @@ public class PressureModelTests
         };
         Assert.False(Model().Evaluate(inp).Green);
     }
+
+    // Vote-less book skew: asks outweigh bids => negative context.
+    [Fact]
+    public void BookSkewContext_is_negative_when_asks_outweigh_bids()
+    {
+        var inp = new PressureInputs {
+            Bids = new List<DepthLevel> { L(99.75, 10), L(99.50, 10) },
+            Asks = new List<DepthLevel> { L(100.25, 40), L(100.50, 40) },
+            BestBidSize = 10, BestAskSize = 40, AggressorDelta = 0, Wall = new WallErosion()
+        };
+        Assert.True(Model().BookSkewContext(inp) < 0);
+    }
 }

@@ -151,5 +151,15 @@ namespace TradingRadar.Engine
             r.Active = baseActive && Math.Abs(lean) > _cfg.ActiveFloor;
             return r;
         }
+
+        // Vote-less "book-skew context": the collapse of imbalance/inside-thin/air-pocket into one read.
+        // Reference only — never fires anything (spec §7). Reuses the imbalance mass calc.
+        public double BookSkewContext(PressureInputs inp)
+        {
+            long bidMass = Mass(inp.Bids), askMass = Mass(inp.Asks);
+            if (bidMass + askMass <= 0) return 0;
+            double raw = (double)(bidMass - askMass) / (bidMass + askMass) * _cfg.ImbalanceGain;
+            return raw < -1 ? -1 : (raw > 1 ? 1 : raw);
+        }
     }
 }
