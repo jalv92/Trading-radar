@@ -6,8 +6,10 @@ using TradingRadar.Engine;
 
 namespace TradingRadar.NT
 {
-    // Render-only Cockpit: directional pressure gauge + 5-signal conditions panel (Aurora).
-    // Reads a PressureResult (+ PressureInputs for reason text). No trading logic.
+    // Render-only Cockpit: the Consumption-Break Controller state + tape-speed reads (Aurora).
+    // Reads a ControllerOutput + tape/context scalars off the Frame. No trading logic.
+    // Supersedes the old flipping 5-condition PressureModel panel (spec 2026-07-01 §7): BookSkewContext
+    // survives only as the demoted, vote-less "book-skew" strip at the bottom (item 6).
     public class CockpitVisual : FrameworkElement
     {
         static readonly Brush PanelBg = B(Color.FromRgb(0x0d, 0x12, 0x1c));
@@ -15,25 +17,43 @@ namespace TradingRadar.NT
         static readonly Pen   CardLn  = P(Color.FromArgb(18, 0xff, 0xff, 0xff), 1);
         static readonly Brush Muted   = B(Color.FromRgb(0x8a, 0x93, 0xa3));
         static readonly Brush Muted2  = B(Color.FromRgb(0x6b, 0x72, 0x80));
-        static readonly Brush Txt     = B(Color.FromRgb(0xdd, 0xe3, 0xec));
         static readonly Color Bid     = Color.FromRgb(0x34, 0xd3, 0x99);
         static readonly Color Ask     = Color.FromRgb(0xfb, 0x71, 0x85);
         static readonly Brush BidTxt  = B(Color.FromRgb(0x6e, 0xe7, 0xb7));
         static readonly Brush AskTxt  = B(Color.FromRgb(0xfd, 0xa4, 0xaf));
-        static readonly Brush Slate   = B(Color.FromRgb(0x94, 0xa3, 0xb8));
+        static readonly Color SlateC  = Color.FromRgb(0x94, 0xa3, 0xb8);
+        static readonly Brush Slate   = B(SlateC);
+        static readonly Color AmberC  = Color.FromRgb(0xff, 0xce, 0x5c);   // same hex as RadarVisual's amber (inside-market accent)
+        static readonly Brush AmberTxt= B(Color.FromRgb(0xff, 0xe0, 0x8a));
         static readonly Brush Track   = B(Color.FromArgb(16, 0xff, 0xff, 0xff));
-        static readonly Brush White   = B(Colors.White);
         static readonly Brush Divider = B(Color.FromArgb(60, 0xff, 0xff, 0xff));
         static readonly Typeface Sans = new Typeface("Segoe UI");
+        // Mono tabular numbers (Aurora identity) — same Consolas construction as RadarVisual's price/volume column.
+        static readonly Typeface Mono = new Typeface(new FontFamily("Consolas"),
+                                             FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
 
-        private PressureResult _res;
-        private PressureInputs _in;
+        // Mirrors the live Controller's FireFrac default — RadarTab owns the real ControllerConfig
+        // instance fed into ControllerStateMachine; this reads the same class's default rather than
+        // hardcoding "0.7" here, so the countdown's fire-threshold marker can't silently drift from it.
+        private static readonly double FireFracDefault = new ControllerConfig().FireFrac;
+        // ponytail: fixed display-scale cap for the signed velocity bar (not an engine threshold, purely
+        // how much of the bar 1 contract/sec occupies) — deterministic per frame, no rolling state.
+        // Retune once Rec shows typical buy/sell-per-sec magnitudes.
+        private const double VelMaxPerSec = 40.0;
+        private const double ZGaugeMax = 3.0;   // tape z-score gauge range per spec §6 ("~0..3+, clamp display")
+        private const double Gap = 10;
+
+        private ControllerOutput _ctrl;
+        private double _buyPerSec, _sellPerSec, _tapeZ, _bookSkew;
         private bool _has;
 
         public CockpitVisual() { ClipToBounds = true; }
 
-        public void SetFrame(PressureInputs inp, PressureResult res)
-        { _in = inp; _res = res; _has = true; InvalidateVisual(); }
+        public void SetFrame(ControllerOutput ctrl, double buyPerSec, double sellPerSec, double tapeZ, double bookSkew)
+        {
+            _ctrl = ctrl; _buyPerSec = buyPerSec; _sellPerSec = sellPerSec; _tapeZ = tapeZ; _bookSkew = bookSkew;
+            _has = true; InvalidateVisual();
+        }
 
         protected override void OnRender(DrawingContext dc)
         {
@@ -41,124 +61,195 @@ namespace TradingRadar.NT
             if (w <= 0 || h <= 0) return;
             double dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
             dc.DrawRectangle(PanelBg, null, new Rect(0, 0, w, h));
-            if (!_has || _res.Signals == null) return;
+            if (!_has) return;
 
             double pad = 14, x = pad, y = pad, cw = w - 2 * pad;
-            double net = _res.Net;
-            int pct = (int)Math.Round(net * 100);
-            bool lng = net >= 0;
-            Color fill = lng ? Bid : Ask;
-            Brush netBr = Math.Abs(net) < 0.08 ? Slate : (lng ? BidTxt : AskTxt);
+            y = DrawBannerCard(dc, x, y, cw, h, pad, dpi);
+            y = DrawCountdownCard(dc, x, y, cw, h, pad, dpi);
+            y = DrawVelocityCard(dc, x, y, cw, h, pad, dpi);
+            y = DrawTapeZCard(dc, x, y, cw, h, pad, dpi);
+            y = DrawChopCard(dc, x, y, cw, h, pad, dpi);
+            DrawBookSkewStrip(dc, x, y, cw, h, pad, dpi);
+        }
 
-            // ---------- gauge card ----------
-            double gh = 100;
-            dc.DrawRoundedRectangle(CardBg, CardLn, new Rect(x, y, cw, gh), 8, 8);
-            Left(dc, "PRESIÓN DIRECCIONAL", x + 12, y + 16, 11, Muted, dpi);
-            Right(dc, (pct > 0 ? "+" : "") + pct + "%", x + cw - 12, y + 12, 22, netBr, dpi);
+        // ---- 1. Controller state banner ----
+        private enum BannerKind { SetupLong, SetupShort, Countdown, Armed, Chop, Waiting }
+        private struct BannerState { public BannerKind Kind; public string Text; public Color Color; public double Glow; }
 
-            double bx = x + 12, by = y + 46, bw = cw - 24, bh = 16;
-            dc.DrawRoundedRectangle(Track, CardLn, new Rect(bx, by, bw, bh), 8, 8);
-            double half = Math.Abs(net) * (bw / 2.0);
-            Brush fb = new SolidColorBrush(Color.FromArgb(150, fill.R, fill.G, fill.B));
-            double fx = lng ? bx + bw / 2.0 : bx + bw / 2.0 - half;
-            if (half > 0.5) dc.DrawRoundedRectangle(fb, null, new Rect(fx, by, half, bh), 6, 6);
-            dc.DrawRectangle(Divider, null, new Rect(bx + bw / 2.0 - 0.5, by - 3, 1, bh + 6));
-            double nx = bx + bw / 2.0 + net * (bw / 2.0);
-            dc.DrawRoundedRectangle(White, null, new Rect(nx - 1.5, by - 4, 3, bh + 8), 2, 2);
-            Left(dc, "◀ SHORT", bx, by + bh + 4, 9, Muted2, dpi);
-            Right(dc, "LONG ▶", bx + bw, by + bh + 4, 9, Muted2, dpi);
-
-            double dy = y + gh - 24;
-            for (int i = 0; i < 5; i++)
+        // Precedence (documented once, here):
+        //  1. A latched Fired side always wins the banner ("SETUP LONG"/"SETUP SHORT", full glow). The
+        //     side comes from Ctrl.Fire.Side — ControllerStateMachine.Update() already recency-tiebreaks
+        //     Fire when BOTH sides are latched Fired simultaneously, so trusting it here can never show
+        //     the stale side.
+        //  2. Otherwise, whichever side is developing (Armed/Countdown) drives the banner, side-colored
+        //     at reduced glow. Countdown outranks Armed; a same-rank tie breaks toward the side that has
+        //     eaten more of its wall (higher Fraction). Cooldown reads as idle here (a timed veto, not a
+        //     live setup) — same as Waiting — so a vetoed candidate never flashes a stale "SETUP" label.
+        //  3. If neither side is developing and the tape reads CHOP, show "CHOP" — a display-only
+        //     awareness light (Javier's 2026-07-01 decision: it does not itself gate the fire path;
+        //     ZFloor already does that in the engine).
+        //  4. Otherwise "WAITING".
+        private static BannerState ComputeBanner(ControllerOutput c)
+        {
+            if (c.Long == SideState.Fired || c.Short == SideState.Fired)
             {
-                Brush b = i < _res.Conviction ? new SolidColorBrush(fill) : B(Color.FromArgb(30, 0xff, 0xff, 0xff));
-                dc.DrawEllipse(b, null, new Point(x + 18 + i * 14, dy + 6), 4.5, 4.5);
+                bool isLong = c.Fire.Side == Side.Ask;
+                return new BannerState {
+                    Kind = isLong ? BannerKind.SetupLong : BannerKind.SetupShort,
+                    Text = isLong ? "SETUP LONG" : "SETUP SHORT",
+                    Color = isLong ? Bid : Ask, Glow = 1.0 };
             }
-            string pill = _res.Green ? (lng ? "▶ SEMÁFORO LONG" : "◀ SEMÁFORO SHORT") : "SIN TRIGGER";
-            Brush pillTx = _res.Green ? (lng ? BidTxt : AskTxt) : Slate;
-            Brush pillBg = _res.Green ? new SolidColorBrush(Color.FromArgb(40, fill.R, fill.G, fill.B))
-                                      : B(Color.FromArgb(36, 0x94, 0xa3, 0xb8));
-            var pf = FT(pill, 11, pillTx, dpi);
-            double pw = pf.Width + 18, ph = pf.Height + 8, px = x + 100;
-            dc.DrawRoundedRectangle(pillBg, null, new Rect(px, dy, pw, ph), 6, 6);
-            dc.DrawText(pf, new Point(px + 9, dy + (ph - pf.Height) / 2));
+            int longRank = Rank(c.Long), shortRank = Rank(c.Short);
+            if (longRank > 0 || shortRank > 0)
+            {
+                bool pickLong = longRank != shortRank ? longRank > shortRank : c.LongFraction >= c.ShortFraction;
+                SideState st = pickLong ? c.Long : c.Short;
+                return new BannerState {
+                    Kind = st == SideState.Countdown ? BannerKind.Countdown : BannerKind.Armed,
+                    Text = st == SideState.Countdown ? "COUNTDOWN" : "ARMED",
+                    Color = pickLong ? Bid : Ask, Glow = 0.45 };
+            }
+            if (c.Chop) return new BannerState { Kind = BannerKind.Chop, Text = "CHOP", Color = SlateC, Glow = 0.35 };
+            return new BannerState { Kind = BannerKind.Waiting, Text = "WAITING", Color = SlateC, Glow = 0.15 };
+        }
 
-            // ---------- conditions card ----------
-            y += gh + 12;
-            double ch = h - y - pad;
-            if (ch < 40) return;
+        private static int Rank(SideState s)
+        {
+            switch (s) { case SideState.Countdown: return 2; case SideState.Armed: return 1; default: return 0; }
+        }
+
+        private double DrawBannerCard(DrawingContext dc, double x, double y, double cw, double h, double pad, double dpi)
+        {
+            double bh = 72;
+            if (y + bh > h - pad) return y;
+            BannerState bs = ComputeBanner(_ctrl);
+            Brush cardBg = new SolidColorBrush(Color.FromArgb((byte)(22 + 70 * bs.Glow), bs.Color.R, bs.Color.G, bs.Color.B));
+            dc.DrawRoundedRectangle(cardBg, CardLn, new Rect(x, y, cw, bh), 8, 8);
+            Left(dc, "CONTROLLER", x + 12, y + 10, 11, Muted, dpi);
+            Brush txtBr = new SolidColorBrush(Color.FromArgb((byte)(150 + 105 * bs.Glow), bs.Color.R, bs.Color.G, bs.Color.B));
+            dc.DrawText(FT(bs.Text, 26, txtBr, dpi), new Point(x + 14, y + 28));
+            string sub;
+            switch (bs.Kind)
+            {
+                case BannerKind.SetupLong:
+                case BannerKind.SetupShort: sub = "● LATCHED · reset al cruzar / fallar el break"; break;
+                case BannerKind.Countdown:  sub = "muro comiéndose con trades"; break;
+                case BannerKind.Armed:      sub = "muro intacto — esperando erosión"; break;
+                case BannerKind.Chop:       sub = "tape lento y alternando"; break;
+                default:                    sub = "sin muro dominante armado"; break;
+            }
+            Left(dc, sub, x + 14, y + 56, 10, Muted2, dpi);
+            return y + bh + Gap;
+        }
+
+        // ---- 2. Consumption countdown ----
+        private double DrawCountdownCard(DrawingContext dc, double x, double y, double cw, double h, double pad, double dpi)
+        {
+            double ch = 62;
+            if (y + ch > h - pad) return y;
             dc.DrawRoundedRectangle(CardBg, CardLn, new Rect(x, y, cw, ch), 8, 8);
-            Left(dc, "CONDICIONES · EN VIVO", x + 12, y + 15, 11, Muted, dpi);
-
-            var S = _res.Signals;
-            double ry = y + 32, rh = 34;
-            for (int i = 0; i < S.Length; i++)
-            {
-                if (ry + rh > y + ch) break;
-                SignalRead s = S[i];
-                int sign = s.Idle() ? 0 : (s.Lean > 0.12 ? 1 : (s.Lean < -0.12 ? -1 : 0));
-                bool fire = s.Active && Math.Abs(s.Lean) > 0.3;
-                Brush chipTx = sign > 0 ? BidTxt : (sign < 0 ? AskTxt : Slate);
-                Brush chipBg = sign > 0 ? B(Color.FromArgb(36, 0x34, 0xd3, 0x99))
-                              : sign < 0 ? B(Color.FromArgb(36, 0xfb, 0x71, 0x85))
-                                         : B(Color.FromArgb(28, 0x94, 0xa3, 0xb8));
-                string lean = sign > 0 ? "LONG" : (sign < 0 ? "SHORT" : "—");
-                var cf = FT(lean, 9, chipTx, dpi);
-                dc.DrawRoundedRectangle(chipBg, null, new Rect(x + 12, ry + 3, 44, 16), 4, 4);
-                dc.DrawText(cf, new Point(x + 12 + (44 - cf.Width) / 2, ry + 3 + (16 - cf.Height) / 2));
-
-                Left(dc, SignalName(s.Id), x + 64, ry + 7, 12.5, Txt, dpi);
-                Left(dc, Reason(s.Id, _in), x + 64, ry + 21, 10.5, Muted2, dpi);
-
-                double wbx = x + cw - 92, wbw = 60;
-                dc.DrawRoundedRectangle(Track, null, new Rect(wbx, ry + 11, wbw, 5), 3, 3);
-                double frac = s.Idle() ? 0.15 : Math.Min(1.0, Math.Abs(s.Lean));
-                Brush wb = sign > 0 ? new SolidColorBrush(Bid) : (sign < 0 ? new SolidColorBrush(Ask) : Slate);
-                dc.DrawRoundedRectangle(wb, null, new Rect(wbx, ry + 11, Math.Max(2.0, wbw * frac), 5), 3, 3);
-
-                Left(dc, fire ? "✓" : "·", x + cw - 20, ry + 7, 13, fire ? Txt : Muted2, dpi);
-                ry += rh;
-            }
+            Left(dc, "CONSUMO DEL MURO", x + 12, y + 10, 11, Muted, dpi);
+            bool longLeads = _ctrl.LongFraction >= _ctrl.ShortFraction;
+            double frac = Clamp01(longLeads ? _ctrl.LongFraction : _ctrl.ShortFraction);
+            Color fillColor = frac > 0.001 ? (longLeads ? Bid : Ask) : SlateC;
+            int pct = (int)Math.Round(frac * 100);
+            RightM(dc, pct + "% comido", x + cw - 12, y + 6, 16, frac > 0.001 ? new SolidColorBrush(fillColor) : Slate, dpi);
+            double bx = x + 12, by = y + 34, bw = cw - 24, bh2 = 14;
+            dc.DrawRoundedRectangle(Track, CardLn, new Rect(bx, by, bw, bh2), 7, 7);
+            double fillW = bw * frac;
+            if (fillW > 1) dc.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(170, fillColor.R, fillColor.G, fillColor.B)), null, new Rect(bx, by, fillW, bh2), 6, 6);
+            // Fire-threshold marker — mirrors ControllerConfig.FireFrac (see FireFracDefault), never a bare literal.
+            double markX = bx + bw * Clamp01(FireFracDefault);
+            dc.DrawRectangle(Divider, null, new Rect(markX - 0.5, by - 2, 1, bh2 + 4));
+            return y + ch + Gap;
         }
 
-        // ---- signal display metadata ----
-        private static string SignalName(SignalId id)
+        // ---- 3. Signed velocity bar ----
+        private double DrawVelocityCard(DrawingContext dc, double x, double y, double cw, double h, double pad, double dpi)
         {
-            switch (id)
-            {
-                case SignalId.Imbalance:  return "Imbalance de reposo";
-                case SignalId.InsideThin: return "Inside fino";
-                case SignalId.AirPocket:  return "Air-pocket";
-                case SignalId.Delta:      return "Delta de agresor (15s)";
-                default:                  return "Erosión del muro";
-            }
+            double ch = 76;
+            if (y + ch > h - pad) return y;
+            dc.DrawRoundedRectangle(CardBg, CardLn, new Rect(x, y, cw, ch), 8, 8);
+            Left(dc, "VELOCIDAD DEL TAPE", x + 12, y + 10, 11, Muted, dpi);
+            double buy = Math.Max(0, _buyPerSec), sell = Math.Max(0, _sellPerSec);
+            LeftM(dc, "-" + sell.ToString("0", CultureInfo.InvariantCulture) + "/s", x + 12, y + 24, 13, AskTxt, dpi);
+            RightM(dc, "+" + buy.ToString("0", CultureInfo.InvariantCulture) + "/s", x + cw - 12, y + 24, 13, BidTxt, dpi);
+            double bx = x + 12, by = y + 46, bw = cw - 24, bh2 = 14, cx = bx + bw / 2.0, half = bw / 2.0;
+            dc.DrawRoundedRectangle(Track, CardLn, new Rect(bx, by, bw, bh2), 7, 7);
+            double buyW = half * Clamp01(buy / VelMaxPerSec);
+            double sellW = half * Clamp01(sell / VelMaxPerSec);
+            if (buyW > 1) dc.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(170, Bid.R, Bid.G, Bid.B)), null, new Rect(cx, by, buyW, bh2), 6, 6);
+            if (sellW > 1) dc.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(170, Ask.R, Ask.G, Ask.B)), null, new Rect(cx - sellW, by, sellW, bh2), 6, 6);
+            dc.DrawRectangle(Divider, null, new Rect(cx - 0.5, by - 2, 1, bh2 + 4));
+            return y + ch + Gap;
         }
-        private static string Reason(SignalId id, PressureInputs inp)
+
+        // ---- 4. Tape-speed z-score gauge ----
+        private double DrawTapeZCard(DrawingContext dc, double x, double y, double cw, double h, double pad, double dpi)
         {
-            long b = 0, a = 0;
-            if (inp.Bids != null) for (int i = 0; i < inp.Bids.Count; i++) b += inp.Bids[i].Volume;
-            if (inp.Asks != null) for (int i = 0; i < inp.Asks.Count; i++) a += inp.Asks[i].Volume;
-            switch (id)
-            {
-                case SignalId.Imbalance:  return b + "/" + a + (a > b ? "  oferta arriba" : "  demanda abajo");
-                case SignalId.InsideThin: return "bid " + inp.BestBidSize + " vs ask " + inp.BestAskSize;
-                case SignalId.AirPocket:  return "huecos cerca del precio";
-                case SignalId.Delta:      return Math.Abs(inp.AggressorDelta) < 4 ? "plano, nadie golpea"
-                                              : (inp.AggressorDelta > 0 ? ("+" + inp.AggressorDelta + " compra")
-                                                                        : (inp.AggressorDelta + " venta"));
-                default:                  return inp.Wall.Active
-                                              ? ((int)Math.Round(inp.Wall.Frac * 100) + "% sin trades → " + (inp.Wall.Above ? "techo" : "soporte") + " falso")
-                                              : "sin erosión activa";
-            }
+            double ch = 52;
+            if (y + ch > h - pad) return y;
+            dc.DrawRoundedRectangle(CardBg, CardLn, new Rect(x, y, cw, ch), 8, 8);
+            Left(dc, "TAPE Z-SCORE", x + 12, y + 10, 11, Muted, dpi);
+            double z = _tapeZ;
+            RightM(dc, "z " + z.ToString("0.0", CultureInfo.InvariantCulture), x + cw - 12, y + 6, 15, AmberTxt, dpi);
+            double bx = x + 12, by = y + 32, bw = cw - 24, bh2 = 10;
+            dc.DrawRoundedRectangle(Track, CardLn, new Rect(bx, by, bw, bh2), 5, 5);
+            double frac = Clamp01(Clamp(z, 0, ZGaugeMax) / ZGaugeMax);
+            if (frac > 0.02) dc.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb((byte)(90 + 110 * frac), AmberC.R, AmberC.G, AmberC.B)), null, new Rect(bx, by, bw * frac, bh2), 5, 5);
+            return y + ch + Gap;
         }
+
+        // ---- 5. CHOP light (display-only awareness, per Javier's 2026-07-01 decision) ----
+        private double DrawChopCard(DrawingContext dc, double x, double y, double cw, double h, double pad, double dpi)
+        {
+            double ch = 32;
+            if (y + ch > h - pad) return y;
+            dc.DrawRoundedRectangle(CardBg, CardLn, new Rect(x, y, cw, ch), 8, 8);
+            bool lit = _ctrl.Chop;
+            dc.DrawEllipse(lit ? new SolidColorBrush(AmberC) : B(Color.FromArgb(40, 0x94, 0xa3, 0xb8)), null, new Point(x + 22, y + ch / 2), 6, 6);
+            Left(dc, lit ? "CHOP · tape lento y alternando" : "CHOP", x + 38, y + (ch - 14) / 2, 12, lit ? AmberTxt : Muted2, dpi);
+            Right(dc, "display-only", x + cw - 12, y + (ch - 11) / 2, 9.5, Muted2, dpi);
+            return y + ch + Gap;
+        }
+
+        // ---- 6. Book-skew context strip — thin, low-contrast, reference only. Never fires anything. ----
+        private void DrawBookSkewStrip(DrawingContext dc, double x, double y, double cw, double h, double pad, double dpi)
+        {
+            double sh = 24;
+            if (y + sh > h - pad) return;
+            Left(dc, "SESGO DE LIBRO · contexto, no dispara", x, y, 9.5, Muted2, dpi);
+            double by = y + 13, bw = cw, bh2 = 5, half = bw / 2.0;
+            dc.DrawRoundedRectangle(Track, null, new Rect(x, by, bw, bh2), 3, 3);
+            double v = Clamp(_bookSkew, -1, 1);
+            Color tint = v >= 0 ? Bid : Ask;
+            double segW = Math.Abs(v) * half;
+            if (segW > 1)
+            {
+                double segX = v >= 0 ? x + half : x + half - segW;
+                dc.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(55, tint.R, tint.G, tint.B)), null, new Rect(segX, by, segW, bh2), 3, 3);
+            }
+            dc.DrawRectangle(Divider, null, new Rect(x + half - 0.5, by - 2, 1, bh2 + 4));
+        }
+
+        // ---- numeric helpers ----
+        private static double Clamp(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
+        private static double Clamp01(double v) { return Clamp(v, 0, 1); }
 
         // ---- text + brush helpers ----
         private FormattedText FT(string s, double size, Brush b, double dpi)
         { return new FormattedText(s, CultureInfo.InvariantCulture, FlowDirection.LeftToRight, Sans, size, b, dpi); }
+        // Mono tabular numbers (Aurora identity) — used for the numeric readouts only; labels stay Sans.
+        private FormattedText FTM(string s, double size, Brush b, double dpi)
+        { return new FormattedText(s, CultureInfo.InvariantCulture, FlowDirection.LeftToRight, Mono, size, b, dpi); }
         private void Left(DrawingContext dc, string s, double x, double yTop, double size, Brush b, double dpi)
         { dc.DrawText(FT(s, size, b, dpi), new Point(x, yTop)); }
         private void Right(DrawingContext dc, string s, double xRight, double yTop, double size, Brush b, double dpi)
         { var ft = FT(s, size, b, dpi); dc.DrawText(ft, new Point(xRight - ft.Width, yTop)); }
+        private void LeftM(DrawingContext dc, string s, double x, double yTop, double size, Brush b, double dpi)
+        { dc.DrawText(FTM(s, size, b, dpi), new Point(x, yTop)); }
+        private void RightM(DrawingContext dc, string s, double xRight, double yTop, double size, Brush b, double dpi)
+        { var ft = FTM(s, size, b, dpi); dc.DrawText(ft, new Point(xRight - ft.Width, yTop)); }
         private static Brush B(Color c) { var br = new SolidColorBrush(c); br.Freeze(); return br; }
         private static Pen P(Color c, double t) { var p = new Pen(B(c), t); p.Freeze(); return p; }
     }

@@ -35,6 +35,9 @@ namespace TradingRadar.NT
             public double BuyPerSec;
             public double SellPerSec;
             public double TapeZ;
+            // Task 11: vote-less book-skew context (PressureModel.BookSkewContext) — the demoted
+            // successor of the old Net% meter, rendered as a thin reference strip, never a trigger.
+            public double BookSkew;
         }
 
         private readonly RadarConfig _cfg = new RadarConfig();   // NQ defaults; later: per-instrument presets
@@ -208,7 +211,7 @@ namespace TradingRadar.NT
                 if (f != null)
                 {
                     _visual.SetFrame(f.Nodes, f.Bids, f.Asks, f.Mid, f.Tick);
-                    _cockpit.SetFrame(f.PInputs, f.PResult);
+                    _cockpit.SetFrame(f.Ctrl, f.BuyPerSec, f.SellPerSec, f.TapeZ, f.BookSkew);
                     // reuse the already-marshaled book mid + biggest-wall prices for live PnL + LMT anchoring
                     _chartTrader.SetContext(f.Mid, f.WallAbove, f.WallBelow, f.Tick);
                     // ControllerOutput.Fired is one-shot by engine contract (see ControllerStateMachine),
@@ -496,6 +499,9 @@ namespace TradingRadar.NT
             };
             ControllerOutput cout = _controller.Update(cin);
             _lastCtrl = cout;   // read by the identity-contract lookup above on the NEXT engine run
+            // Task 11: vote-less book-skew context for the Cockpit's demoted reference strip (spec §7) —
+            // reuses the same pin already assembled for Evaluate above; never a vote, never a trigger.
+            double bookSkew = _pressure.BookSkewContext(pin);
 
             _latest = new Frame
             {
@@ -509,7 +515,8 @@ namespace TradingRadar.NT
                 PInputs = pin,
                 PResult = _pressure.Evaluate(pin),
                 Ctrl = cout, Fired = cout.Fired, Fire = cout.Fire,
-                BuyPerSec = win1s.BuyVol, SellPerSec = win1s.SellVol, TapeZ = _tape.ZScore
+                BuyPerSec = win1s.BuyVol, SellPerSec = win1s.SellVol, TapeZ = _tape.ZScore,
+                BookSkew = bookSkew
             };
             MaybeDiag(now);
             if (_capture && _capWriter != null)
