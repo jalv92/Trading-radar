@@ -55,6 +55,9 @@ namespace TradingRadar.Engine
             public int HoldCount;
             public DateTime CooldownUntil = DateTime.MinValue;
             public double Fraction;
+            // ponytail: latches the firing FireEvent so it stays readable on o.Fire for as long as
+            // State == Fired (the per-call `fire` local in Update() resets to default every tick).
+            public FireEvent LastFire;
         }
 
         private readonly ControllerConfig _cfg;
@@ -76,7 +79,14 @@ namespace TradingRadar.Engine
             o.Chop = chop;
             o.Long = _long.State; o.LongFraction = _long.Fraction;
             o.Short = _short.State; o.ShortFraction = _short.Fraction;
-            o.Fired = fired; o.Fire = fire;
+            o.Fired = fired;
+            // ponytail: while a side is latched Fired, keep reporting its FireEvent (not just on the
+            // exact firing tick) — `fire` above is a fresh per-call local and would otherwise go back
+            // to default() the moment HoldCount stops advancing.
+            o.Fire = fired ? fire
+                : _long.State == SideState.Fired ? _long.LastFire
+                : _short.State == SideState.Fired ? _short.LastFire
+                : default(FireEvent);
             return o;
         }
 
@@ -107,8 +117,52 @@ namespace TradingRadar.Engine
                 case SideState.Cooldown:
                     if (inp.Now >= c.CooldownUntil) { c.State = SideState.Waiting; c.Fraction = 0; }
                     break;
+                case SideState.Countdown:
+                    return StepCountdown(c, Side.Ask, cur, inp, chop, ref fire);
+                case SideState.Fired:
+                    // Reset when the wall is gone or price has clearly crossed/held past it.
+                    if (cur <= 0 || inp.Mid > c.WallPrice + _cfg.AwayTicks * _tick)
+                    { c.State = SideState.Waiting; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.Fraction = 0; }
+                    break;
             }
             return false;
+        }
+
+        private bool StepCountdown(Candidate c, Side wallSide, long cur, ControllerInputs inp, bool chop, ref FireEvent fire)
+        {
+            if (cur <= 0) { c.State = SideState.Waiting; c.Fraction = 0; return false; }
+            if (cur > c.Peak) c.Peak = cur;
+            if (cur < c.Min) c.Min = cur;
+
+            // Reload veto: refilled well above the running min (someone defending).
+            if (cur - c.Min >= _cfg.ReloadFrac * c.Peak)
+            { c.State = SideState.Cooldown; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.HoldCount = 0; return false; }
+
+            // Price fell away from the wall (mid too far) => abandon.
+            if (Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick)
+            { c.State = SideState.Waiting; c.HoldCount = 0; c.Fraction = 0; return false; }
+
+            ConsumptionRead r = ConsumptionTracker.Read(wallSide, c.WallPrice, c.Peak, cur, c.ArmTime, inp.Book);
+            c.Fraction = r.Fraction;
+
+            bool deltaOk = wallSide == Side.Ask ? inp.AggressorDelta >= _cfg.DeltaFloor
+                                                : inp.AggressorDelta <= -_cfg.DeltaFloor;
+            bool pre = r.Fraction >= _cfg.FireFrac
+                       && r.TradeBackedFraction >= _cfg.MinTradeBackedRatio
+                       && deltaOk && inp.TapeZScore >= _cfg.ZFloor && !chop;
+
+            if (!pre) { c.HoldCount = 0; return false; }
+
+            c.HoldCount++;
+            if (c.HoldCount < _cfg.K) return false;
+
+            // FIRE — one-shot, latch.
+            c.State = SideState.Fired;
+            fire = new FireEvent {
+                Side = wallSide, WallPrice = c.WallPrice, EntryHint = c.WallPrice,
+                Fraction = r.Fraction, DeltaAtFire = inp.AggressorDelta, ZAtFire = inp.TapeZScore, Time = inp.Now };
+            c.LastFire = fire;
+            return true;
         }
 
         private void AdvanceArmedOrCountdown(Candidate c, Side wallSide, long cur, ControllerInputs inp)
@@ -146,6 +200,13 @@ namespace TradingRadar.Engine
                     break;
                 case SideState.Cooldown:
                     if (inp.Now >= c.CooldownUntil) { c.State = SideState.Waiting; c.Fraction = 0; }
+                    break;
+                case SideState.Countdown:
+                    return StepCountdown(c, Side.Bid, cur, inp, chop, ref fire);
+                case SideState.Fired:
+                    // Reset when the wall is gone or price has clearly crossed/held past it (flipped direction).
+                    if (cur <= 0 || inp.Mid < c.WallPrice - _cfg.AwayTicks * _tick)
+                    { c.State = SideState.Waiting; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.Fraction = 0; }
                     break;
             }
             return false;

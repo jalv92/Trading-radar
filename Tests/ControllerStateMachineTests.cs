@@ -74,4 +74,40 @@ public class ControllerStateMachineTests
         var o = m.Update(In(100.25, 60, 0, 0, 0, 0, 0, 100.00, 2, EmptyBook()));   // size dropped, NO prints => pull
         Assert.Equal(SideState.Cooldown, o.Long);
     }
+
+    // Drives an ask wall from 120 down to ~30 (75% eaten) with buys, delta+ and z high, for K snapshots.
+    [Fact]
+    public void Fires_long_once_on_full_confluence_then_latches()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook())); // arm, peak 120
+        var b2 = BookWithBuys(100.25, 60, 2);
+        m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2));        // countdown
+        var b3 = BookWithBuys(100.25, 90, 3);                             // more buys at the wall (cumulative 90+)
+        ControllerOutput o = default(ControllerOutput);
+        int fires = 0;
+        for (int s = 3; s <= 8; s++)                                      // hold several snapshots (K=3)
+        {
+            var b = BookWithBuys(100.25, 90, s);
+            o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: 2.0, alt: 0, mid: 100.00, sec: s, book: b));
+            if (o.Fired) fires++;
+        }
+        Assert.Equal(1, fires);                       // one-shot
+        Assert.Equal(Side.Ask, o.Fire.Side);          // ask wall above => long break
+        Assert.Equal(SideState.Fired, o.Long);        // latched
+    }
+
+    // Opposing delta blocks the fire even at high consumption.
+    [Fact]
+    public void Does_not_fire_long_when_delta_opposes()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));
+        for (int s = 2; s <= 8; s++)
+        {
+            var b = BookWithBuys(100.25, 90, s);
+            var o = m.Update(In(100.25, 30, 0, 0, delta: -30, z: 2.0, alt: 0, mid: 100.00, sec: s, book: b)); // sellers pressing
+            Assert.False(o.Fired);
+        }
+    }
 }
