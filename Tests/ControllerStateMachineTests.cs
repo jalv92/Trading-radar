@@ -110,4 +110,40 @@ public class ControllerStateMachineTests
             Assert.False(o.Fired);
         }
     }
+
+    [Fact]
+    public void Chop_suppresses_fire_even_at_high_consumption()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));
+        for (int s = 2; s <= 8; s++)
+        {
+            var b = BookWithBuys(100.25, 90, s);
+            // z below ChopSlowZ and alternations above ChopAltCount => CHOP, must not fire despite 75% eaten + buys.
+            var o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: -0.5, alt: 4, mid: 100.00, sec: s, book: b));
+            Assert.True(o.Chop);
+            Assert.False(o.Fired);
+        }
+    }
+
+    // THE anti-flip gate: an input stream whose book skew flips every tick must produce NO fire and
+    // never leave a stable non-firing state. Walls are intact (no consumption), delta/skew oscillate.
+    [Fact]
+    public void Does_not_oscillate_or_fire_on_flipping_book_skew()
+    {
+        var m = Machine();
+        int fires = 0;
+        for (int s = 1; s <= 40; s++)
+        {
+            long delta = (s % 2 == 0) ? 50 : -50;      // skew flips every snapshot
+            double z = (s % 2 == 0) ? 2.0 : -0.5;      // and so does speed
+            int alt = (s % 3 == 0) ? 4 : 0;
+            // Walls present but INTACT (current == peak), so no consumption can arm the countdown.
+            var o = m.Update(In(100.25, 120, 99.75, 120, delta, z, alt, 100.00, s, EmptyBook()));
+            if (o.Fired) fires++;
+            Assert.NotEqual(SideState.Countdown, o.Long);   // intact wall never enters countdown
+            Assert.NotEqual(SideState.Countdown, o.Short);
+        }
+        Assert.Equal(0, fires);
+    }
 }
