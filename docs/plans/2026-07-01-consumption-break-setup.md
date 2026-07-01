@@ -183,21 +183,33 @@ public class TapeSpeedTests
     static DateTime T(int ms) => new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds(ms);
 
     [Fact]
-    public void ZScore_is_positive_when_rate_spikes_above_baseline()
+    public void ZScore_exceeds_gate_on_a_real_spike()
     {
         var ts = new TapeSpeed(0.1);
-        for (int i = 0; i < 60; i++) ts.Sample(10.0, T(i * 50)); // steady baseline ~10/s
-        ts.Sample(40.0, T(3100));                                // spike
+        for (int i = 0; i < 80; i++) ts.Sample(10.0 + (i % 2 == 0 ? 1.0 : -1.0), T(i * 50)); // baseline ~10 ±1
+        ts.Sample(60.0, T(4100));   // strong spike
         Assert.True(ts.Ready);
         Assert.True(ts.ZScore > 2.0);
     }
 
     [Fact]
-    public void ZScore_near_zero_on_steady_rate()
+    public void ZScore_stays_below_gate_on_an_in_baseline_sample()
     {
         var ts = new TapeSpeed(0.1);
-        for (int i = 0; i < 60; i++) ts.Sample(10.0, T(i * 50));
-        Assert.True(Math.Abs(ts.ZScore) < 0.5);
+        for (int i = 0; i < 80; i++) ts.Sample(10.0 + (i % 2 == 0 ? 1.0 : -1.0), T(i * 50));
+        ts.Sample(11.0, T(4100));   // within the noise band
+        Assert.True(ts.ZScore < 2.0);
+    }
+
+    // Regression guard: post-update scoring caps z at sqrt(0.9/0.1)=3.0 regardless of spike size.
+    // Pre-update scoring must scale — a ~10x-baseline spike reads well above that ceiling.
+    [Fact]
+    public void ZScore_does_not_saturate_and_scales_with_spike_size()
+    {
+        var ts = new TapeSpeed(0.1);
+        for (int i = 0; i < 80; i++) ts.Sample(10.0 + (i % 2 == 0 ? 1.0 : -1.0), T(i * 50));
+        ts.Sample(100.0, T(4100));  // ~10x baseline
+        Assert.True(ts.ZScore > 5.0);
     }
 }
 ```
@@ -223,7 +235,7 @@ namespace TradingRadar.Engine
         private double _var;
         private int _n;
 
-        public TapeSpeed(double alpha) { _alpha = alpha <= 0 || alpha > 1 ? 0.1 : alpha; }
+        public TapeSpeed(double alpha) { _alpha = alpha <= 0 || alpha >= 1 ? 0.1 : alpha; }
 
         public bool Ready { get { return _n >= MinSamples; } }
         public double ZScore { get; private set; }
@@ -231,13 +243,16 @@ namespace TradingRadar.Engine
         public void Sample(double rate, DateTime now)
         {
             if (_n == 0) { _mean = rate; _var = 0; _n = 1; ZScore = 0; return; }
+            // Score the new sample against the baseline BEFORE absorbing it. Scoring against
+            // post-update stats saturates z at sqrt((1-alpha)/alpha) for any large spike (a 2x
+            // and a 100x spike would read the same). Pre-update scoring keeps z unbounded.
+            double std = Math.Sqrt(_var);
+            ZScore = _n >= MinSamples && std > 1e-9 ? (rate - _mean) / std : 0.0;
             double prevMean = _mean;
             _mean = _alpha * rate + (1 - _alpha) * _mean;
             // EWMA variance (West/Welford-style incremental for exponential weighting).
             _var = (1 - _alpha) * (_var + _alpha * (rate - prevMean) * (rate - prevMean));
             _n++;
-            double std = Math.Sqrt(_var);
-            ZScore = _n >= MinSamples && std > 1e-9 ? (rate - _mean) / std : 0.0;
         }
     }
 }
