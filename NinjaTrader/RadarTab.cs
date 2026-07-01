@@ -25,8 +25,6 @@ namespace TradingRadar.NT
             public double Tick;
             public double WallAbove;   // price of the biggest wall above mid this run (0 = none found)
             public double WallBelow;   // price of the biggest wall below mid this run (0 = none found)
-            public PressureInputs PInputs;
-            public PressureResult PResult;
             // Task 10: Controller spine + tape-speed reads, rendered by CockpitVisual (Task 11) and
             // delivered to RadarChartTrader (Task 12).
             public ControllerOutput Ctrl;
@@ -500,7 +498,9 @@ namespace TradingRadar.NT
             ControllerOutput cout = _controller.Update(cin);
             _lastCtrl = cout;   // read by the identity-contract lookup above on the NEXT engine run
             // Task 11: vote-less book-skew context for the Cockpit's demoted reference strip (spec §7) —
-            // reuses the same pin already assembled for Evaluate above; never a vote, never a trigger.
+            // reuses the same pin assembled above; never a vote, never a trigger. `pin` itself is kept
+            // only for this — PressureModel.Evaluate(pin) is no longer called per-run (nothing reads the
+            // old PressureResult since the Cockpit rewrite; Evaluate stays in the engine for its own tests).
             double bookSkew = _pressure.BookSkewContext(pin);
 
             _latest = new Frame
@@ -512,8 +512,6 @@ namespace TradingRadar.NT
                 Tick  = _cfg.TickSize,
                 WallAbove = wallAbovePx,
                 WallBelow = wallBelowPx,
-                PInputs = pin,
-                PResult = _pressure.Evaluate(pin),
                 Ctrl = cout, Fired = cout.Fired, Fire = cout.Fire,
                 BuyPerSec = win1s.BuyVol, SellPerSec = win1s.SellVol, TapeZ = _tape.ZScore,
                 BookSkew = bookSkew

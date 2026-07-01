@@ -35,6 +35,8 @@ namespace TradingRadar.NT
         // Mirrors the live Controller's FireFrac default — RadarTab owns the real ControllerConfig
         // instance fed into ControllerStateMachine; this reads the same class's default rather than
         // hardcoding "0.7" here, so the countdown's fire-threshold marker can't silently drift from it.
+        // TODO: if RadarTab ever parameterizes ControllerConfig (e.g. a UI knob), pass the live value
+        // into SetFrame instead of mirroring the class default here.
         private static readonly double FireFracDefault = new ControllerConfig().FireFrac;
         // ponytail: fixed display-scale cap for the signed velocity bar (not an engine threshold, purely
         // how much of the bar 1 contract/sec occupies) — deterministic per frame, no rolling state.
@@ -76,6 +78,35 @@ namespace TradingRadar.NT
         private enum BannerKind { SetupLong, SetupShort, Countdown, Armed, Chop, Waiting }
         private struct BannerState { public BannerKind Kind; public string Text; public Color Color; public double Glow; }
 
+        // Which side (if any) is "live" this frame — shared by the banner (state label) AND the
+        // countdown card (which side's Fraction to paint), so they can never disagree: a side latched
+        // Fired always wins (Fraction = its frozen final value); else whichever side is Armed/Countdown
+        // (Countdown outranks Armed, ties break toward the higher Fraction). Cooldown/Waiting read as
+        // idle — a reload-vetoed side deliberately keeps its frozen Fraction in the engine (see
+        // ControllerStateMachine), and must never paint as live progress once it's no longer developing.
+        private struct ActiveSide { public bool Any; public bool IsLong; public double Fraction; }
+
+        private static ActiveSide ResolveActiveSide(ControllerOutput c)
+        {
+            if (c.Long == SideState.Fired || c.Short == SideState.Fired)
+            {
+                bool isLong = c.Fire.Side == Side.Ask;
+                return new ActiveSide { Any = true, IsLong = isLong, Fraction = isLong ? c.LongFraction : c.ShortFraction };
+            }
+            int longRank = Rank(c.Long), shortRank = Rank(c.Short);
+            if (longRank > 0 || shortRank > 0)
+            {
+                bool pickLong = longRank != shortRank ? longRank > shortRank : c.LongFraction >= c.ShortFraction;
+                return new ActiveSide { Any = true, IsLong = pickLong, Fraction = pickLong ? c.LongFraction : c.ShortFraction };
+            }
+            return new ActiveSide { Any = false };
+        }
+
+        private static int Rank(SideState s)
+        {
+            switch (s) { case SideState.Countdown: return 2; case SideState.Armed: return 1; default: return 0; }
+        }
+
         // Precedence (documented once, here):
         //  1. A latched Fired side always wins the banner ("SETUP LONG"/"SETUP SHORT", full glow). The
         //     side comes from Ctrl.Fire.Side — ControllerStateMachine.Update() already recency-tiebreaks
@@ -91,31 +122,21 @@ namespace TradingRadar.NT
         //  4. Otherwise "WAITING".
         private static BannerState ComputeBanner(ControllerOutput c)
         {
+            ActiveSide a = ResolveActiveSide(c);
+            if (!a.Any)
+            {
+                if (c.Chop) return new BannerState { Kind = BannerKind.Chop, Text = "CHOP", Color = SlateC, Glow = 0.35 };
+                return new BannerState { Kind = BannerKind.Waiting, Text = "WAITING", Color = SlateC, Glow = 0.15 };
+            }
+            Color col = a.IsLong ? Bid : Ask;
             if (c.Long == SideState.Fired || c.Short == SideState.Fired)
-            {
-                bool isLong = c.Fire.Side == Side.Ask;
                 return new BannerState {
-                    Kind = isLong ? BannerKind.SetupLong : BannerKind.SetupShort,
-                    Text = isLong ? "SETUP LONG" : "SETUP SHORT",
-                    Color = isLong ? Bid : Ask, Glow = 1.0 };
-            }
-            int longRank = Rank(c.Long), shortRank = Rank(c.Short);
-            if (longRank > 0 || shortRank > 0)
-            {
-                bool pickLong = longRank != shortRank ? longRank > shortRank : c.LongFraction >= c.ShortFraction;
-                SideState st = pickLong ? c.Long : c.Short;
-                return new BannerState {
-                    Kind = st == SideState.Countdown ? BannerKind.Countdown : BannerKind.Armed,
-                    Text = st == SideState.Countdown ? "COUNTDOWN" : "ARMED",
-                    Color = pickLong ? Bid : Ask, Glow = 0.45 };
-            }
-            if (c.Chop) return new BannerState { Kind = BannerKind.Chop, Text = "CHOP", Color = SlateC, Glow = 0.35 };
-            return new BannerState { Kind = BannerKind.Waiting, Text = "WAITING", Color = SlateC, Glow = 0.15 };
-        }
-
-        private static int Rank(SideState s)
-        {
-            switch (s) { case SideState.Countdown: return 2; case SideState.Armed: return 1; default: return 0; }
+                    Kind = a.IsLong ? BannerKind.SetupLong : BannerKind.SetupShort,
+                    Text = a.IsLong ? "SETUP LONG" : "SETUP SHORT", Color = col, Glow = 1.0 };
+            SideState st = a.IsLong ? c.Long : c.Short;
+            return new BannerState {
+                Kind = st == SideState.Countdown ? BannerKind.Countdown : BannerKind.Armed,
+                Text = st == SideState.Countdown ? "COUNTDOWN" : "ARMED", Color = col, Glow = 0.45 };
         }
 
         private double DrawBannerCard(DrawingContext dc, double x, double y, double cw, double h, double pad, double dpi)
@@ -149,11 +170,14 @@ namespace TradingRadar.NT
             if (y + ch > h - pad) return y;
             dc.DrawRoundedRectangle(CardBg, CardLn, new Rect(x, y, cw, ch), 8, 8);
             Left(dc, "CONSUMO DEL MURO", x + 12, y + 10, 11, Muted, dpi);
-            bool longLeads = _ctrl.LongFraction >= _ctrl.ShortFraction;
-            double frac = Clamp01(longLeads ? _ctrl.LongFraction : _ctrl.ShortFraction);
-            Color fillColor = frac > 0.001 ? (longLeads ? Bid : Ask) : SlateC;
+            // Same rank-based side resolution as the banner (ResolveActiveSide) — an idle side (Waiting
+            // or a reload-vetoed Cooldown, which deliberately keeps its frozen Fraction in the engine)
+            // paints as 0, never a stale bar the banner itself reads as inactive.
+            ActiveSide a = ResolveActiveSide(_ctrl);
+            double frac = a.Any ? Clamp01(a.Fraction) : 0.0;
+            Color fillColor = a.Any ? (a.IsLong ? Bid : Ask) : SlateC;
             int pct = (int)Math.Round(frac * 100);
-            RightM(dc, pct + "% comido", x + cw - 12, y + 6, 16, frac > 0.001 ? new SolidColorBrush(fillColor) : Slate, dpi);
+            RightM(dc, pct + "% comido", x + cw - 12, y + 6, 16, a.Any ? new SolidColorBrush(fillColor) : Slate, dpi);
             double bx = x + 12, by = y + 34, bw = cw - 24, bh2 = 14;
             dc.DrawRoundedRectangle(Track, CardLn, new Rect(bx, by, bw, bh2), 7, 7);
             double fillW = bw * frac;
