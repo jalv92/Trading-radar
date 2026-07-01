@@ -5,10 +5,14 @@
 - **Spec:** `docs/specs/2026-06-29-radar-cockpit-design.md` §8 (Chart Trader), §2 (execution-surface gate), §9 (over-trading risk).
 - **Commit:** `eb9ff03`. **Files:** `NinjaTrader/RadarChartTrader.cs` (new), `NinjaTrader/RadarTab.cs` (wired). nt8c staged build 15 files 0/0. AbsorptionScalper + Engine untouched.
 
-## What shipped (MKT-only v1)
-Order ticket docked under the Cockpit in RadarTab's right column:
-- **BUY / SELL MKT** (neon emerald/coral Aurora), **Rev / Close / Flat**, **qty** stepper, **account** selector (ComboBox on `Account.All`), live **position + PnL** ($ and ticks).
-- NT8 Account API: `CreateOrder(…, OrderType.Market, OrderEntry.Manual, TimeInForce.Day, …, Core.Globals.MaxDate, null)` → `Submit`; `Flatten(new[]{inst})`, `CancelAllOrders`; `Position.GetUnrealizedProfitLoss`. Order/Execution/Position updates instrument-filtered + marshaled to UI via `Dispatcher.InvokeAsync`; `Account.Positions`/`Account.All` reads `lock`-ed.
+## What shipped (v1 — MKT + wall-anchored LMT)
+Order ticket docked under the Cockpit in RadarTab's right column. **Layout (NT8-style, top→bottom):** BUY/SELL MKT → BUY/SELL LMT → move ▲/▼ → Rev/Close/Flat (3 equal cols) → account+qty (one row) → PnL bar.
+- **MKT:** `CreateOrder(…, OrderType.Market, OrderEntry.Manual, TimeInForce.Day, …, Core.Globals.MaxDate, null)` → `Submit`; `Flatten`, `CancelAllOrders`; `Position.GetUnrealizedProfitLoss`.
+- **Wall-anchored LMT** (`LimitAnchorPrice`): SELL LMT = biggest wall above mid + 1 tick; BUY LMT = biggest wall below mid − 1 tick (one-shot at submit, does NOT chase the wall). Fallback mid±1 tick when no wall on that side. Wall computed per engine run in `RadarTab.MaybeRunEngine`, pushed via `SetContext(mid, wallAbove, wallBelow, tick)`.
+- **Move ▲/▼:** `Order.LimitPriceChanged` + `Account.Change` (preserves queue priority, guarded by `Order.IsTerminalState`). Clamped non-marketable against `_lastPrice` mid.
+- **One working limit:** same-side re-click re-anchors via `Change`; opposite-side flip sequences cancel→submit on the `Cancelled` ack (`_pendingReplace`); Cancel-throw leaves state intact. `Cleanup`/instrument-switch/account-switch/`Close` cancel the resting limit first.
+- **Ladder marker:** `RadarChartTrader.TryGetActiveOrder` → `RadarTab` paint tick → `RadarVisual.SetActiveOrder` draws a dashed side-colored line + gutter/edge tag at the order price; moves with the order, clears on fill/cancel.
+- Order/Execution/Position updates instrument-filtered + marshaled to UI via `Dispatcher.InvokeAsync`; `Account.Positions`/`Account.All` reads `lock`-ed; `_activeLimit`/`_workingOrders` UI-thread confined.
 
 ## Safety gate (implemented)
 - **Default Sim/Playback.** Real broker/prop account is **BLOCKED** unless the per-account **ARM LIVE** checkbox is set; arming is tracked per account (`_armedFor`, reference-equal) and reset on every account switch.
@@ -28,7 +32,14 @@ Order ticket docked under the Cockpit in RadarTab's right column:
 9. **F9** — if the real target is a **prop firm**: daily-loss limit, max-trades/day, loss-streak cooldown (button lockout).
 10. **F10** — surface order rejections in the ticket UI, not only the Output tab.
 
-**Re-submit for VETO review once F1–F8 (plus F9 if prop) are implemented.** Until then: Sim/Playback testing only.
+### Added by the LMT / move re-review (2026-06-30) — real-account only
+- **F1/F2/F6 widened:** F1 (server stop at entry) now also covers a **filled resting limit** (fills while unattended — more acute). F2 (qty clamp) must also bound LMT qty + the `Reverse` ×2. F6 (Close cancels working orders) is now load-bearing — **DONE for this control's own limit** (Close/Flat/teardown/switch cancel `_activeLimit`); a broader "cancel all my working orders" still owed for real.
+- **F11 (BLOCKER) — DONE for this control:** orphaned working limit on teardown/context-switch — `Cleanup`/instrument-switch/account-switch now `Cancel` the resting limit. (A hard-warn/confirm on window-close still nice-to-have.)
+- **F12 (BLOCKER) — DONE:** cancel/replace sequenced (same-side `Change`, opposite-side cancel→submit on ack; no double-rest, no orphan on Cancel-throw).
+- **F13 — MAJOR (deferred):** no wall on the required side → LMT silently rests at mid±1 tick (near market). Before real: block or require explicit confirm (ties to F10). `ponytail:` note at `LimitAnchorPrice`.
+- **F14 — MAJOR (deferred):** LMT submit + move key off the possibly-stale `_lastPrice` mid. A frozen mid (feed stall) defeats the non-marketable clamp. Before real: gate on fresh-quote/`Connection.Status == Connected` and clamp/anchor against the real best bid/ask (needs L2 quotes piped into the ticket).
+
+**Real-money VETO stands; preconditions are now F1–F14** (F11/F12 done; F1/F2/F6 widened; F13/F14 + F1/F2/F9/F10 deferred). Re-submit for VETO review once F1–F8 and F13/F14 (plus F9 if prop) are implemented. Until then: **Sim/Playback testing only.**
 
 ## How to test (Sim/Playback)
 F5 compile in NT8 → **close & reopen** the Liquidity Radar window (open Add-Ons don't refresh on recompile). Select **Sim101** (or a Playback connection) → the ticket is live; BUY/SELL/Rev/Close/Flat operate on the Sim position with live PnL. Selecting a real account disables the buttons and shows ARM LIVE (leave it OFF).
