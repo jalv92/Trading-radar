@@ -23,6 +23,8 @@ namespace TradingRadar.NT
             public IReadOnlyList<DepthLevel> Asks;
             public double Mid;
             public double Tick;
+            public double WallAbove;   // price of the biggest wall above mid this run (0 = none found)
+            public double WallBelow;   // price of the biggest wall below mid this run (0 = none found)
             public PressureInputs PInputs;
             public PressureResult PResult;
         }
@@ -151,7 +153,7 @@ namespace TradingRadar.NT
             _chartTrader = new RadarChartTrader();
             Grid rightCol = new Grid();
             rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1.0, GridUnitType.Star) });
-            rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(200) });
+            rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(280) });
             Grid.SetRow(_cockpit, 0);     rightCol.Children.Add(_cockpit);
             Grid.SetRow(_chartTrader, 1); rightCol.Children.Add(_chartTrader);
 
@@ -175,8 +177,13 @@ namespace TradingRadar.NT
                 {
                     _visual.SetFrame(f.Nodes, f.Bids, f.Asks, f.Mid, f.Tick);
                     _cockpit.SetFrame(f.PInputs, f.PResult);
-                    _chartTrader.SetLastPrice(f.Mid);  // reuse the already-marshaled book mid for live PnL
+                    // reuse the already-marshaled book mid + biggest-wall prices for live PnL + LMT anchoring
+                    _chartTrader.SetContext(f.Mid, f.WallAbove, f.WallBelow, f.Tick);
                 }
+                // Push the Chart Trader's active working limit order onto the ladder as an overlay marker.
+                double ordPx; bool ordBuy; int ordQty;
+                bool hasOrd = _chartTrader.TryGetActiveOrder(out ordPx, out ordBuy, out ordQty);
+                _visual.SetActiveOrder(hasOrd, ordPx, ordBuy, ordQty);
                 _visual.AdvanceAnimation(); // sweep/fade clock
                 if (_minSizeBox != null)
                 {
@@ -340,13 +347,25 @@ namespace TradingRadar.NT
                 AggressorDelta = _book.AggressorDelta(now.AddSeconds(-15)),
                 Wall = pWall
             };
+            var snapNodes = _tracker.GetSnapshot(now);
+            // Biggest wall above/below mid this run — anchors the Chart Trader's BUY/SELL LMT (§2).
+            double wallAbovePx = 0, wallBelowPx = 0;
+            long   wallAboveSz = 0, wallBelowSz = 0;
+            for (int i = 0; i < snapNodes.Count; i++)
+            {
+                RadarNode wn = snapNodes[i];
+                if (wn.Price > pMid && wn.LastKnownSize > wallAboveSz) { wallAboveSz = wn.LastKnownSize; wallAbovePx = wn.Price; }
+                if (wn.Price < pMid && wn.LastKnownSize > wallBelowSz) { wallBelowSz = wn.LastKnownSize; wallBelowPx = wn.Price; }
+            }
             _latest = new Frame
             {
-                Nodes = _tracker.GetSnapshot(now),
+                Nodes = snapNodes,
                 Bids  = new List<DepthLevel>(pBids),
                 Asks  = new List<DepthLevel>(pAsks),
                 Mid   = pMid,
                 Tick  = _cfg.TickSize,
+                WallAbove = wallAbovePx,
+                WallBelow = wallBelowPx,
                 PInputs = pin,
                 PResult = _pressure.Evaluate(pin)
             };

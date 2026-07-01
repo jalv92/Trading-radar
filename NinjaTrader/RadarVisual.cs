@@ -23,6 +23,9 @@ namespace TradingRadar.NT
         static readonly Brush SlateBg  = FrozenBrush(Color.FromRgb(0x94, 0xa3, 0xb8));
         static readonly Pen   AmberLine= FrozenPen(Color.FromArgb(128, 0xff, 0xce, 0x5c), 1);
         static readonly Pen   PullDash = FrozenDash(Color.FromRgb(0x94, 0xa3, 0xb8), 1);
+        // Chart Trader active-order marker — dashed, side-colored (distinct from the solid amber mid line).
+        static readonly Pen   OrderLineBuy  = FrozenDash(Color.FromRgb(0x34, 0xd3, 0x99), 1.6);
+        static readonly Pen   OrderLineSell = FrozenDash(Color.FromRgb(0xfb, 0x71, 0x85), 1.6);
         static readonly Brush BidBook      = FrozenBrush(Color.FromArgb(115, 0x34, 0xd3, 0x99));  // ~.45
         static readonly Brush AskBook      = FrozenBrush(Color.FromArgb(115, 0xfb, 0x71, 0x85));  // ~.45
         static readonly Brush MidChipBg    = FrozenBrush(Color.FromArgb(230, 0x14, 0x18, 0x22));
@@ -50,6 +53,11 @@ namespace TradingRadar.NT
         private IReadOnlyList<DepthLevel> _asks;
         private double _mid;
         private double _tick           = 0.25;
+        // Chart Trader active working limit order — overlay only, pushed each paint tick by RadarTab.
+        private bool   _ordHas;
+        private double _ordPrice;
+        private bool   _ordIsBuy;
+        private int    _ordQty;
         private double _anchorTop      = double.NaN;   // price of the top visible row; persists across frames
         private const int    DESIRED_ROWS = 27;        // price levels the ladder targets (mid ± ~13 ticks → covers the book)
         private const double MIN_ROW_PX   = 16.0;      // ponytail: row-height clamp; widen the band if bars look too thin/fat
@@ -75,6 +83,16 @@ namespace TradingRadar.NT
         }
 
         public void AdvanceAnimation() { }
+
+        // Pushed each paint tick by RadarTab from the Chart Trader's active working limit order (if any).
+        // SetFrame already repaints every tick regardless, so skip the redundant InvalidateVisual when
+        // nothing about the order actually changed since the last call.
+        public void SetActiveOrder(bool has, double price, bool isBuy, int qty)
+        {
+            if (has == _ordHas && price == _ordPrice && isBuy == _ordIsBuy && qty == _ordQty) return;
+            _ordHas = has; _ordPrice = price; _ordIsBuy = isBuy; _ordQty = qty;
+            InvalidateVisual();
+        }
 
         protected override void OnRender(DrawingContext dc)
         {
@@ -254,6 +272,33 @@ namespace TradingRadar.NT
             double chipY = midY - chipH / 2.0;
             dc.DrawRoundedRectangle(MidChipBg, MidChipBorder, new Rect(2, chipY, chipW, chipH), 3, 3);
             dc.DrawText(midFt, new Point(7, midY - midFt.Height / 2.0));
+
+            // Chart Trader active working limit order — dashed side-colored line + left-gutter tag;
+            // an edge indicator (like the ↑/↓ node stacks below) if the order's price is off-screen.
+            if (_ordHas)
+            {
+                Pen ordPen = _ordIsBuy ? OrderLineBuy : OrderLineSell;
+                Brush ordTxt = _ordIsBuy ? BidText : AskText;
+                string tag = (_ordIsBuy ? "▶ BUY " : "◀ SELL ") + _ordQty;
+                double ordY = Y(_ordPrice);
+                if (ordY >= halfRow && ordY <= h - halfRow)
+                {
+                    dc.DrawLine(ordPen, new Point(0, ordY), new Point(w, ordY));
+                    var ordFt = new FormattedText(tag, CultureInfo.InvariantCulture,
+                        FlowDirection.LeftToRight, Sans, 11, ordTxt, dpi);
+                    double tagW = ordFt.Width + 8, tagH = ordFt.Height + 3;
+                    double tagY = ordY - tagH - 2;
+                    dc.DrawRoundedRectangle(MidChipBg, ordPen, new Rect(2, tagY, tagW, tagH), 3, 3);
+                    dc.DrawText(ordFt, new Point(6, tagY + 1.5));
+                }
+                else
+                {
+                    double edgeY = ordY < halfRow ? 10 + 4 * 14 : h - 10 - 4 * 14;   // below the ↑/↓ node stacks
+                    string arrow = ordY < halfRow ? "▲ " : "▼ ";
+                    DrawText(dc, arrow + tag + "  " + _ordPrice.ToString("0.00", CultureInfo.InvariantCulture),
+                        4, edgeY, 11, Mono, ordTxt, dpi, 0.9);
+                }
+            }
 
             // Edge markers for Visible nodes whose row is off-screen (remembered walls outside the live band).
             if (_nodes != null)

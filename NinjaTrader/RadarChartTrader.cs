@@ -10,8 +10,8 @@ using NinjaTrader.Cbi;
 
 namespace TradingRadar.NT
 {
-    // Order-entry surface docked under the Cockpit (spec §8). MKT-only, Sim/Playback-first.
-    // Real Account API: CreateOrder()+Submit() (no strategy Enter*/Exit* — this is an Add-On, not a Strategy).
+    // Order-entry surface docked under the Cockpit (spec §8). MKT + wall-anchored LMT, Sim/Playback-first.
+    // Real Account API: CreateOrder()+Submit()/Change()/Cancel() (no strategy Enter*/Exit* — Add-On, not a Strategy).
     // Hard gate: submits to a non-Sim/non-Playback account are blocked unless "ARM LIVE" is checked.
     public class RadarChartTrader : Grid
     {
@@ -33,6 +33,11 @@ namespace TradingRadar.NT
         private static readonly Brush SellHover = Frozen(Color.FromArgb(61,  0xfb, 0x71, 0x85));
         private static readonly Brush SellBorder= Frozen(Color.FromArgb(140, 0xfb, 0x71, 0x85));
         private static readonly Brush SellText  = Frozen(Color.FromRgb(0xff, 0xb0, 0xbb));
+        // LMT buttons: same hue, hollow/lighter fill + no glow — visually distinct from the glowing MKT pills.
+        private static readonly Brush BuyLmtFill   = Frozen(Color.FromArgb(10, 0x34, 0xd3, 0x99));
+        private static readonly Brush BuyLmtHover  = Frozen(Color.FromArgb(30, 0x34, 0xd3, 0x99));
+        private static readonly Brush SellLmtFill  = Frozen(Color.FromArgb(10, 0xfb, 0x71, 0x85));
+        private static readonly Brush SellLmtHover = Frozen(Color.FromArgb(30, 0xfb, 0x71, 0x85));
         private static readonly Brush MgFill    = Frozen(Color.FromArgb(8,   0xff, 0xff, 0xff));  // ~.03
         private static readonly Brush MgHover   = Frozen(Color.FromArgb(18,  0xff, 0xff, 0xff));  // ~.07
         private static readonly Brush MgText    = Frozen(Color.FromRgb(0xc3, 0xca, 0xd6));
@@ -45,20 +50,41 @@ namespace TradingRadar.NT
         private Instrument _instrument;
         private Account _account;
         private Account _armedFor;      // account the user explicitly armed via the checkbox — per-account, not sticky
-        private double _lastPrice;
+        private double _lastPrice;      // book mid, pushed by RadarTab's paint timer (SetContext)
+        private double _wallAbove;      // price of the biggest wall above mid this engine run (0 = none)
+        private double _wallBelow;      // price of the biggest wall below mid this engine run (0 = none)
+        private double _tick;
+        private Order _activeLimit;     // the one working limit order this control currently has resting
         private readonly HashSet<Order> _workingOrders = new HashSet<Order>(); // in-flight orders this control submitted
 
-        private readonly ComboBox _accountCombo = new ComboBox { Width = 130, Margin = new Thickness(0, 0, 6, 0) };
+        // A same-side LMT re-anchor uses Account.Change() directly (atomic). An opposite-side flip must
+        // cancel the old order first and only THEN submit the new one — stashed here and fired from
+        // OnOrderUpdate once the cancel is confirmed (WaitingOn == the order we're cancelling).
+        private sealed class PendingReplace
+        {
+            public OrderAction Action;
+            public int Qty;
+            public double Price;
+            public string Tag;
+            public Order WaitingOn;
+        }
+        private PendingReplace _pendingReplace;
+
+        private readonly ComboBox _accountCombo = new ComboBox { Margin = new Thickness(0, 0, 6, 0) };
         private readonly CheckBox _armChk = new CheckBox { Content = "ARM LIVE", Visibility = Visibility.Collapsed,
             Foreground = Coral, FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
-            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
+            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 2, 6, 0) };
         private readonly TextBlock _warnText = new TextBlock { FontFamily = new FontFamily("Segoe UI"), FontSize = 10,
-            VerticalAlignment = VerticalAlignment.Center, Foreground = Muted };
+            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 2, 0, 0), Foreground = Muted };
         private readonly TextBox _qtyBox = new TextBox { Text = "1", Width = 40, TextAlignment = TextAlignment.Center,
             Background = Ink, Foreground = TextCol, BorderBrush = BorderBr,
             VerticalContentAlignment = VerticalAlignment.Center };
         private readonly Button _buyBtn;
         private readonly Button _sellBtn;
+        private readonly Button _buyLmtBtn;
+        private readonly Button _sellLmtBtn;
+        private readonly Button _upBtn;
+        private readonly Button _dnBtn;
         private readonly Button _revBtn;
         private readonly Button _closeBtn;
         private readonly Button _flatBtn;
@@ -70,23 +96,32 @@ namespace TradingRadar.NT
         public RadarChartTrader()
         {
             Background = Panel;
-            for (int i = 0; i < 5; i++) RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            for (int i = 0; i < 6; i++) RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-            _buyBtn  = MakePrimaryButton("BUY MKT",  BuyFill,  BuyHover,  BuyBorder,  BuyText,  Emerald.Color);
-            _sellBtn = MakePrimaryButton("SELL MKT", SellFill, SellHover, SellBorder, SellText, Coral.Color);
-            _revBtn   = MakeManageButton("Rev");
-            _closeBtn = MakeManageButton("Close");
-            _flatBtn  = MakeManageButton("Flat");
+            _buyBtn     = MakeNeonButton("BUY MKT",  BuyFill,    BuyHover,    BuyBorder,  BuyText,  40, 14, 9, Emerald.Color);
+            _sellBtn    = MakeNeonButton("SELL MKT", SellFill,   SellHover,   SellBorder, SellText, 40, 14, 9, Coral.Color);
+            _buyLmtBtn  = MakeNeonButton("BUY LMT",  BuyLmtFill, BuyLmtHover, BuyBorder,  BuyText,  40, 13, 9, null);
+            _sellLmtBtn = MakeNeonButton("SELL LMT", SellLmtFill,SellLmtHover,SellBorder, SellText, 40, 13, 9, null);
+            _upBtn      = MakeNeonButton("▲", MgFill, MgHover, BorderBr, MgText, 40, 16, 9, null);
+            _dnBtn      = MakeNeonButton("▼", MgFill, MgHover, BorderBr, MgText, 40, 16, 9, null);
+            _revBtn     = MakeManageButton("Rev");
+            _closeBtn   = MakeManageButton("Close");
+            _flatBtn    = MakeManageButton("Flat");
 
-            _buyBtn.Click  += (o, e) => SubmitMarket(OrderAction.Buy, "Buy");
-            _sellBtn.Click += (o, e) => SubmitMarket(OrderAction.Sell, "Sell");
-            _revBtn.Click   += (o, e) => Reverse();
-            _closeBtn.Click += (o, e) => ClosePosition(false);
-            _flatBtn.Click  += (o, e) => ClosePosition(true);
+            _buyBtn.Click     += (o, e) => SubmitMarket(OrderAction.Buy, "Buy");
+            _sellBtn.Click    += (o, e) => SubmitMarket(OrderAction.Sell, "Sell");
+            _buyLmtBtn.Click  += (o, e) => SubmitLimit(true);
+            _sellLmtBtn.Click += (o, e) => SubmitLimit(false);
+            _upBtn.Click      += (o, e) => MoveOrder(1);
+            _dnBtn.Click      += (o, e) => MoveOrder(-1);
+            _revBtn.Click     += (o, e) => Reverse();
+            _closeBtn.Click   += (o, e) => ClosePosition(false);
+            _flatBtn.Click    += (o, e) => ClosePosition(true);
 
             _accountCombo.DisplayMemberPath = "Name";
             _accountCombo.Background = Ink;
             _accountCombo.Foreground = TextCol;
+            _accountCombo.HorizontalAlignment = HorizontalAlignment.Stretch;
             _accountCombo.SelectionChanged += (o, e) => OnAccountSelected();
             _armChk.Checked   += (o, e) => { _armedFor = _account; RefreshArmUi(); };
             _armChk.Unchecked += (o, e) => { _armedFor = null; RefreshArmUi(); };
@@ -100,46 +135,52 @@ namespace TradingRadar.NT
             _qtyBox.LostFocus += (o, e) => commitQty();
             _qtyBox.KeyDown   += (o, e) => { if (e.Key == Key.Enter) commitQty(); };
 
-            // Row 0: header + account + arm gate
-            {
-                var hdr = new TextBlock { Text = "CHART TRADER",
-                    FontFamily = new FontFamily("Segoe UI"), FontSize = 10.5, FontWeight = FontWeights.SemiBold,
-                    Foreground = Muted, Margin = new Thickness(2, 6, 0, 6) };
-                var acctRow = new StackPanel { Orientation = Orientation.Horizontal,
-                    Children = { _accountCombo, _armChk, _warnText } };
-                AddRow(0, new StackPanel { Margin = new Thickness(8, 4, 8, 2), Children = { hdr, acctRow } });
-            }
+            // Row 0: BUY MKT / SELL MKT — the primary order entry, at the very top (like NT8's Chart Trader).
+            AddRow(0, TwoColRow(_buyBtn, _sellBtn, 8, 4));
 
-            // Row 1: qty stepper
-            {
-                var lbl = new TextBlock { Text = "Qty:", Margin = new Thickness(0, 0, 4, 0),
-                    VerticalAlignment = VerticalAlignment.Center, FontFamily = new FontFamily("Segoe UI"),
-                    FontSize = 11, Foreground = Muted };
-                var minus = MakeManageButton("−"); minus.Width = 22;
-                var plus  = MakeManageButton("+");  plus.Width = 22;
-                minus.Click += (o, e) => StepQty(-1);
-                plus.Click  += (o, e) => StepQty(1);
-                AddRow(1, new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 2, 8, 2),
-                    Children = { lbl, minus, _qtyBox, plus } });
-            }
+            // Row 1: BUY LMT / SELL LMT — wall-anchored (see LimitAnchorPrice()).
+            AddRow(1, TwoColRow(_buyLmtBtn, _sellLmtBtn, 8, 0));
 
-            // Row 2: BUY / SELL
+            // Row 2: ▲ / ▼ — move the active working limit 1 tick; disabled when none is working.
+            AddRow(2, TwoColRow(_upBtn, _dnBtn, 8, 0));
+
+            // Row 3: Rev / Close / Flat — 3 equal columns, evenly spread.
             {
                 var row = new Grid { Margin = new Thickness(8, 4, 8, 4) };
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                _buyBtn.Margin = new Thickness(0, 0, 3, 0);
-                _sellBtn.Margin = new Thickness(3, 0, 0, 0);
-                SetColumn(_buyBtn, 0);  row.Children.Add(_buyBtn);
-                SetColumn(_sellBtn, 1); row.Children.Add(_sellBtn);
-                AddRow(2, row);
+                for (int c = 0; c < 3; c++) row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                _revBtn.Margin   = new Thickness(0, 0, 3, 0);
+                _closeBtn.Margin = new Thickness(3, 0, 3, 0);
+                _flatBtn.Margin  = new Thickness(3, 0, 0, 0);
+                SetColumn(_revBtn, 0);   row.Children.Add(_revBtn);
+                SetColumn(_closeBtn, 1); row.Children.Add(_closeBtn);
+                SetColumn(_flatBtn, 2);  row.Children.Add(_flatBtn);
+                AddRow(3, row);
             }
 
-            // Row 3: Rev / Close / Flat
-            AddRow(3, new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 0, 8, 4),
-                Children = { _revBtn, _closeBtn, _flatBtn } });
+            // Row 4: account (stretches left) + qty stepper (right), like NT8; ARM/warn wrap below.
+            {
+                var qtyLbl = new TextBlock { Text = "Qty:", Margin = new Thickness(8, 0, 4, 0),
+                    VerticalAlignment = VerticalAlignment.Center, FontFamily = new FontFamily("Segoe UI"),
+                    FontSize = 11, Foreground = Muted };
+                var minus = MakeManageButton("−"); minus.Width = 22; minus.Margin = new Thickness(0, 0, 2, 0);
+                var plus  = MakeManageButton("+");  plus.Width = 22; plus.Margin  = new Thickness(2, 0, 0, 0);
+                minus.Click += (o, e) => StepQty(-1);
+                plus.Click  += (o, e) => StepQty(1);
+                var qtyGroup = new StackPanel { Orientation = Orientation.Horizontal,
+                    Children = { qtyLbl, minus, _qtyBox, plus } };
+                DockPanel.SetDock(qtyGroup, Dock.Right);
 
-            // Row 4: position + PnL readout — bordered bar (position left, PnL right)
+                var acctQty = new DockPanel { Margin = new Thickness(8, 4, 8, 0) };
+                acctQty.Children.Add(qtyGroup);
+                acctQty.Children.Add(_accountCombo);   // last child fills remaining width (stretches left)
+
+                var armWrap = new WrapPanel { Margin = new Thickness(8, 0, 8, 4),
+                    Children = { _armChk, _warnText } };
+
+                AddRow(4, new StackPanel { Children = { acctQty, armWrap } });
+            }
+
+            // Row 5: position + PnL readout — bordered bar (position left, PnL right).
             {
                 _posText.VerticalAlignment = VerticalAlignment.Center;
                 _pnlText.VerticalAlignment = VerticalAlignment.Center;
@@ -149,13 +190,13 @@ namespace TradingRadar.NT
                 pnlGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                 SetColumn(_posText, 0); pnlGrid.Children.Add(_posText);
                 SetColumn(_pnlText, 1); pnlGrid.Children.Add(_pnlText);
-                AddRow(4, new Border { Background = PnlBarBg, BorderBrush = PanelLine, BorderThickness = new Thickness(1),
+                AddRow(5, new Border { Background = PnlBarBg, BorderBrush = PanelLine, BorderThickness = new Thickness(1),
                     CornerRadius = new CornerRadius(8), Padding = new Thickness(11, 7, 11, 7),
                     Margin = new Thickness(8, 4, 8, 8), Child = pnlGrid });
             }
 
-            // ponytail: no TifSelector / AtmStrategySelector / Entry button / SL-TP lines here —
-            // MKT-only v1 per spec §8/§12. TimeInForce hardcoded to Day in SubmitRaw().
+            // ponytail: no TifSelector / AtmStrategySelector / Entry button / bracket SL-TP here —
+            // MKT+LMT-only v1 per spec. TimeInForce hardcoded to Day; no ATM.
 
             Account.AccountStatusUpdate += OnAccountStatusUpdate;
             PopulateAccounts();
@@ -165,6 +206,18 @@ namespace TradingRadar.NT
         {
             SetRow(content, row);
             Children.Add(content);
+        }
+
+        private static Grid TwoColRow(FrameworkElement left, FrameworkElement right, double sideMargin, double topMargin)
+        {
+            var row = new Grid { Margin = new Thickness(sideMargin, topMargin, sideMargin, 4) };
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            left.Margin  = new Thickness(0, 0, 3, 0);
+            right.Margin = new Thickness(3, 0, 0, 0);
+            SetColumn(left, 0);  row.Children.Add(left);
+            SetColumn(right, 1); row.Children.Add(right);
+            return row;
         }
 
         // Rounded neon button template — overrides the default WPF button chrome so the translucent
@@ -207,14 +260,9 @@ namespace TradingRadar.NT
             return b;
         }
 
-        private Button MakePrimaryButton(string text, Brush fill, Brush hover, Brush border, Brush fg, Color glow)
-        {
-            return MakeNeonButton(text, fill, hover, border, fg, 40, 14, 9, glow);
-        }
-
         private Button MakeManageButton(string text)
         {
-            var b = MakeNeonButton(text, MgFill, MgHover, BorderBr, MgText, 26, 11, 8, null);
+            var b = MakeNeonButton(text, MgFill, MgHover, BorderBr, MgText, 28, 11, 8, null);
             b.MinWidth = 50;
             b.Margin = new Thickness(0, 0, 6, 0);
             return b;
@@ -227,21 +275,39 @@ namespace TradingRadar.NT
             set
             {
                 if (_instrument == value) return;
+                CancelActiveLimitIfWorking("instrument switch");   // don't orphan a live order on switch/teardown
                 _instrument = value;
                 _lastPrice = 0;
-                _workingOrders.Clear(); // ponytail: stale in-flight orders from the old instrument stop being tracked
+                _wallAbove = 0;
+                _wallBelow = 0;
+                _activeLimit = null;
+                _pendingReplace = null;
+                _workingOrders.Clear();
                 RefreshArmUi();
                 RefreshPositionUi();
             }
         }
 
-        // Called by RadarTab's UI-thread paint timer with the already-marshaled book mid —
-        // reuses the existing instrument subscription instead of opening a second MarketData feed.
-        public void SetLastPrice(double mid)
+        // Called by RadarTab's UI-thread paint timer with the already-marshaled book mid + biggest-wall
+        // prices above/below mid — reuses the existing instrument subscription instead of a new feed.
+        public void SetContext(double mid, double wallAbove, double wallBelow, double tick)
         {
-            if (mid <= 0) return;
-            _lastPrice = mid;
+            if (mid > 0) _lastPrice = mid;
+            _wallAbove = wallAbove;
+            _wallBelow = wallBelow;
+            if (tick > 0) _tick = tick;
             RefreshPositionUi();
+        }
+
+        // Exposes the one active working limit order for RadarVisual's ladder marker.
+        public bool TryGetActiveOrder(out double price, out bool isBuy, out int qty)
+        {
+            Order ord = _activeLimit;
+            if (ord == null) { price = 0; isBuy = false; qty = 0; return false; }
+            price = ord.LimitPrice;
+            isBuy = ord.OrderAction == OrderAction.Buy;
+            qty = ord.Quantity;
+            return true;
         }
 
         // Fail-closed: Sim is recognized ONLY via the authoritative Provider enum. Any account whose
@@ -289,14 +355,28 @@ namespace TradingRadar.NT
         {
             Account acct = _accountCombo.SelectedItem as Account;
             if (acct == _account) return;
+            CancelActiveLimitIfWorking("account switch");   // on the OLD account, before we lose the reference
             UnsubscribeAccount();
             _account = acct;
             _armedFor = null;           // arming never carries over to a newly selected account
             _armChk.IsChecked = false;
-            _workingOrders.Clear();     // in-flight tracking is per-account (positions/orders differ)
+            _activeLimit = null;        // order tracking is per-account (orders/positions differ)
+            _pendingReplace = null;
+            _workingOrders.Clear();
             SubscribeAccount();
             RefreshArmUi();
             RefreshPositionUi();
+        }
+
+        // Cancels the currently-tracked working limit if it's still alive — used on teardown/context
+        // switch (instrument, account, Cleanup) so a live order is never left orphaned/untracked.
+        private void CancelActiveLimitIfWorking(string context)
+        {
+            Order ord = _activeLimit;
+            if (ord == null || _account == null) return;
+            if (Order.IsTerminalState(ord.OrderState)) return;
+            try { _account.Cancel(new[] { ord }); }
+            catch (Exception ex) { Diag(context + ": cancel failed: " + ex.Message); }
         }
 
         private void SubscribeAccount()
@@ -315,11 +395,6 @@ namespace TradingRadar.NT
             _account.PositionUpdate  -= OnPositionUpdate;
         }
 
-        private static bool IsTerminal(OrderState s)
-        {
-            return s == OrderState.Filled || s == OrderState.Cancelled || s == OrderState.Rejected;
-        }
-
         // ---- account-thread handlers: marshal any WPF mutation to the UI thread ----
         private void OnOrderUpdate(object sender, OrderEventArgs e)
         {
@@ -329,11 +404,32 @@ namespace TradingRadar.NT
             if (e.OrderState == OrderState.Rejected)
                 Diag("order rejected: " + e.Error + " " + e.Comment);
             OrderState state = e.OrderState;
+            OrderType  type  = ord.OrderType;
             Dispatcher.InvokeAsync((Action)(() =>
             {
-                if (IsTerminal(state)) _workingOrders.Remove(ord);   // HashSet.Remove is a no-op if already gone
+                if (Order.IsTerminalState(state))
+                {
+                    _workingOrders.Remove(ord);   // HashSet.Remove is a no-op if already gone
+                    if (ReferenceEquals(_activeLimit, ord)) _activeLimit = null;
+                    // Opposite-side flip: the old order we cancelled just reached its terminal state —
+                    // fire the stashed replacement now (only if it actually got Cancelled, not Filled/Rejected).
+                    if (_pendingReplace != null && ReferenceEquals(_pendingReplace.WaitingOn, ord))
+                    {
+                        PendingReplace p = _pendingReplace;
+                        _pendingReplace = null;
+                        if (state == OrderState.Cancelled)
+                            SubmitRaw(p.Action, OrderType.Limit, p.Qty, p.Price, p.Tag);
+                        else
+                            Diag("pending replace dropped — old order reached " + state + " instead of Cancelled.");
+                    }
+                }
+                else if (state == OrderState.Working && type == OrderType.Limit)
+                {
+                    _workingOrders.Remove(ord);   // resting limit no longer counts as "in flight"
+                    _activeLimit = ord;           // the one tracked working limit (v1: one at a time)
+                }
                 RefreshPositionUi();
-                RefreshArmUi();   // re-enables buttons once the in-flight count drops to 0
+                RefreshArmUi();   // re-enables buttons / refreshes ▲▼ once state settles
             }));
         }
 
@@ -357,6 +453,11 @@ namespace TradingRadar.NT
             bool canTrade = CanTrade();
             _buyBtn.IsEnabled = canTrade;
             _sellBtn.IsEnabled = canTrade;
+            _buyLmtBtn.IsEnabled = canTrade;
+            _sellLmtBtn.IsEnabled = canTrade;
+            bool canMove = canTrade && _activeLimit != null;
+            _upBtn.IsEnabled = canMove;
+            _dnBtn.IsEnabled = canMove;
             _revBtn.IsEnabled = canTrade;
             _closeBtn.IsEnabled = canTrade;
             _flatBtn.IsEnabled = canTrade;
@@ -431,7 +532,122 @@ namespace TradingRadar.NT
         private void SubmitMarket(OrderAction action, string tag)
         {
             if (!ValidateForSubmit()) return;
-            SubmitRaw(action, GetQty(), tag);
+            SubmitRaw(action, OrderType.Market, GetQty(), 0, tag);
+        }
+
+        private double EffectiveTick()
+        {
+            if (_tick > 0) return _tick;
+            return _instrument != null ? _instrument.MasterInstrument.TickSize : 0.25;
+        }
+
+        private static double RoundToTick(double price, double tick)
+        {
+            return tick > 0 ? Math.Round(price / tick) * tick : price;
+        }
+
+        // Single, clear anchor rule for BUY/SELL LMT (Javier's call to tune further):
+        // SELL → biggest wall ABOVE mid + 1 tick (non-marketable). BUY → biggest wall BELOW mid − 1 tick.
+        // No wall on the required side → fall back to a mid ± 1 tick proxy for best ask / best bid (Diag'd).
+        // ponytail: F13 (deferred to the real-account gate) — this fallback silently rests the order near
+        // market instead of blocking/confirming when no wall exists. F14 — LMT submit/move isn't gated on
+        // a fresh-quote/connection check and clamps against the possibly-stale mid, not real best bid/ask
+        // (needs L2 quotes piped into this control — bigger change).
+        private double LimitAnchorPrice(bool isBuy)
+        {
+            double tick = EffectiveTick();
+            if (isBuy)
+            {
+                if (_wallBelow > 0) return RoundToTick(_wallBelow - tick, tick);
+                Diag("BUY LMT: no wall below mid — anchoring at mid - 1 tick (best-bid proxy).");
+                return RoundToTick(_lastPrice - tick, tick);
+            }
+            if (_wallAbove > 0) return RoundToTick(_wallAbove + tick, tick);
+            Diag("SELL LMT: no wall above mid — anchoring at mid + 1 tick (best-ask proxy).");
+            return RoundToTick(_lastPrice + tick, tick);
+        }
+
+        private void SubmitLimit(bool isBuy)
+        {
+            if (!ValidateForSubmit()) return;
+            if (_lastPrice <= 0) { Diag("blocked — no price context yet."); return; }
+            double price = LimitAnchorPrice(isBuy);
+            if (price <= 0) { Diag("blocked — invalid anchor price."); return; }
+            OrderAction action = isBuy ? OrderAction.Buy : OrderAction.Sell;
+            string tag = isBuy ? "BuyLmt" : "SellLmt";
+            int qty = GetQty();
+
+            if (_activeLimit != null)
+            {
+                if (_activeLimit.OrderAction == action)
+                {
+                    // Same side: re-anchor in place — Account.Change is atomic, no cancel/submit race.
+                    ChangeActiveLimitPrice(price, "re-anchor");
+                    return;
+                }
+                // Opposite side (flip): sequence it. Cancel first; the replacement fires from
+                // OnOrderUpdate once the cancel is confirmed (see PendingReplace above).
+                Order old = _activeLimit;
+                _workingOrders.Add(old);   // block a second submit while the cancel is in flight
+                _pendingReplace = new PendingReplace { Action = action, Qty = qty, Price = price, Tag = tag, WaitingOn = old };
+                try
+                {
+                    _account.Cancel(new[] { old });
+                    RefreshArmUi();
+                }
+                catch (Exception ex)
+                {
+                    // Invariant broken if we proceed: Diag + bail. Do NOT null _activeLimit (old order is
+                    // presumably still resting) and do NOT submit the replacement — that would compound it.
+                    Diag("cancel-before-replace failed: " + ex.Message);
+                    _workingOrders.Remove(old);
+                    _pendingReplace = null;
+                    RefreshArmUi();
+                }
+                return;
+            }
+
+            SubmitRaw(action, OrderType.Limit, qty, price, tag);
+        }
+
+        // Change()'s the active working limit to a new price — used by both the ▲/▼ move and a
+        // same-side LMT re-anchor. Guards the order isn't already Filled/Cancelled/Rejected before
+        // calling Change (OnOrderUpdate is async-marshaled, so _activeLimit can lag reality briefly).
+        private void ChangeActiveLimitPrice(double newPrice, string context)
+        {
+            Order ord = _activeLimit;
+            if (ord == null) { Diag(context + ": no working limit order."); return; }
+            if (Order.IsTerminalState(ord.OrderState))
+            {
+                Diag(context + ": order already " + ord.OrderState + " — refusing to Change.");
+                return;
+            }
+            try
+            {
+                ord.LimitPriceChanged = newPrice;
+                _account.Change(new[] { ord });
+            }
+            catch (Exception ex)
+            {
+                Diag(context + " failed: " + ex.Message);
+            }
+        }
+
+        // ▲/▼ — move the active working limit 1 tick via Account.Change() (preserves queue priority;
+        // does NOT cancel+resubmit). Confirmed API: Order.LimitPriceChanged + Account.Change(orders).
+        private void MoveOrder(int deltaTicks)
+        {
+            if (!ValidateForSubmit()) return;
+            Order ord = _activeLimit;
+            if (ord == null) { Diag("no working limit order to move."); return; }
+            double tick = EffectiveTick();
+            double newPrice = RoundToTick(ord.LimitPrice + deltaTicks * tick, tick);
+            bool isBuy = ord.OrderAction == OrderAction.Buy;
+            // Keep non-marketable: clamp against mid as a best-bid/best-ask proxy (exact L2 quotes
+            // aren't piped into this control — see LimitAnchorPrice). Diag + no-op at the boundary.
+            if (isBuy && newPrice >= _lastPrice)  { Diag("blocked — move would cross the market (buy limit >= mid)."); return; }
+            if (!isBuy && newPrice <= _lastPrice) { Diag("blocked — move would cross the market (sell limit <= mid)."); return; }
+            ChangeActiveLimitPrice(newPrice, "move");
         }
 
         private Position CurrentPosition()
@@ -450,7 +666,7 @@ namespace TradingRadar.NT
                 return;
             }
             OrderAction action = pos.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.Buy;
-            SubmitRaw(action, pos.Quantity * 2, "Rev");
+            SubmitRaw(action, OrderType.Market, pos.Quantity * 2, 0, "Rev");
         }
 
         private void ClosePosition(bool cancelOrdersFirst)
@@ -463,24 +679,26 @@ namespace TradingRadar.NT
                 catch (Exception ex) { Diag("Flat failed: " + ex.Message); }
                 return;
             }
+            // A resting limit from this control could otherwise fill later and silently re-open the position.
+            CancelActiveLimitIfWorking("close");
             Position pos = CurrentPosition();
             if (pos == null || pos.MarketPosition == MarketPosition.Flat || pos.Quantity == 0)
                 return;
             OrderAction action = pos.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.Buy;
-            SubmitRaw(action, pos.Quantity, "Close");
+            SubmitRaw(action, OrderType.Market, pos.Quantity, 0, "Close");
         }
 
         // Single choke point for every order this control sends — guarded, try/catch, diagnostic on failure.
-        // ponytail: OrderType.Market / TimeInForce.Day hardcoded — limit/stop/bracket/ATM deferred (spec §8/§12).
-        private void SubmitRaw(OrderAction action, int qty, string tag)
+        // ponytail: bracket SL/TP / ATM deferred (spec §8/§12). MKT + LMT only.
+        private void SubmitRaw(OrderAction action, OrderType type, int qty, double limitPrice, string tag)
         {
             if (qty < 1) { Diag("blocked — qty < 1."); return; }
             try
             {
                 // gtd is unused for TimeInForce.Day, but must be a real, in-range DateTime — NT8 adds an
                 // exchange/UTC offset during order processing, so DateTime.MaxValue can overflow and throw.
-                Order o = _account.CreateOrder(_instrument, action, OrderType.Market, OrderEntry.Manual,
-                    TimeInForce.Day, qty, 0, 0, string.Empty, tag, NinjaTrader.Core.Globals.MaxDate, null);
+                Order o = _account.CreateOrder(_instrument, action, type, OrderEntry.Manual,
+                    TimeInForce.Day, qty, limitPrice, 0, string.Empty, tag, NinjaTrader.Core.Globals.MaxDate, null);
                 _account.Submit(new[] { o });
                 _workingOrders.Add(o);   // synchronous in-flight guard — closes the double-click window
                 RefreshArmUi();
@@ -493,6 +711,7 @@ namespace TradingRadar.NT
 
         public void Cleanup()
         {
+            CancelActiveLimitIfWorking("cleanup");   // don't leave a live order orphaned on teardown
             Account.AccountStatusUpdate -= OnAccountStatusUpdate;
             UnsubscribeAccount();
         }
