@@ -414,7 +414,7 @@ namespace TradingRadar.NT
             _buyLmtBtn.Effect = buyLive ? SetupGlow(Emerald.Color) : null;
             _sellLmtBtn.Effect = sellLive ? SetupGlow(Coral.Color) : null;
             _setupText.Visibility = _pendingSetup != null ? Visibility.Visible : Visibility.Collapsed;
-            _setupText.Text = buyLive ? "SETUP LONG listo" : sellLive ? "SETUP SHORT listo" : string.Empty;
+            _setupText.Text = buyLive ? "SETUP LONG listo · calibrando" : sellLive ? "SETUP SHORT listo · calibrando" : string.Empty;
             _setupText.Foreground = buyLive ? Emerald : Coral;
         }
 
@@ -536,6 +536,9 @@ namespace TradingRadar.NT
             if (!IsPlaybackAccount(_account)) return;
             _pendingReplace = null;
             ClearPendingSetup();      // a pre-stage keyed off the pre-reset book/wall is stale after a rewind
+            // Rewind + replay reproduces the SAME FireEvent.Time — reset the dedupe guard so the
+            // legitimately re-fired setup isn't silently swallowed by OnSetupFire's dedupe check.
+            _lastFireTime = DateTime.MinValue;
             _workingOrders.Clear();   // any in-flight submit is void after a Playback reset — re-enable the buttons
             Order ord = _activeLimit;
             if (ord != null)
@@ -780,9 +783,15 @@ namespace TradingRadar.NT
             // consumed by this one click. A pre-stage for the OTHER side is stale the moment its
             // opposite button is clicked — drop it either way.
             PendingSetup setup = _pendingSetup;
-            double price = (setup != null && setup.IsBuy == isBuy) ? setup.Price : LimitAnchorPrice(isBuy);
+            bool consumedSetup = setup != null && setup.IsBuy == isBuy;
+            double price = consumedSetup ? setup.Price : LimitAnchorPrice(isBuy);
             if (setup != null) ClearPendingSetup();
             if (price <= 0) { Diag("blocked — invalid anchor price."); return; }
+            // Log-only (feeds the Rec calibration pass / future F18) — the click can land seconds after
+            // the fire, so the pre-staged price can have gone marketable against the current proxy quote
+            // by the time the human clicks. _lastPrice > 0 already holds (checked above). No block.
+            if (consumedSetup && (isBuy ? setup.Price >= _lastPrice : setup.Price <= _lastPrice))
+                Diag(string.Format("pre-stage consumed marketable at click — setup {0:0.00} vs mid {1:0.00}.", setup.Price, _lastPrice));
             OrderAction action = isBuy ? OrderAction.Buy : OrderAction.Sell;
             string tag = isBuy ? "BuyLmt" : "SellLmt";
             int qty = GetQty();
