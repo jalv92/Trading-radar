@@ -51,8 +51,9 @@ namespace TradingRadar.NT
         private double _mid;
         private double _tick           = 0.25;
         private double _anchorTop      = double.NaN;   // price of the top visible row; persists across frames
-        private const int    ANCHOR_GUARD_TICKS = 4;   // re-anchor when mid comes within this many ticks of an edge
-        private const double TARGET_ROW_PX      = 26.0;
+        private const int    DESIRED_ROWS = 27;        // price levels the ladder targets (mid ± ~13 ticks → covers the book)
+        private const double MIN_ROW_PX   = 16.0;      // ponytail: row-height clamp; widen the band if bars look too thin/fat
+        private const double MAX_ROW_PX   = 40.0;
 
         public void SetFrame(IReadOnlyList<RadarNode> nodes, IReadOnlyList<DepthLevel> bids,
                              IReadOnlyList<DepthLevel> asks, double mid, double tickSize)
@@ -75,24 +76,22 @@ namespace TradingRadar.NT
 
             if (_mid <= 0) return;
 
-            // Stable row grid (anchored layout — rows derived from panel height, not book depth).
-            int    rows = (int)Math.Max(9, Math.Floor(h / TARGET_ROW_PX));
-            double rowH = h / rows;
+            // Row grid — row height scales so the ladder FILLS the window at any size
+            // (clamped so bars never get absurdly thin/fat). rowH depends only on panel
+            // height → constant per frame, changes only when the user resizes → no jitter.
+            double rowH = Math.Min(MAX_ROW_PX, Math.Max(MIN_ROW_PX, h / DESIRED_ROWS));
+            int    rows = Math.Max(9, (int)Math.Floor(h / rowH));
             double barX = 88, barMaxW = w - barX - 96;
 
-            // (Re)initialise anchor on first frame, instrument change, or mid discontinuity.
-            if (double.IsNaN(_anchorTop)
-                || _mid > _anchorTop + _tick
-                || _mid < _anchorTop - (rows + 1) * _tick)
-                _anchorTop = RoundToTick(_mid) + (rows / 2) * _tick;
-
-            // Edge re-anchor: slide the price column only when mid nears the top/bottom edge.
-            double guard  = ANCHOR_GUARD_TICKS * _tick;
-            double bottom = _anchorTop - (rows - 1) * _tick;
-            int safety = 0;
-            while (_mid > _anchorTop - guard  && safety++ < rows) { _anchorTop += _tick; bottom += _tick; }
-            safety = 0;
-            while (_mid < bottom + guard && safety++ < rows) { _anchorTop -= _tick; bottom -= _tick; }
+            // Anchor so mid sits centered, snapped to the tick grid. Re-anchor (recenter)
+            // ONLY when mid drifts out of the middle band, or on first frame / instrument
+            // change / discontinuity. Between re-anchors the grid is stationary: a given
+            // price keeps its y, bars grow/shrink in place, only the mid marker glides
+            // (DOM-standard scroll-in-place — no whole-profile reflow every tick).
+            double midRowNow = double.IsNaN(_anchorTop) ? double.NaN : (_anchorTop - _mid) / _tick;
+            double band = rows / 4.0;   // recenter once mid leaves the middle half of the ladder
+            if (double.IsNaN(midRowNow) || midRowNow < band || midRowNow > rows - 1 - band)
+                _anchorTop = RoundToTick(_mid) + Math.Floor(rows / 2.0) * _tick;
 
             // Anchored y-mapping: price of the top row is _anchorTop; rows go downward by _tick each.
             double Y(double price) { return ((_anchorTop - price) / _tick) * rowH; }
