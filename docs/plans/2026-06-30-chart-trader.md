@@ -51,7 +51,65 @@ Order ticket docked under the Cockpit in RadarTab's right column. **Layout (NT8-
 - **F19 (MAJOR) — new:** `OnSetupFire` lights the "SETUP LONG/SHORT listo" label + LMT-button glow **regardless of account/arm state and on UNMEASURED placeholder thresholds** (spec §9 calibration not yet done). On a non-armed **real** account the button is disabled but still glows a "ready" label — an active inducement to check ARM LIVE and take an uncalibrated signal, on the exact account where it must NOT be trusted. Before real: (1) the "listo" affordance must not render as actionable/"ready" on a non-armed real account (suppress it, or render it explicitly as "SIM ONLY / not armed"), and (2) carry an "UNCALIBRATED" qualifier until the Rec-CSV pass (spec §9) validates the thresholds vs baseline. *Sim/Playback: MINOR — add a "calibrating" tag so trust isn't built on placeholder fires.*
 - **F1 (re-scoped) now also covers the pre-stage entry — no new item, note the mitigation:** a pre-staged LMT click routes through `SubmitRaw(isEntry:true)`, so on real it is subject to the same mandatory-bracket rule (ATM or code SL/TP) as every other entry. The **pre-stage + ATM interaction is intended and mitigating** — the ATM bracket is the F1 stop that would protect even a stale F18 fill (bracket offsets are ATM-template ticks from the actual fill, not the structural stop, but it is a server-resting stop). The F1 bracket mandate must not be considered satisfied by the pre-stage path alone without a stop attached.
 
-**Real-money VETO stands; preconditions are now F1(re-scoped)–F19** (F11/F12/F15/F16/F17 done; F1/F2/F6/F7/F14 widened; F13/F14 + F1(bracket-mandate)/F2/F9/F10 + **F18/F19** deferred to the real gate). **The Consumption-Break pre-stage (commit `43b9934`) is CLEARED for Sim/Playback only** — verified no auto-submit, ARM LIVE + Sim-default intact. Re-submit for VETO review once F1(re-scoped)–F8, F13/F14 and F18/F19 (plus F9 if prop) are implemented. Until then: **Sim/Playback testing only.**
+### Added by the AUTO-mode re-review (2026-07-01) – real-account only
+(From `trading-risk-manager`, reviewing commit `de91b2b` – AUTO mode auto-submits the pre-staged break-direction
+limit on a Controller fire. **Posture verified against the code, not the summary:** AUTO arms ONLY via `TryArmAuto`
+(`IsSimAccount` fail-closed + an ATM template picked); every account/instrument switch and a manual **Flat**
+force-disarm; the fire path routes through the UNCHANGED `TryAutoFire` – `ValidateForSubmit` – `CanTrade` – `SubmitLimit`
+– `SubmitRaw` choke – a strict *superset* of the manual click's validations (`ValidateForSubmit` runs twice), no
+skipped check, no new NT8 Account/Order API. **Containment holds:** `_autoArmed` is set only after the `IsSimAccount`
+gate and cleared on every account switch, so AUTO can neither arm nor fire on a non-Sim account. **Sim/Playback
+clearance STANDS.** The items below are the hard preconditions before AUTO may EVER arm on a real account – on top
+of F1–F19, which ALL reopen in the unattended context.)
+- **F20 (BLOCKER) – new:** the mandatory-ATM invariant is enforced at ARM time but NOT at FIRE time. `TryArmAuto`
+  requires an ATM template, yet `SubmitRaw` re-reads `_atmSelector.SelectedAtmStrategy` at submit and **silently
+  degrades to a naked plain `Account.Submit` when it is null** – there is no `isAuto` guard requiring a bracket (the
+  exact degrade-to-plain fallback the F1 re-scope said must be hard-blocked). `_atmUserPicked`/`_autoArmed` only clear
+  on DropDownClosed-None / account / instrument switch; a selector that self-clears its selection by ANY OTHER route
+  (e.g. after a `StartAtmStrategy`'d ATM completes and the selector reverts, or an async repopulate that deselects
+  without raising `DropDownClosed`) leaves AUTO armed with no template. Failure scenario: fire #1 attaches the ATM and
+  fills; the ATM's target/stop closes the position; guard 2 (busy) clears the instant it goes flat; fire #2 auto-opens
+  an **unattended entry with no server-resting stop** – and the 15s auto-cancel only kills an *unfilled* entry, never
+  a *filled* naked position. On real this is the F1 catastrophe put on autopilot. Fix: `TryAutoFire` must assert
+  `_atmSelector.SelectedAtmStrategy != null` (belt to the `DropDownClosed` suspenders – force-disarm + Diag if the
+  template was lost), AND `SubmitRaw`'s degrade-to-plain branch must be hard-blocked for any `isAuto`/entry order
+  (mandate a bracket or refuse the submit). *Sim/Playback: **fix now** – it is a ~2-line guard and a naked
+  auto-position corrupts the very calibration data AUTO exists to gather.*
+- **F21 (BLOCKER) – new:** no connection-loss / session handling for a WORKING auto order. A disconnect or session
+  close with a resting AUTO limit (or an AUTO entry mid-attach) has no handler; worse, `MaybeAutoCancel` ages against
+  the market-data clock (`_now`), which STOPS advancing on a data disconnect – so the 15s auto-cancel never fires and
+  an unattended auto order can rest/fill across the gap. Before real (ties F8): gate the auto-fire on
+  `Connection.Status == Connected`, cancel working auto orders on disconnect, and reconcile working orders/position on
+  reconnect before AUTO re-enables.
+- **F22 (BLOCKER) – new:** AUTO must not ARM on real until (a) the Rec-CSV pass (spec §9) validates every threshold it
+  fires on – the Controller's AND `AutoFireCapPerDay`/`AutoStaleTicks`/`AutoCancelSeconds`, all placeholders today –
+  against baseline; (b) N documented profitable Sim/Playback sessions exist; and (c) a **per-session realized-loss cap
+  force-disarms AUTO** (automation needs its own cumulative-loss kill-switch, distinct from the per-trade F9). If the
+  real target is a **prop firm**, F9 (daily-loss / max-trades / loss-streak cooldown) must gate the AUTO *arm*, not
+  just the manual buttons.
+- **F23 (MAJOR) – new:** cap key + persistence. The daily cap is keyed to the REPLAY date and held in an **in-memory**
+  counter. On real: key it to the session/trading-day in the account's exchange timezone, and make the count survive
+  an add-on reload / platform restart mid-session (persist it, or re-derive from the account's execution history) – an
+  in-memory reset silently re-opens the full 5-fire cap on every reload.
+- **F24 (MAJOR, gating) – new:** explicit `trading-risk-manager` re-review of AUTO-on-real is itself a precondition.
+  AUTO overturns the standing "human always clicks the final submit" pillar; no code path may arm AUTO on a real
+  account until F20–F23 + the reopened F1–F19 are implemented and re-verified against calibrated thresholds in this seat.
+
+**Sim-scope notes (not blockers – recorded for the calibration pass):**
+- **Guard 4 (anti-stale) is effectively inert at fire time.** The pre-stage price is computed from `_lastPrice` and
+  checked against the *same* `_lastPrice` synchronously inside `TryAutoFire`, so `marketableThrough` is false by
+  construction (≤ tolerance always); guard 4 only ever trips on `_lastPrice <= 0`. HARMLESS for AUTO (the immediate
+  submit is non-marketable by construction – unlike F18's *delayed* manual click), but the "F18 essence" comment
+  overclaims: do NOT treat F18's click-time re-clamp as satisfied by guard 4 when porting to real.
+- **Multi-day replay dormancy.** Hitting the cap force-disarms; on crossing into a new replay day guard 1
+  (`!_autoArmed`) returns BEFORE the day-reset runs, so AUTO stays dormant until manually re-armed. The counter does
+  reset, but it is moot until re-arm – risk-reducing, flagged only so it isn't mistaken for a bug.
+- **Defense-in-depth:** `TryAutoFire` trusts `_autoArmed` as the Sim proxy and does not itself re-assert
+  `IsSimAccount(_account)` at fire time (it relies on force-disarm-on-switch). Containment holds today, but a direct
+  `IsSimAccount` re-check in guard 1 would fail-closed at fire time, matching the ARM LIVE philosophy (which re-checks
+  `IsSimAccount` on every submit via `CanTrade`). Cheap hardening.
+
+**Real-money VETO stands; preconditions are now F1(re-scoped)–F24** (F11/F12/F15/F16/F17 done; F1/F2/F6/F7/F14 widened; F13/F14 + F1(bracket-mandate)/F2/F9/F10 + **F18/F19** + **F20–F24 (AUTO)** deferred to the real gate). **The Consumption-Break pre-stage (`43b9934`) and AUTO mode (`de91b2b`) are CLEARED for Sim/Playback only** – verified no auto-submit-to-real path (AUTO arms only on `IsSimAccount`, disarms on every switch/Flat), ARM LIVE + Sim-default intact. **AUTO-on-real stays VETOED** until F20–F24 (+ the reopened F1–F19, plus F9 if prop) are implemented and re-reviewed in this seat. Until then: **Sim/Playback testing only** – and **fix F20 now** so the calibration pass never logs a naked auto-position.
 
 ## AUTO mode (2026-07-01, Sim/Playback only)
 
@@ -114,6 +172,37 @@ guard 4, but the click-time re-check F18 calls for is still unimplemented for th
   only `_autoOrder` lets `OnOrderUpdate`'s terminal-state branch clean up that case.
 - The checkbox+status-label WrapPanel pattern (ARM LIVE, now AUTO) is inlined twice — extract a shared
   helper if a 3rd toggle needs it.
+
+### Hardening (2026-07-01, same-day review round) — F20 fixed for Sim scope, spurious-disarm fixed
+
+Applied after `trading-code-reviewer` (no blockers) and `trading-risk-manager` (F20–F24 above; Sim/Playback
+clearance stands) reviewed `de91b2b`.
+
+- **F20 — DONE for Sim scope.** `TryAutoFire` gained guard 5: asserts `_atmSelector.SelectedAtmStrategy
+  != null` at the actual fire moment (not just at arm time) — force-disarms (`"ATM perdido"`) + Diag's if
+  the template was lost since arming. `SubmitRaw` gained a second, lower-level check: `isAuto &&
+  atm == null` now aborts the submit entirely BEFORE `CreateOrder` — no order, no degrade-to-plain — so an
+  auto entry can never go out naked even if guard 5 were somehow bypassed. Manual clicks are unaffected
+  (still degrade to plain on ATM-attach failure per F17 — a human is watching those). F21–F24 (connection
+  loss, real-arm preconditions, cap persistence, and the mandatory risk-manager re-review) remain open and
+  are explicitly out of scope for Sim/Playback.
+- **Guard 1 hardened (defense in depth):** now also re-asserts `IsSimAccount(_account)` at fire time
+  (`ForceDisarmAuto("cuenta no-Sim")` if it fails), mirroring how `CanTrade` re-checks `IsSimAccount` on
+  every manual submit rather than trusting the arm-time check alone.
+- **Spurious AUTO disarm on connection blips — fixed.** `PopulateAccounts` reassigns
+  `_accountCombo.ItemsSource` on every `AccountStatusUpdate`; WPF transiently resets `SelectedItem` to
+  `null` as part of that reassignment, which used to run `OnAccountSelected`'s full account-switch
+  teardown (including `ForceDisarmAuto("cambio de cuenta")`) before the very next line restored the SAME
+  account — silently disarming AUTO on a mere connection blip, not a real switch. Fixed by detaching the
+  (now field-stored, not inline-lambda) `SelectionChanged` handler around the `ItemsSource`/`SelectedItem`
+  reassignment and re-asserting once after: a no-op if the settled selection matches `_account` (the blip
+  case), or the real teardown+setup if it's genuinely different (e.g. the account actually disappeared). A
+  user-driven account switch in the dropdown is untouched — that path never goes through `PopulateAccounts`.
+- Comment corrections: guard 4 no longer claims to implement F18's click-time re-clamp (it's a
+  degenerate-quote guard only — F18's manual-path fix is still open); the daily-cap comment now states the
+  counter burns on every ATTEMPT, including one whose submit later throws (conservative, deliberate).
+
+Gates: `dotnet test` 88/88, `nt8c` staged build 0/0.
 
 ### Sim test checklist for the ATM path (before trusting it)
 1. Open the tab, pick a Sim/Playback account + instrument → confirm the **ATM box shows nothing pre-selected** (blank), i.e. no auto-picked template.

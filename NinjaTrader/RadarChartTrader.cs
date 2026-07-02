@@ -102,6 +102,7 @@ namespace TradingRadar.NT
         private DateTime _autoSubmittedAt;        // replay time of that auto-submit, for the auto-cancel timeout
 
         private readonly ComboBox _accountCombo = new ComboBox { Margin = new Thickness(0, 0, 6, 0) };
+        private SelectionChangedEventHandler _accountSelectionHandler;   // see PopulateAccounts
         private readonly CheckBox _armChk = new CheckBox { Content = "ARM LIVE", Visibility = Visibility.Collapsed,
             Foreground = Coral, FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
             VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 2, 6, 0) };
@@ -171,7 +172,10 @@ namespace TradingRadar.NT
             _accountCombo.Background = Ink;
             _accountCombo.Foreground = TextCol;
             _accountCombo.HorizontalAlignment = HorizontalAlignment.Stretch;
-            _accountCombo.SelectionChanged += (o, e) => OnAccountSelected();
+            // Stored (not an inline lambda) so PopulateAccounts can detach/reattach it around the
+            // ItemsSource reassignment blip — see PopulateAccounts.
+            _accountSelectionHandler = (o, e) => OnAccountSelected();
+            _accountCombo.SelectionChanged += _accountSelectionHandler;
             _armChk.Checked   += (o, e) => { _armedFor = _account; RefreshArmUi(); };
             _armChk.Unchecked += (o, e) => { _armedFor = null; RefreshArmUi(); };
             _autoChk.Checked   += (o, e) => { if (!_suppressAutoChkEvent) TryArmAuto(); };
@@ -452,7 +456,13 @@ namespace TradingRadar.NT
         // `tick` is passed in from OnSetupFire's own EffectiveTick() call — same fire event, same tick.
         private void TryAutoFire(FireEvent f, bool isBuy, double tick)
         {
-            if (!_autoArmed) return;                                     // guard 1
+            if (!_autoArmed) return;                                     // guard 1a
+            if (!IsSimAccount(_account))                                  // guard 1b: re-assert Sim at fire time
+            {
+                Diag("AUTO skip — account no longer Sim at fire time.");  // fail-closed, mirrors CanTrade's per-submit re-check
+                ForceDisarmAuto("cuenta no-Sim");
+                return;
+            }
             if (!ValidateForSubmit()) return;                            // no instrument/account, order in flight, not Sim/armed (Diag'd inside)
             if (_activeLimit != null || !IsFlat(CurrentPosition()))         // guard 2: busy
             {
@@ -462,22 +472,36 @@ namespace TradingRadar.NT
 
             DateTime day = f.Time.Date;                                  // REPLAY time — a new replay day resets the count
             if (day != _autoFireDay) { _autoFireDay = day; _autoFireCount = 0; }
-            if (_autoFireCount >= AutoFireCapPerDay)                      // guard 3: daily cap
-            {
+            if (_autoFireCount >= AutoFireCapPerDay)                      // guard 3: daily cap (burns on every ATTEMPT below,
+            {                                                             // including one whose submit throws — conservative, deliberate)
                 string capStatus = _autoFireCount + "/" + AutoFireCapPerDay;
                 Diag("AUTO skip — daily cap " + capStatus + " reached.");
                 ForceDisarmAuto("cap " + capStatus);   // route through the one disarm gate
                 return;
             }
 
-            // guard 4: anti-stale (F18 essence) — a fire whose pre-stage is already marketable-through
-            // beyond tolerance must not become an unconditional marketable entry (F18's late-signal case).
+            // guard 4: degenerate-quote guard, not F18's click-time re-clamp — at synchronous auto-submit
+            // the pre-stage price is derived from this SAME _lastPrice a moment earlier in OnSetupFire, so
+            // marketableThrough is false by construction; this only catches _lastPrice<=0 (no context yet).
+            // F18's actual click-time re-clamp is for the MANUAL path and is still unimplemented — required
+            // before any real-account port (see docs/plans/2026-06-30-chart-trader.md).
             bool marketableThrough = isBuy
                 ? _pendingSetup.Price - _lastPrice > AutoStaleTicks * tick
                 : _lastPrice - _pendingSetup.Price > AutoStaleTicks * tick;
             if (_lastPrice <= 0 || marketableThrough)
             {
                 Diag(string.Format("AUTO skip — stale at fire (setup {0:0.00} vs mid {1:0.00}).", _pendingSetup.Price, _lastPrice));
+                return;
+            }
+
+            // guard 5 (F20): the ATM template must still be selected at the actual fire moment, not just
+            // at arm time — if it deselected since (async repopulate, or the selector reset after some
+            // other ATM completed), an auto entry must NEVER go out naked. SubmitRaw enforces this again
+            // at the actual submit instant (defense in depth); this is the earlier, cheaper trip.
+            if (_atmSelector.SelectedAtmStrategy == null)
+            {
+                Diag("AUTO skip — ATM lost at fire time.");
+                ForceDisarmAuto("ATM perdido");
                 return;
             }
 
@@ -613,16 +637,32 @@ namespace TradingRadar.NT
             Dispatcher.InvokeAsync((Action)PopulateAccounts);
         }
 
+        // Fires on every AccountStatusUpdate (connection blips included), not just a real account list
+        // change. WPF transiently resets SelectedItem -> null when ItemsSource is reassigned to a fresh
+        // collection; left attached through that, the blip's SelectionChanged ran OnAccountSelected's
+        // full teardown (Cancel/Unsubscribe/ForceDisarmAuto) even though the very next line below just
+        // restores the SAME account — silently disarming AUTO on a mere connection blip. Detach for the
+        // reassignment, then re-assert once: a no-op if the settled selection == _account (the blip
+        // case), or the real switch teardown+setup if it's genuinely different (account actually removed).
         private void PopulateAccounts()
         {
             List<Account> accts;
             lock (Account.All) accts = Account.All.ToList();
             Account keep = _accountCombo.SelectedItem as Account;
-            _accountCombo.ItemsSource = accts;
-            if (keep != null && accts.Contains(keep))
-                _accountCombo.SelectedItem = keep;
-            else
-                _accountCombo.SelectedItem = accts.FirstOrDefault(IsSimAccount) ?? accts.FirstOrDefault();
+            _accountCombo.SelectionChanged -= _accountSelectionHandler;
+            try
+            {
+                _accountCombo.ItemsSource = accts;
+                if (keep != null && accts.Contains(keep))
+                    _accountCombo.SelectedItem = keep;
+                else
+                    _accountCombo.SelectedItem = accts.FirstOrDefault(IsSimAccount) ?? accts.FirstOrDefault();
+            }
+            finally
+            {
+                _accountCombo.SelectionChanged += _accountSelectionHandler;
+            }
+            OnAccountSelected();
         }
 
         private void OnAccountSelected()
@@ -1055,6 +1095,11 @@ namespace TradingRadar.NT
             // F16: ATM only attaches once the user has actually picked one via the dropdown (DropDownClosed) —
             // a stale/auto-selected SelectedAtmStrategy from the control's own async repopulate never attaches.
             NinjaTrader.NinjaScript.AtmStrategy atm = (isEntry && _atmUserPicked) ? _atmSelector.SelectedAtmStrategy : null;
+            // F20 (defense in depth): TryAutoFire's guard 5 already checks the ATM at fire time, but this
+            // is the actual submit instant — an AUTO entry must NEVER go out naked. Abort before CreateOrder
+            // (no order at all), unlike the atm-attach-failure branch below, which only degrades a MANUAL
+            // entry to plain because a human is watching it.
+            if (isAuto && atm == null) { Diag("AUTO blocked — no ATM at submit; refusing a naked auto entry."); return; }
             // ATM requires the entry order's CreateOrder "name" argument to be EXACTLY "Entry" (NT8 docs).
             string orderName = atm != null ? "Entry" : tag;
             try
