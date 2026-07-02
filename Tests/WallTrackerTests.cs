@@ -173,4 +173,11 @@ public class WallTrackerTests
     {
         Assert.Equal(0, WallTracker.TrustedSize(false, 1.5, 500, 1.0));
     }
+
+    // Pins the strict `<` at the exact boundary — an accidental `<=` would extend trust one tick.
+    [Fact]
+    public void TrustedSize_boundary_age_equal_to_window_is_not_trusted()
+    {
+        Assert.Equal(0, WallTracker.TrustedSize(false, 1.0, 500, 1.0));
+    }
 }
