@@ -31,6 +31,15 @@ namespace TradingRadar.Engine
         // the wall-identity guard (>= 1 tick move => abandon) exactly when the setup matures.
         public double LongWallPrice;
         public double ShortWallPrice;
+        // Fix 3 (day-1 capture observability): per-candidate diagnostics, not consumed by any decision
+        // logic — just surfaced for the next Rec capture. DistTicks follows the same validity rule as
+        // *WallPrice (0 unless that side is Armed/Countdown/Fired); HoldCount/CooldownUntil are verbatim.
+        public int LongHoldCount;
+        public int ShortHoldCount;
+        public double LongDistTicks;
+        public double ShortDistTicks;
+        public DateTime LongCooldownUntil;
+        public DateTime ShortCooldownUntil;
     }
 
     // All placeholders — measured from Rec CSV (spec §9). No literal threshold lives in logic.
@@ -39,7 +48,9 @@ namespace TradingRadar.Engine
         public long SignificanceBand = 60;       // min wall size to arm (contracts) — MEASURED
         public double MinTradeBackedRatio = 0.6; // fraction of the drop that trades must explain
         public double FireFrac = 0.7;            // consumption fraction to fire
-        public long DeltaFloor = 8;              // |AggressorDelta| agreeing to confirm
+        // MEASURED day-1 ES (2026-06-22): 8 passed ~50% of rows (no signal); 30 ≈ p66/p82 — provisional
+        // until Countdown-conditional data exists
+        public long DeltaFloor = 30;              // |AggressorDelta| agreeing to confirm
         public double ZFloor = 1.5;              // tape-speed z-score to confirm
         public int K = 3;                        // consecutive snapshots meeting fire pre-conditions
         public double ReloadFrac = 0.25;         // refill above running-min (as frac of peak) => reload veto
@@ -101,6 +112,12 @@ namespace TradingRadar.Engine
                 : default(FireEvent);
             o.LongWallPrice = IsIdentityHeld(_long.State) ? _long.WallPrice : 0;
             o.ShortWallPrice = IsIdentityHeld(_short.State) ? _short.WallPrice : 0;
+            o.LongHoldCount = _long.HoldCount;
+            o.ShortHoldCount = _short.HoldCount;
+            o.LongDistTicks = IsIdentityHeld(_long.State) ? Math.Abs(inp.Mid - _long.WallPrice) / _tick : 0;
+            o.ShortDistTicks = IsIdentityHeld(_short.State) ? Math.Abs(inp.Mid - _short.WallPrice) / _tick : 0;
+            o.LongCooldownUntil = _long.CooldownUntil;
+            o.ShortCooldownUntil = _short.CooldownUntil;
             return o;
         }
 
@@ -210,6 +227,9 @@ namespace TradingRadar.Engine
             ConsumptionRead r = ConsumptionTracker.Read(wallSide, c.WallPrice, c.Peak, cur, c.ArmTime, inp.Book);
             c.Fraction = r.Fraction; c.TradeBackedFraction = r.TradeBackedFraction;
             if (r.Fraction <= 0 || r.Drop < _cfg.MinDropBand) return; // nothing eaten yet, or sub-band jitter — stay Armed
+            // ponytail: reuse AwayTicks (no new knob) — too far from the wall to judge trade-backing
+            // (TradedAt only matches prints AT the wall); far thinning stays Armed, never pull-vetoes.
+            if (Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick) return;
             if (r.TradeBackedFraction >= _cfg.MinTradeBackedRatio)
                 c.State = SideState.Countdown;
             else

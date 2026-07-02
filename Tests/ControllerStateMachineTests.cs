@@ -37,6 +37,18 @@ public class ControllerStateMachineTests
         Assert.False(o.Fired);
     }
 
+    // Fix 1 (root cause): a far-away drop (mid outside AwayTicks) must NOT pull-veto — TradedAt only
+    // matches trades printed AT the wall, so judging trade-backing at a distance is tautologically 0.
+    // Stay Armed instead of falsely vetoing to Cooldown (day-1: 94.2%/91.2% of all vetoes were this).
+    [Fact]
+    public void Far_away_drop_stays_armed_no_trade_backed_judgement()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 98.50, 1, EmptyBook()));         // arm, mid 7 ticks from wall (>= AwayTicks)
+        var o = m.Update(In(100.25, 30, 0, 0, 0, 0, 0, 98.50, 2, EmptyBook())); // big drop, no trades, still far -> stays Armed
+        Assert.Equal(SideState.Armed, o.Long);
+    }
+
     // A wall below significance does not arm.
     [Fact]
     public void Does_not_arm_when_wall_below_significance()
@@ -89,7 +101,7 @@ public class ControllerStateMachineTests
         for (int s = 3; s <= 8; s++)                                      // hold several snapshots (K=3)
         {
             var b = BookWithBuys(100.25, 90, s);
-            o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: 2.0, alt: 0, mid: 100.00, sec: s, book: b));
+            o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: s, book: b));
             if (o.Fired) fires++;
         }
         Assert.Equal(1, fires);                       // one-shot
@@ -120,7 +132,7 @@ public class ControllerStateMachineTests
         {
             var b = BookWithBuys(100.25, 90, s);
             // z below ChopSlowZ and alternations above ChopAltCount => CHOP, must not fire despite 75% eaten + buys.
-            var o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: -0.5, alt: 4, mid: 100.00, sec: s, book: b));
+            var o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: -0.5, alt: 4, mid: 100.00, sec: s, book: b));
             Assert.True(o.Chop);
             Assert.False(o.Fired);
         }
@@ -138,7 +150,7 @@ public class ControllerStateMachineTests
         for (int s = 2; s <= 8; s++)
         {
             var b = BookWithBuys(100.25, 90, s);                          // 75% eaten, fully trade-backed
-            var o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: 2.0, alt: 4, mid: 100.00, sec: s, book: b));
+            var o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 4, mid: 100.00, sec: s, book: b));
             if (o.Fired) fires++;
             Assert.True(o.Chop);        // z=2.0 <= ChopSlowZ=3.0 AND alt=4 >= ChopAltCount=3
         }
@@ -187,7 +199,7 @@ public class ControllerStateMachineTests
         var m = Machine();
         m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));            // arm
         int fires = 0; ControllerOutput o = default(ControllerOutput);
-        for (int s = 2; s <= 8; s++) { var b = BookWithBuys(100.25, 90, s); o = m.Update(In(100.25, 30, 0, 0, 20, 2.0, 0, 100.00, s, b)); if (o.Fired) fires++; }
+        for (int s = 2; s <= 8; s++) { var b = BookWithBuys(100.25, 90, s); o = m.Update(In(100.25, 30, 0, 0, 40, 2.0, 0, 100.00, s, b)); if (o.Fired) fires++; }
         Assert.Equal(1, fires);
         Assert.Equal(SideState.Fired, o.Long);
         // Price breaks up and holds well past the wall -> reset to Waiting.
@@ -249,7 +261,7 @@ public class ControllerStateMachineTests
         var m = Machine();
         m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));
         int fires = 0; ControllerOutput o = default(ControllerOutput);
-        for (int s = 2; s <= 8; s++) { var b = BookWithBuys(100.25, 90, s); o = m.Update(In(100.25, 30, 0, 0, 20, 2.0, 0, 100.00, s, b)); if (o.Fired) fires++; }
+        for (int s = 2; s <= 8; s++) { var b = BookWithBuys(100.25, 90, s); o = m.Update(In(100.25, 30, 0, 0, 40, 2.0, 0, 100.00, s, b)); if (o.Fired) fires++; }
         Assert.Equal(1, fires);
         Assert.Equal(SideState.Fired, o.Long);
         // False break: price reverses back below the wall by more than AwayTicks; wall still present (cur>0).
@@ -271,7 +283,7 @@ public class ControllerStateMachineTests
         var m = Machine();
         m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));                // arm Long
         ControllerOutput o = default(ControllerOutput);
-        for (int s = 2; s <= 8; s++) { var b = BookWithBuys(100.25, 90, s); o = m.Update(In(100.25, 30, 0, 0, 20, 2.0, 0, 100.00, s, b)); }
+        for (int s = 2; s <= 8; s++) { var b = BookWithBuys(100.25, 90, s); o = m.Update(In(100.25, 30, 0, 0, 40, 2.0, 0, 100.00, s, b)); }
         Assert.Equal(SideState.Fired, o.Long);
         Assert.Equal(Side.Ask, o.Fire.Side);
 
@@ -281,7 +293,7 @@ public class ControllerStateMachineTests
         for (int s = 11; s <= 14; s++)                                                    // fires at s=13, latches
         {
             var b = BookWithSells(99.75, 90, s);
-            o = m.Update(In(100.25, 30, 99.75, 30, delta: -20, z: 2.0, alt: 0, mid: 100.00, sec: s, book: b));
+            o = m.Update(In(100.25, 30, 99.75, 30, delta: -40, z: 2.0, alt: 0, mid: 100.00, sec: s, book: b));
         }
         Assert.Equal(SideState.Fired, o.Short);
         Assert.False(o.Fired);                    // s=14 is a non-firing tick after the fire
@@ -333,7 +345,7 @@ public class ControllerStateMachineTests
         for (int s = 3; s <= 4; s++)
         {
             var b = BookWithBuys(100.25, 90, s);
-            o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: 2.0, alt: 0, mid: 100.00, sec: s, book: b));
+            o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: s, book: b));
             if (o.Fired) fires++;
         }
         Assert.Equal(SideState.Countdown, o.Long);
@@ -346,15 +358,15 @@ public class ControllerStateMachineTests
 
         // One good snapshot after the interruption must NOT fire — the counter restarted.
         var bGood1 = BookWithBuys(100.25, 90, 6);
-        o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: 2.0, alt: 0, mid: 100.00, sec: 6, book: bGood1));
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 6, book: bGood1));
         Assert.False(o.Fired);
 
         // Two more consecutive good snapshots complete a fresh K=3 -> fires.
         var bGood2 = BookWithBuys(100.25, 90, 7);
-        o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: 2.0, alt: 0, mid: 100.00, sec: 7, book: bGood2));
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 7, book: bGood2));
         Assert.False(o.Fired);
         var bGood3 = BookWithBuys(100.25, 90, 8);
-        o = m.Update(In(100.25, 30, 0, 0, delta: 20, z: 2.0, alt: 0, mid: 100.00, sec: 8, book: bGood3));
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 8, book: bGood3));
         Assert.True(o.Fired);
     }
 
@@ -407,5 +419,21 @@ public class ControllerStateMachineTests
         Assert.Equal(SideState.Waiting, o3.Long);
         Assert.Equal(0, o3.LongFraction);
         Assert.False(o3.Fired);
+    }
+
+    // Day-1 calibration Fix 3: per-candidate observability (HoldCount/DistTicks) surfaced on
+    // ControllerOutput for the next capture — DistTicks follows *WallPrice's validity rule (held
+    // while Armed/Countdown/Fired, 0 otherwise), HoldCount is verbatim.
+    [Fact]
+    public void Exposes_hold_count_and_dist_ticks_while_armed_then_clears_on_abandon()
+    {
+        var m = Machine();
+        var o1 = m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 98.50, 1, EmptyBook())); // arm, mid 7 ticks from wall
+        Assert.Equal(SideState.Armed, o1.Long);
+        Assert.Equal(0, o1.LongHoldCount);
+        Assert.Equal(7.0, o1.LongDistTicks, 3);
+        var o2 = m.Update(In(100.25, 0, 0, 0, 0, 0, 0, 98.50, 2, EmptyBook()));   // wall vanishes -> abandon
+        Assert.Equal(SideState.Waiting, o2.Long);
+        Assert.Equal(0, o2.LongDistTicks);
     }
 }

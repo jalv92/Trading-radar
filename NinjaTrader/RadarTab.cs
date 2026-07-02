@@ -163,7 +163,8 @@ namespace TradingRadar.NT
                 _sigWriter.WriteLine("time,mid,bidMass,askMass,bestBid,bestAsk,delta15s,wallFrac,wallAbove,wallPx," +
                     "wallAbovePx,wallAboveCur,wallBelowPx,wallBelowCur,consumeFracLong,tradeBackedLong," +
                     "consumeFracShort,tradeBackedShort,printsPerSec,buyVolPerSec,sellVolPerSec,tapeZ,ctrlLong,ctrlShort," +
-                    "ctrlWallAbovePx,ctrlWallAboveSz,ctrlWallBelowPx,ctrlWallBelowSz");
+                    "ctrlWallAbovePx,ctrlWallAboveSz,ctrlWallBelowPx,ctrlWallBelowSz,tapeAlternations," +
+                    "ctrlLongHold,ctrlShortHold,ctrlLongDistTicks,ctrlShortDistTicks,ctrlLongCooldownUntil,ctrlShortCooldownUntil");
                 _sigWriter.Flush();
                 _capture = true;
             };
@@ -496,6 +497,10 @@ namespace TradingRadar.NT
                 Mid = pMid, Now = now, Book = _book
             };
             ControllerOutput cout = _controller.Update(cin);
+            // Day-1 capture gap: a full arm->drop->veto cycle was observed to complete and reset between
+            // two 2s heartbeat rows, leaving no trace in the CSV. Snapshot the state transition BEFORE
+            // _lastCtrl is overwritten below, so the sig writer can force an immediate row on any change.
+            bool ctrlStateChanged = cout.Long != _lastCtrl.Long || cout.Short != _lastCtrl.Short;
             _lastCtrl = cout;   // read by the identity-contract lookup above on the NEXT engine run
             // Task 11: vote-less book-skew context for the Cockpit's demoted reference strip (spec §7) —
             // reuses the same pin assembled above; never a vote, never a trigger. `pin` itself is kept
@@ -548,7 +553,8 @@ namespace TradingRadar.NT
                             _prevStates[key] = n.State;
                         }
                     }
-                    if (_lastMidLog == DateTime.MinValue || (now - _lastMidLog).TotalSeconds >= 2)
+                    bool heartbeat = _lastMidLog == DateTime.MinValue || (now - _lastMidLog).TotalSeconds >= 2;
+                    if (heartbeat)
                     {
                         _lastMidLog = now;
                         _capWriter.WriteLine(string.Format(
@@ -556,44 +562,52 @@ namespace TradingRadar.NT
                             "{0},mid,,,,,,,,,,{1:0.00},{2},{3}",
                             now.ToString("o"), mid, medBid, medAsk));
                         _capWriter.Flush();
-                        // enhanced PressureInputs snapshot (Plan D measurement)
-                        if (_capture && _sigWriter != null)
-                        {
-                            var bids = _book.Levels(Side.Bid); var asks = _book.Levels(Side.Ask);
-                            long bidMass = 0, askMass = 0;
-                            for (int i = 0; i < bids.Count; i++) bidMass += bids[i].Volume;
-                            for (int i = 0; i < asks.Count; i++) askMass += asks[i].Volume;
-                            DepthLevel bb, ba;
-                            long bestBid = _book.TryBestBid(out bb) ? bb.Volume : 0;
-                            long bestAsk = _book.TryBestAsk(out ba) ? ba.Volume : 0;
-                            long delta15 = _book.AggressorDelta(now.AddSeconds(-15));
-                            // nearest wall erosion to the inside (max |frac|); 0 if none
-                            double wf = 0.0, wpx = 0.0; bool wabove = false;
-                            var er = _tracker.ErosionReads(_book, now);
-                            for (int i = 0; i < er.Count; i++)
-                                if (er[i].Approaching && er[i].Frac > wf)
-                                { wf = er[i].Frac; wpx = er[i].Price; wabove = er[i].Price > mid; }
-                            // consumeFracLong/Short and tradeBackedLong/Short are both the Controller's own
-                            // authoritative reads (ControllerOutput.LongFraction/LongTradeBacked etc — already
-                            // correctly zeroed on abandon, see ControllerStateMachine). wallAbovePx/wallBelowPx
-                            // above are the raw recomputed dominant wall, which during Armed/Countdown is a
-                            // DIFFERENT price level than the one the fractions describe (the identity-pinned
-                            // armed wall) — log that identity-pinned feed too (ctrlWallAbove*/ctrlWallBelow*,
-                            // the exact values passed to _controller.Update this run) so calibration can tell
-                            // the two apart instead of silently mixing levels.
-                            _sigWriter.WriteLine(string.Format(System.Globalization.CultureInfo.InvariantCulture,
-                                "{0},{1:0.00},{2},{3},{4},{5},{6},{7:0.000},{8},{9:0.00}," +
-                                "{10:0.00},{11},{12:0.00},{13},{14:0.000},{15:0.000},{16:0.000},{17:0.000}," +
-                                "{18},{19},{20},{21:0.000},{22},{23}," +
-                                "{24:0.00},{25},{26:0.00},{27}",
-                                now.ToString("o"), mid, bidMass, askMass, bestBid, bestAsk, delta15, wf, wabove, wpx,
-                                wallAbovePx, wallAboveSz, wallBelowPx, wallBelowSz,
-                                cout.LongFraction, cout.LongTradeBacked, cout.ShortFraction, cout.ShortTradeBacked,
-                                win1s.Prints, win1s.BuyVol, win1s.SellVol, _tape.ZScore,
-                                cout.Long, cout.Short,
-                                ctrlWallAbovePx, ctrlWallAboveSz, ctrlWallBelowPx, ctrlWallBelowSz));
-                            _sigWriter.Flush();
-                        }
+                    }
+                    // enhanced PressureInputs snapshot (Plan D measurement) — on the 2s heartbeat, OR
+                    // immediately when either side's SideState changed this run (ctrlStateChanged, captured
+                    // above before _lastCtrl was overwritten). Day-1 capture proved a full arm->drop->veto
+                    // cycle can complete and vanish between two heartbeat rows; the event trigger guarantees
+                    // every transition lands a row without touching the heartbeat's own cadence.
+                    if (_capture && _sigWriter != null && (heartbeat || ctrlStateChanged))
+                    {
+                        var bids = _book.Levels(Side.Bid); var asks = _book.Levels(Side.Ask);
+                        long bidMass = 0, askMass = 0;
+                        for (int i = 0; i < bids.Count; i++) bidMass += bids[i].Volume;
+                        for (int i = 0; i < asks.Count; i++) askMass += asks[i].Volume;
+                        DepthLevel bb, ba;
+                        long bestBid = _book.TryBestBid(out bb) ? bb.Volume : 0;
+                        long bestAsk = _book.TryBestAsk(out ba) ? ba.Volume : 0;
+                        long delta15 = _book.AggressorDelta(now.AddSeconds(-15));
+                        // nearest wall erosion to the inside (max |frac|); 0 if none
+                        double wf = 0.0, wpx = 0.0; bool wabove = false;
+                        var er = _tracker.ErosionReads(_book, now);
+                        for (int i = 0; i < er.Count; i++)
+                            if (er[i].Approaching && er[i].Frac > wf)
+                            { wf = er[i].Frac; wpx = er[i].Price; wabove = er[i].Price > mid; }
+                        // consumeFracLong/Short and tradeBackedLong/Short are both the Controller's own
+                        // authoritative reads (ControllerOutput.LongFraction/LongTradeBacked etc — already
+                        // correctly zeroed on abandon, see ControllerStateMachine). wallAbovePx/wallBelowPx
+                        // above are the raw recomputed dominant wall, which during Armed/Countdown is a
+                        // DIFFERENT price level than the one the fractions describe (the identity-pinned
+                        // armed wall) — log that identity-pinned feed too (ctrlWallAbove*/ctrlWallBelow*,
+                        // the exact values passed to _controller.Update this run) so calibration can tell
+                        // the two apart instead of silently mixing levels.
+                        _sigWriter.WriteLine(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                            "{0},{1:0.00},{2},{3},{4},{5},{6},{7:0.000},{8},{9:0.00}," +
+                            "{10:0.00},{11},{12:0.00},{13},{14:0.000},{15:0.000},{16:0.000},{17:0.000}," +
+                            "{18},{19},{20},{21:0.000},{22},{23}," +
+                            "{24:0.00},{25},{26:0.00},{27},{28}," +
+                            "{29},{30},{31:0.00},{32:0.00},{33},{34}",
+                            now.ToString("o"), mid, bidMass, askMass, bestBid, bestAsk, delta15, wf, wabove, wpx,
+                            wallAbovePx, wallAboveSz, wallBelowPx, wallBelowSz,
+                            cout.LongFraction, cout.LongTradeBacked, cout.ShortFraction, cout.ShortTradeBacked,
+                            win1s.Prints, win1s.BuyVol, win1s.SellVol, _tape.ZScore,
+                            cout.Long, cout.Short,
+                            ctrlWallAbovePx, ctrlWallAboveSz, ctrlWallBelowPx, ctrlWallBelowSz, cin.TapeAlternations,
+                            cout.LongHoldCount, cout.ShortHoldCount, cout.LongDistTicks, cout.ShortDistTicks,
+                            cout.LongCooldownUntil == DateTime.MinValue ? "" : cout.LongCooldownUntil.ToString("o"),
+                            cout.ShortCooldownUntil == DateTime.MinValue ? "" : cout.ShortCooldownUntil.ToString("o")));
+                        _sigWriter.Flush();
                     }
                 }
                 catch { }

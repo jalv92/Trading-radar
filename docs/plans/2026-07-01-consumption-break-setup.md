@@ -1235,3 +1235,15 @@ Verify in Playback: on a fire, the ticket pre-fills the correct side/price and t
 **2. Inline Execution** — execute tasks in this session with `executing-plans`, batching engine Tasks 1–8 (testable here) with checkpoints, and pausing at Task 9 for the Windows-only NT layer.
 
 **Which approach?**
+
+---
+
+## Day-1 calibration outcome (2026-07-01)
+
+One full Replay day (ES, `lr-signals-*.csv`) produced ZERO fires across 14,932 snapshots — root cause confirmed by trace, not guessed. Three fixes applied:
+
+- **Proximity gate before the trade-backed judgment** (root cause) — `AdvanceArmedOrCountdown` was pull-vetoing to Cooldown on *every* far-away thinning (94.2%/91.2% of the day's vetoes, median distance 6.1/6.5 ticks) because `BookMirror.TradedAt` only matches trades printed AT the wall price; judging trade-backing from 6+ ticks away is tautologically 0. Now reuses `AwayTicks` (no new knob) to skip the trade-backed decision entirely while mid sits far from the wall — Countdown was unreachable before this, reachable now.
+- **`ControllerConfig.DeltaFloor` 8 → 30** — measured day-1: the old floor passed ~50% of rows (coin-flip, no confirmation value); 30 ≈ p66/p82, tightening the agreeing-delta gate. Provisional until Countdown-conditional data exists (today's capture never reached Countdown often enough to measure the gate in the state it actually matters).
+- **Capture observability** — `ControllerOutput` gained `LongHoldCount/ShortHoldCount`, `LongDistTicks/ShortDistTicks`, `LongCooldownUntil/ShortCooldownUntil`; the `RadarTab` sig writer gained matching CSV columns plus a `tapeAlternations` column, and now writes an immediate event-triggered row on any `cout.Long`/`cout.Short` state change (in addition to the 2s heartbeat) — today's capture proved a full arm→drop→veto cycle can complete and vanish between two heartbeat rows.
+
+Everything else in this plan stays a placeholder pending a post-fix capture — the day-1 data was collected under the broken proximity gate, so the FireFrac/MinTradeBackedRatio/ZFloor/ReloadFrac calibration table above is not yet trustworthy and needs a fresh Replay session with these fixes live.
