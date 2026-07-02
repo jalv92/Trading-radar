@@ -28,11 +28,14 @@ tautologically unsatisfiable at distance:
 - `ConsumptionTracker.Read` / `TradedAt` / `InferAggressor` were read line-by-line: no
   arithmetic/matching defect. Missing precondition, not broken measurement.
 
-**Fix (commit `34295fe`):** proximity gate in `AdvanceArmedOrCountdown` — the Countdown/Cooldown
-decision only runs when `|Mid − WallPrice| < AwayTicks × tick`; far thinning stays Armed
-(Peak/Min and Fraction/TradeBackedFraction telemetry keep updating). Reuses `AwayTicks` — no new
-knob — and by construction Countdown can now only be entered near-touch, which also resolves the
-"instant away-abandon on Countdown entry" concern.
+**Fix (commits `34295fe` + `0d9a63a`):** proximity gate in `AdvanceArmedOrCountdown` — the
+Countdown/Cooldown decision only runs when `|Mid − WallPrice| < AwayTicks × tick`. While far, the
+candidate stays Armed and **re-baselines** `Peak = Min = cur` every tick (Fraction/TradeBacked
+read 0 — nothing judgeable yet), so the judgment on arrival spans ONLY the approach window —
+far-away cancel churn cannot force an instant pull-veto at the touch (the review caught that
+first version, which kept accumulating Peak while far, just deferred the tautology). Reuses
+`AwayTicks` — no new knob — and by construction Countdown can only be entered near-touch, which
+also resolves the "instant away-abandon on Countdown entry" concern.
 
 ## Config decisions (day-1)
 
