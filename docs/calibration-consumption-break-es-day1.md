@@ -280,6 +280,11 @@ round — only the persistence rule moved. Delta near-misses were observed (28 v
 floor -30) but **NOT acted on** at n=2 — far too thin to move a threshold on, same bar as round 3's
 n=3 grid.
 
+**Round-5 correction:** those "delta near-misses" were misread — the SIGN was against the setup
+(delta +28 of BUYERS on a SHORT candidate that requires ≤ −30; −19 of sellers on a LONG requiring
+≥ +30). They were direction-opposed flow, not narrow misses; the delta gate correctly blocked
+counter-flow fires both times. `DeltaFloor` is validated by them, not questioned.
+
 ### Next-run acceptance criteria
 
 1. At least 1 real fire under the new K-window rule, ideally several, to see whether persistence was
@@ -287,4 +292,22 @@ n=3 grid.
 2. `HoldCount`/`ShortHoldCount` in the AUTO log/sig CSV visibly shows a jitter-tolerant progression
    (e.g. 1, 2, 1, 2, 3) instead of resetting to 0 on every dip — confirms the window is live on real
    data, not just in tests.
-3. Re-open the Delta near-miss question only once n grows past single digits.
+3. ~~Re-open the Delta near-miss question~~ Resolved by the round-5 correction above — closed.
+
+## Round 5 (second observable AUTO day — same replay day 06-22, stopped 15:17)
+
+AUTO armed all day (log clean: one arm event, zero fires, zero guard skips — the machine had nothing
+to act on). Countdown gate audit of all 21 rows matched round 4's shape exactly, with one decisive
+addition: **the run stopped at 15:17, and the day's only two full-confluence moments sit at 15:47
+and 16:06** — the segment run simply contained no firing moment at the round-4 bar.
+
+**`FireFrac` 0.7 → 0.6 (calibration-acceleration, Sim).** Across the two observable days, every
+episode with ALL other gates green (delta −309/+524, z > 1.5, trade-backed 1.00, at the wall)
+arrived at consumption 0.62–0.68 and died on FireFrac alone (10:51 SHORT, 13:19 LONG). The round-3
+grid had already singled out 0.6 as the only volume lever without a clear quality cost. At 0.6 this
+run projects ~2 fires. Re-derive once ~15–20 real fires exist; not a validated-quality claim.
+
+**Deterministic prediction for the next run** (falsifiable end-to-end pipeline test): replaying the
+SAME day (2026-06-22) through ~16:10 must produce fires around 10:51 (SHORT), 13:19 (LONG) at the
+new FireFrac, and near 15:47 / 16:06 even at the old bar — each leaving a complete
+prestage→submit→order_update lifecycle in the AUTO log.

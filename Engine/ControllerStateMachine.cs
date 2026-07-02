@@ -53,7 +53,11 @@ namespace TradingRadar.Engine
     {
         public long SignificanceBand = 60;       // min wall size to arm (contracts) — MEASURED
         public double MinTradeBackedRatio = 0.6; // fraction of the drop that trades must explain
-        public double FireFrac = 0.7;            // consumption fraction to fire
+        // MEASURED rounds 3-5 ES: the only quality-neutral volume lever in the 54-cell grid; on 2
+        // independently-observed days, episodes with EVERY other gate green (delta -309/+524, z>1.5,
+        // trade-backed 1.0, at the wall) arrived at frac 0.62-0.68 and died on this gate alone.
+        // Calibration-acceleration setting for Sim — re-derive once ~15-20 real fires exist.
+        public double FireFrac = 0.6;            // consumption fraction to fire
         // MEASURED day-1 ES (2026-06-22): 8 passed ~50% of rows (no signal); 30 ≈ p66/p82 — provisional
         // until Countdown-conditional data exists
         public long DeltaFloor = 30;              // |AggressorDelta| agreeing to confirm
