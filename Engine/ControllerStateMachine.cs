@@ -34,7 +34,12 @@ namespace TradingRadar.Engine
         // Fix 3 (day-1 capture observability): per-candidate diagnostics, not consumed by any decision
         // logic — just surfaced for the next Rec capture. DistTicks stays valid through Cooldown too
         // (round-2: the veto row needs the judgment distance — see DistTicksValid), unlike *WallPrice
-        // which is 0 unless that side is Armed/Countdown/Fired; HoldCount/CooldownUntil are verbatim.
+        // which is 0 unless that side is Armed/Countdown/Fired; CooldownUntil is verbatim.
+        // HoldCount/ShortHoldCount report TWO different counters depending on state (round-4 K window
+        // split them into separate fields on Candidate — see PassBits): while Armed, this is the
+        // veto-dwell consecutive count (unchanged); while Countdown, this is the count of passing
+        // ticks within the last KWindow judged ticks (so the CSV still shows a 1,2,3 progression even
+        // through a jitter dip, instead of resetting to 0).
         public int LongHoldCount;
         public int ShortHoldCount;
         public double LongDistTicks;
@@ -53,7 +58,8 @@ namespace TradingRadar.Engine
         // until Countdown-conditional data exists
         public long DeltaFloor = 30;              // |AggressorDelta| agreeing to confirm
         public double ZFloor = 1.5;              // tape-speed z-score to confirm
-        public int K = 3;                        // consecutive snapshots meeting fire pre-conditions
+        public int K = 3;                        // snapshots meeting fire pre-conditions required within KWindow
+        public int KWindow = 5; // MEASURED round-4 ES: full confluence exists but breaks on single-tick z/frac jitter before 3 consecutive; 3-of-5 keeps sustained-confluence semantics while tolerating 1-2 jitter dips — placeholder, calibrate with fires
         public double ReloadFrac = 0.25;         // refill above running-min (as frac of peak) => reload veto
         public int AwayTicks = 6;                // mid this far from the wall => price fell away
         public double ChopSlowZ = -0.3;          // z at/below this = quiet tape
@@ -74,6 +80,11 @@ namespace TradingRadar.Engine
             public long Min;
             public DateTime ArmTime;
             public int HoldCount;
+            // Round-4 K-window persistence: bitmask of the last KWindow StepCountdown judged-tick
+            // pass/fail results (bit 0 = most recent judged tick). Fire-path state ONLY — kept
+            // separate from HoldCount, which stays the Armed-phase veto-dwell consecutive counter
+            // (round-2, unchanged) so the two never share/clobber each other's semantics.
+            public int PassBits;
             public DateTime CooldownUntil = DateTime.MinValue;
             public double Fraction;
             public double TradeBackedFraction;
@@ -114,8 +125,8 @@ namespace TradingRadar.Engine
                 : default(FireEvent);
             o.LongWallPrice = IsIdentityHeld(_long.State) ? _long.WallPrice : 0;
             o.ShortWallPrice = IsIdentityHeld(_short.State) ? _short.WallPrice : 0;
-            o.LongHoldCount = _long.HoldCount;
-            o.ShortHoldCount = _short.HoldCount;
+            o.LongHoldCount = _long.State == SideState.Countdown ? PassCount(_long.PassBits) : _long.HoldCount;
+            o.ShortHoldCount = _short.State == SideState.Countdown ? PassCount(_short.PassBits) : _short.HoldCount;
             o.LongDistTicks = DistTicksValid(_long.State) ? Math.Abs(inp.Mid - _long.WallPrice) / _tick : 0;
             o.ShortDistTicks = DistTicksValid(_short.State) ? Math.Abs(inp.Mid - _short.WallPrice) / _tick : 0;
             o.LongCooldownUntil = _long.CooldownUntil;
@@ -128,6 +139,14 @@ namespace TradingRadar.Engine
         private static bool IsIdentityHeld(SideState s)
         {
             return s == SideState.Armed || s == SideState.Countdown || s == SideState.Fired;
+        }
+
+        // Round-4 K-window persistence: number of set bits in a PassBits register (<= KWindow, tiny).
+        private static int PassCount(int bits)
+        {
+            int n = 0;
+            while (bits != 0) { n += bits & 1; bits >>= 1; }
+            return n;
         }
 
         // DistTicks additionally stays valid through Cooldown: WallPrice is never cleared on the veto
@@ -185,11 +204,11 @@ namespace TradingRadar.Engine
         {
             double curWallPrice = wallSide == Side.Ask ? inp.WallAbovePrice : inp.WallBelowPrice;
             if (cur <= 0 || System.Math.Abs(curWallPrice - c.WallPrice) >= _tick)
-            { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; return false; }
+            { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; c.PassBits = 0; return false; }
             // The trade ring can no longer prove trades back to ArmTime — re-baseline instead of
             // silently under-counting Traded (which would misroute clean consumption into the pull veto).
             if (inp.Now - c.ArmTime >= inp.Book.TradeRetention)
-            { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; return false; }
+            { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; c.PassBits = 0; return false; }
             if (cur > c.Peak) c.Peak = cur;
             if (cur < c.Min) c.Min = cur;
 
@@ -197,11 +216,11 @@ namespace TradingRadar.Engine
             // are deliberately NOT zeroed here — Cooldown->Waiting (above) zeroes them once the veto elapses,
             // and the frozen value stays readable through Cooldown by the same design as c.Fraction.
             if (cur - c.Min >= _cfg.ReloadFrac * c.Peak)
-            { c.State = SideState.Cooldown; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.HoldCount = 0; return false; }
+            { c.State = SideState.Cooldown; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.HoldCount = 0; c.PassBits = 0; return false; }
 
             // Price fell away from the wall (mid too far) => abandon.
             if (Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick)
-            { c.State = SideState.Waiting; c.HoldCount = 0; c.Fraction = 0; c.TradeBackedFraction = 0; return false; }
+            { c.State = SideState.Waiting; c.HoldCount = 0; c.PassBits = 0; c.Fraction = 0; c.TradeBackedFraction = 0; return false; }
 
             ConsumptionRead r = ConsumptionTracker.Read(wallSide, c.WallPrice, c.Peak, cur, c.ArmTime, inp.Book);
             c.Fraction = r.Fraction; c.TradeBackedFraction = r.TradeBackedFraction;
@@ -209,7 +228,7 @@ namespace TradingRadar.Engine
             bool deltaOk = wallSide == Side.Ask ? inp.AggressorDelta >= _cfg.DeltaFloor
                                                 : inp.AggressorDelta <= -_cfg.DeltaFloor;
             // Fire must be judged where the order will actually be staged — at the wall. Reuses JudgeTicks
-            // (no new knob): without this, HoldCount could keep accumulating while price drifts away
+            // (no new knob): without this, the window could keep accumulating while price drifts away
             // mid-dwell and fire anywhere up to AwayTicks out (round-3 real fire: entered Countdown at 1.5
             // ticks, fired at 5.0 after a fast snap during the K-dwell — the worst of the 3 fires).
             bool nearWall = Math.Abs(inp.Mid - c.WallPrice) / _tick < _cfg.JudgeTicks;
@@ -217,10 +236,16 @@ namespace TradingRadar.Engine
                        && r.TradeBackedFraction >= _cfg.MinTradeBackedRatio
                        && deltaOk && inp.TapeZScore >= _cfg.ZFloor && !chop;
 
-            if (!pre) { c.HoldCount = 0; return false; }
-
-            c.HoldCount++;
-            if (c.HoldCount < _cfg.K) return false;
+            // Round-4 K-window persistence: every surviving (non-abandoned) Countdown tick is judged
+            // — no non-judgeable tick exists here — so every tick shifts the register, pass or fail.
+            // This tolerates 1-2 jitter dips inside KWindow instead of the old "any single miss zeroes
+            // everything" consecutive-hold rule (measured: full confluence existed but never held 3
+            // CONSECUTIVE 20Hz ticks). Fire still requires THIS tick to be a passing, near-wall tick
+            // (the `pre` term below) — the order stages off the CURRENT tick's values, a sustained-but-
+            // stale window must not fire on a tick that itself failed.
+            int mask = (1 << _cfg.KWindow) - 1;
+            c.PassBits = ((c.PassBits << 1) | (pre ? 1 : 0)) & mask;
+            if (!pre || PassCount(c.PassBits) < _cfg.K) return false;
 
             // FIRE — one-shot, latch.
             c.State = SideState.Fired;
@@ -262,7 +287,9 @@ namespace TradingRadar.Engine
             if (r.Fraction <= 0 || r.Drop < _cfg.MinDropBandFrac * c.Peak || distTicks >= _cfg.JudgeTicks)
             { c.HoldCount = 0; return; } // nothing eaten, noise-band jitter, or too far for TradedAt to be trusted — stay Armed, reset veto dwell
             if (r.TradeBackedFraction >= _cfg.MinTradeBackedRatio)
-            { c.State = SideState.Countdown; c.HoldCount = 0; return; }
+            // Entering Countdown zeroes BOTH counters: HoldCount (Armed veto-dwell, unrelated once
+            // here) and PassBits (the fresh K-window fire register — round-4).
+            { c.State = SideState.Countdown; c.HoldCount = 0; c.PassBits = 0; return; }
             // Thinning NOT explained by trades = pull/spoof candidate. Require K CONSECUTIVE judgeable
             // sub-ratio ticks (not one) before conceding the veto — a single sub-ratio read can be a
             // print-matching miss, not a real pull; HoldCount is reset above the instant any tick fails

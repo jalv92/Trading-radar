@@ -235,3 +235,56 @@ didn't exist until now.
    — proof the K-dwell is being exercised by real data, not just by tests.
 6. **No threshold gets declared "validated"** under roughly 15–20 real fires. n=3 was already too
    thin for the grid above; the same bar applies to anything this round's data might suggest.
+
+## Round 4 (first fully-observable AUTO day, 2026-06-22 replay)
+
+The observability package from round 3 worked: the AUTO log is finally readable end-to-end,
+including the 2 failed arm attempts that round 3 could only hypothesize about — **"silent arm
+failure" is CONFIRMED as a real UX gap**, not a theoretical guard. Operators can now see an arm
+attempt fail instead of it vanishing with zero trace.
+
+With the pipe now visible, the funnel got measured properly for the first time: **20+ Countdown
+episodes**, `tradeBacked` **never failed inside Countdown (0/29 rows)** — the day-1 tautology and
+its round-2/round-3 follow-on fixes are holding — and full-confluence moments genuinely **exist**
+(e.g. frac 0.92 / tb 1.00 / delta 195 / z 2.91 / dist 0.5 — every gate passing simultaneously).
+`HoldCount` reached **2 of K=3** at its best point across the whole day. **Zero fires.**
+
+### Root cause: persistence vs 20Hz jitter, not levels
+
+The binding constraint is the CONSECUTIVE-hold requirement, not any threshold. `pre` must hold for
+3 consecutive 20Hz engine ticks (150ms), and `tapeZScore`/`Fraction` jitter tick-to-tick even during
+genuine sustained consumption — a single dip resets `HoldCount` to 0, so the countdown never
+survives to a 3rd consecutive pass despite the underlying setup remaining intact. Thresholds are
+deliberately NOT moving: the round-3 grid already proved loosening Delta/Z makes forward quality
+worse, not better, so tightening the PERSISTENCE rule (not the gates) is the fix.
+
+**Fix (this round):** `Engine/ControllerStateMachine.cs` — replaced the consecutive-hold `HoldCount`
+bookkeeping in `StepCountdown`'s fire path with a K-window shift register (`Candidate.PassBits`):
+every judged tick shifts in a pass/fail bit (capped to the last `KWindow` ticks), and fire requires
+the window to hold `>= K` set bits AND the CURRENT tick to be a passing, near-wall tick. `K` stays
+3; new `ControllerConfig.KWindow = 5` (3-of-5) tolerates 1-2 jitter dips inside a sustained-
+confluence run instead of demanding perfection tick-to-tick. The Armed-phase veto-dwell counter
+(`HoldCount`, round-2, still-consecutive by design) was kept fully separate — the two never share
+state, verified by zeroing both explicitly at the Armed→Countdown transition. Regression tests:
+`Fires_on_3_of_5_window_tolerating_a_single_tick_z_dip`,
+`Never_fires_when_max_passes_in_any_5_window_stays_below_k`,
+`Does_not_fire_on_a_failing_current_tick_even_with_two_prior_passes_in_window`,
+`Single_broken_snapshot_does_not_reset_the_window_fires_on_recovery_within_kwindow` (renamed/
+reworked — its old assertion, that a single broken snapshot resets the count to 0, is no longer the
+behavior; that IS the round-4 fix).
+
+### Config: HOLD, with one non-move noted
+
+`ControllerConfig`'s existing thresholds (Delta/Z/FireFrac/MinTradeBackedRatio) are unchanged this
+round — only the persistence rule moved. Delta near-misses were observed (28 vs floor 30, -19 vs
+floor -30) but **NOT acted on** at n=2 — far too thin to move a threshold on, same bar as round 3's
+n=3 grid.
+
+### Next-run acceptance criteria
+
+1. At least 1 real fire under the new K-window rule, ideally several, to see whether persistence was
+   in fact the whole blocker or whether a fire still needs to clear the order pipe end-to-end.
+2. `HoldCount`/`ShortHoldCount` in the AUTO log/sig CSV visibly shows a jitter-tolerant progression
+   (e.g. 1, 2, 1, 2, 3) instead of resetting to 0 on every dip — confirms the window is live on real
+   data, not just in tests.
+3. Re-open the Delta near-miss question only once n grows past single digits.

@@ -183,14 +183,17 @@ public class ControllerStateMachineTests
         Assert.False(o.Fired);
 
         // Fast snap: mid drifts to 3 ticks away (< AwayTicks(6), so no abandon) with every other term
-        // still passing -> the near-wall gate blocks `pre`, HoldCount resets to 0, no fire.
+        // still passing -> the near-wall gate blocks `pre` this tick, no fire. Round-4: the K-window
+        // register is NOT zeroed by a single miss (only abandon paths reset it) — it shifts in a fail
+        // bit, so the 2 earlier passes stay counted (reported count 2, unchanged from before the drift).
         var bDrift = BookWithBuys(100.25, 90, 5);
         o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 99.50, sec: 5, book: bDrift));
         Assert.Equal(SideState.Countdown, o.Long);
-        Assert.Equal(0, o.LongHoldCount);
+        Assert.Equal(2, o.LongHoldCount);
         Assert.False(o.Fired);
 
-        // Back near the wall with full confluence for a fresh K=3 -> fires.
+        // Back near the wall with full confluence -> fires as soon as the window has K=3 passes AND
+        // the current tick passes (round-4: fires at the first of these ticks, not after a fresh K=3).
         int fires = 0;
         for (int s = 6; s <= 8; s++)
         {
@@ -462,10 +465,14 @@ public class ControllerStateMachineTests
         Assert.Equal(SideState.Armed, oRearm.Long);
     }
 
-    // K-debounce regression: a single snapshot that breaks a fire pre-condition must reset HoldCount
-    // to 0 — firing requires K CONSECUTIVE snapshots, not K total across an interruption.
+    // Round-4 (renamed from K_debounce_resets_on_a_single_broken_snapshot — semantics changed):
+    // the OLD consecutive-hold rule zeroed everything on any single broken snapshot, requiring a
+    // fresh K=3 run to fire. The NEW K-window rule only zeroes the register on an actual Countdown
+    // abandon/veto — a single missed judged tick just shifts in a fail bit and leaves the earlier
+    // passes counted, so recovery one tick later can complete 3-of-5 and fire immediately (this is
+    // the round-4 fix: sustained-but-jittery confluence no longer needs 3 perfectly CONSECUTIVE ticks).
     [Fact]
-    public void K_debounce_resets_on_a_single_broken_snapshot()
+    public void Single_broken_snapshot_does_not_reset_the_window_fires_on_recovery_within_kwindow()
     {
         var m = Machine();
         m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));            // arm peak 120
@@ -473,7 +480,7 @@ public class ControllerStateMachineTests
         m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2));                    // -> Countdown
 
         int fires = 0; ControllerOutput o = default(ControllerOutput);
-        // Two good snapshots (HoldCount 1, 2) — one short of firing (K=3).
+        // Two good snapshots (window count 1, 2) — one short of firing (K=3).
         for (int s = 3; s <= 4; s++)
         {
             var b = BookWithBuys(100.25, 90, s);
@@ -483,23 +490,97 @@ public class ControllerStateMachineTests
         Assert.Equal(SideState.Countdown, o.Long);
         Assert.Equal(0, fires);
 
-        // Interrupt: delta drops below the floor for one snapshot -> HoldCount resets to 0.
+        // Interrupt: delta drops below the floor for one snapshot. NEW semantics: this does NOT zero
+        // the window (only a Countdown abandon/veto resets it) — it shifts in a fail bit, leaving the
+        // 2 earlier passes still counted.
         var bBad = BookWithBuys(100.25, 90, 5);
         o = m.Update(In(100.25, 30, 0, 0, delta: 0, z: 2.0, alt: 0, mid: 100.00, sec: 5, book: bBad));
         Assert.False(o.Fired);
+        Assert.Equal(2, o.LongHoldCount);
 
-        // One good snapshot after the interruption must NOT fire — the counter restarted.
+        // One good snapshot after the interruption completes 3-of-5 (passes at s=3,4,6 within the
+        // last 5 judged ticks) -> fires immediately, where the OLD consecutive-hold rule would have
+        // required a fresh K=3 run and NOT fired here.
         var bGood1 = BookWithBuys(100.25, 90, 6);
         o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 6, book: bGood1));
-        Assert.False(o.Fired);
-
-        // Two more consecutive good snapshots complete a fresh K=3 -> fires.
-        var bGood2 = BookWithBuys(100.25, 90, 7);
-        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 7, book: bGood2));
-        Assert.False(o.Fired);
-        var bGood3 = BookWithBuys(100.25, 90, 8);
-        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 8, book: bGood3));
         Assert.True(o.Fired);
+        Assert.Equal(SideState.Fired, o.Long);
+    }
+
+    // Round-4 fix: full confluence broken only by a single-tick z dip (the measured real-world
+    // pattern — tapeZ/fraction jitter tick-to-tick at 20Hz) must not block a fire that would
+    // otherwise complete within the KWindow=5 register. pass,pass,FAIL(z dip),pass -> fires on the
+    // 4th tick (3 passes within the last 5 judged ticks), then stays latched (one-shot).
+    [Fact]
+    public void Fires_on_3_of_5_window_tolerating_a_single_tick_z_dip()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));            // arm peak 120
+        var b2 = BookWithBuys(100.25, 60, 2);
+        m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2));                    // -> Countdown
+
+        ControllerOutput o = default(ControllerOutput);
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 3, book: BookWithBuys(100.25, 90, 3))); // pass 1
+        Assert.False(o.Fired);
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 4, book: BookWithBuys(100.25, 90, 4))); // pass 2
+        Assert.False(o.Fired);
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 1.0, alt: 0, mid: 100.00, sec: 5, book: BookWithBuys(100.25, 90, 5))); // z dip below ZFloor(1.5) -> fail
+        Assert.False(o.Fired);
+        Assert.Equal(SideState.Countdown, o.Long);
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 6, book: BookWithBuys(100.25, 90, 6))); // pass 3 -> 3-of-5 AND current tick passes -> fire
+        Assert.True(o.Fired);
+        Assert.Equal(SideState.Fired, o.Long);
+
+        // One-shot: further passing ticks after the latch do not fire again.
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 7, book: BookWithBuys(100.25, 90, 7)));
+        Assert.False(o.Fired);
+    }
+
+    // Round-4 window-bound regression: an interruption pattern where the max passes in ANY 5-tick
+    // window never reaches K=3 must never fire, even though 3 total passes occur across the whole
+    // sequence. Sequence P,F,F,F,P,F,P — sliding 5-windows give passes {2,1,2}, always < K.
+    [Fact]
+    public void Never_fires_when_max_passes_in_any_5_window_stays_below_k()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));            // arm peak 120
+        var b2 = BookWithBuys(100.25, 60, 2);
+        m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2));                    // -> Countdown
+
+        // z=2.0 passes ZFloor(1.5); z=1.0 fails it — every other term (delta/consumption/near-wall)
+        // stays passing throughout, isolating the pass/fail axis to z the same way as the other tests.
+        double[] zs = { 2.0, 1.0, 1.0, 1.0, 2.0, 1.0, 2.0 }; // P F F F P F P
+        int fires = 0; ControllerOutput o = default(ControllerOutput);
+        for (int i = 0; i < zs.Length; i++)
+        {
+            int s = 3 + i;
+            o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: zs[i], alt: 0, mid: 100.00, sec: s, book: BookWithBuys(100.25, 90, s)));
+            if (o.Fired) fires++;
+        }
+        Assert.Equal(0, fires);
+        Assert.Equal(SideState.Countdown, o.Long);
+    }
+
+    // Round-4 current-tick regression: even with 2 prior passes sitting in the window (one short of
+    // K=3), a tick that itself fails `pre` must never fire — firing requires the window to hold >= K
+    // passes AND the CURRENT tick to be a passing, near-wall tick (the order stages off THIS tick's
+    // values). This is the first 3 ticks of the sibling z-dip fire test, stopped before the recovery
+    // tick that would complete 3-of-5.
+    [Fact]
+    public void Does_not_fire_on_a_failing_current_tick_even_with_two_prior_passes_in_window()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));            // arm peak 120
+        var b2 = BookWithBuys(100.25, 60, 2);
+        m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2));                    // -> Countdown
+
+        m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 3, book: BookWithBuys(100.25, 90, 3))); // pass 1
+        var o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 4, book: BookWithBuys(100.25, 90, 4))); // pass 2
+        Assert.Equal(2, o.LongHoldCount);
+        // Current tick fails (z dip) -> no fire regardless of the 2 passes already in the window.
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 1.0, alt: 0, mid: 100.00, sec: 5, book: BookWithBuys(100.25, 90, 5)));
+        Assert.False(o.Fired);
+        Assert.Equal(SideState.Countdown, o.Long);
     }
 
     // Task 10 identity contract: ControllerOutput exposes the armed wall's price while Armed/Countdown,
