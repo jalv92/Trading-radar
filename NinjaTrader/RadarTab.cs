@@ -72,6 +72,9 @@ namespace TradingRadar.NT
         private DateTime _lastDiag      = DateTime.MinValue;
         private DateTime _lastEngineRun = DateTime.MinValue;
         private const double EngineIntervalMs = 50;   // run engine+snapshot at most ~20Hz
+        // Round-6: bounded blind-trust window for the armed wall's identity feed — placeholder, calibrate next round.
+        private const double BlindTrustSeconds = 1.0;
+        private long _engineRunSeq;   // monotonic per-engine-run counter, for sig CSV provenance (src/seq)
         private const double ReplayResetBackwardMs = 2000;   // Playback rewind trip: real rewinds jump seconds-minutes; feed jitter is a few ms
         private const double ReplayResetForwardMs  = 60000;  // Playback scrub-ahead / session-rollover trip: bigger than any real quiet-market gap
         private volatile bool _autoCalib;
@@ -169,7 +172,8 @@ namespace TradingRadar.NT
                     "wallAbovePx,wallAboveCur,wallBelowPx,wallBelowCur,consumeFracLong,tradeBackedLong," +
                     "consumeFracShort,tradeBackedShort,printsPerSec,buyVolPerSec,sellVolPerSec,tapeZ,ctrlLong,ctrlShort," +
                     "ctrlWallAbovePx,ctrlWallAboveSz,ctrlWallBelowPx,ctrlWallBelowSz,tapeAlternations," +
-                    "ctrlLongHold,ctrlShortHold,ctrlLongDistTicks,ctrlShortDistTicks,ctrlLongCooldownUntil,ctrlShortCooldownUntil,autoArmed");
+                    "ctrlLongHold,ctrlShortHold,ctrlLongDistTicks,ctrlShortDistTicks,ctrlLongCooldownUntil,ctrlShortCooldownUntil,autoArmed," +
+                    "src,seq");
                 _sigWriter.Flush();
                 _capture = true;
             };
@@ -344,15 +348,20 @@ namespace TradingRadar.NT
             return 0;
         }
 
-        // Live resting size at a specific price, by identity (0 if that level is gone). Backs the
-        // ARMED-WALL IDENTITY CONTRACT in MaybeRunEngine: an armed candidate must keep seeing ITS wall's
-        // size, not whichever wall happens to be biggest this run once its own wall is partway eaten.
+        // Live resting size at a specific price, by identity (0 if that level is gone or the blind-trust
+        // window has expired). Backs the ARMED-WALL IDENTITY CONTRACT in MaybeRunEngine: an armed
+        // candidate must keep seeing ITS wall's size, not whichever wall happens to be biggest this run
+        // once its own wall is partway eaten. Round-6: a node blinking out of the MBP-10 window
+        // (InWindow=false) still gets its LastKnownSize trusted for BlindTrustSeconds — see
+        // WallTracker.TrustedSize — because MarkBlind only clears InWindow, LastKnownSize is still the
+        // last real observation, and feeding 0 the instant a wall blinks destroyed 95-96% of armed
+        // candidates (phantom cur<=0 abandons).
         private long SizeAtPrice(IReadOnlyList<RadarNode> nodes, Side side, double price)
         {
             if (price <= 0) return 0;
             for (int i = 0; i < nodes.Count; i++)
-                if (nodes[i].InWindow && nodes[i].Side == side && Math.Abs(nodes[i].Price - price) < _cfg.TickSize / 2.0)
-                    return nodes[i].LastKnownSize;
+                if (nodes[i].Side == side && Math.Abs(nodes[i].Price - price) < _cfg.TickSize / 2.0)
+                    return WallTracker.TrustedSize(nodes[i].InWindow, nodes[i].AgeSeconds, nodes[i].LastKnownSize, BlindTrustSeconds);
             return 0;
         }
 
@@ -392,7 +401,7 @@ namespace TradingRadar.NT
                 if (e.Instrument != _instrument) return;   // stale event from a prior instrument (mid-switch) — drop before touching the book
                 _book.ApplyDepth(de);
                 _depthEvents++;
-                MaybeRunEngine(e.Time);
+                MaybeRunEngine(e.Time, 'D');
             }
         }
 
@@ -405,11 +414,13 @@ namespace TradingRadar.NT
                 if (e.Instrument != _instrument) return;   // stale event from a prior instrument (mid-switch) — drop before touching the book
                 _book.ApplyTrade(te);
                 _tradeEvents++;
-                MaybeRunEngine(e.Time);
+                MaybeRunEngine(e.Time, 'T');
             }
         }
 
-        private void MaybeRunEngine(DateTime now)
+        // src: 'D' when triggered from the depth handler, 'T' from the trade handler — sig CSV
+        // provenance column, so a capture can tell which feed drove any given engine run.
+        private void MaybeRunEngine(DateTime now, char src)
         {
             if (_lastEngineRun != DateTime.MinValue)
             {
@@ -428,6 +439,8 @@ namespace TradingRadar.NT
                     // event still saw a negative delta and the engine stayed frozen until replay time
                     // climbed back past it. Re-basing lets the very next forward tick resume normally —
                     // without bypassing the throttle on every jittery backward tick (which running here would).
+                    // known: re-clears the throttle on sub-second out-of-order stamps (round-6 measured 0
+                    // lost fires from this); do not patch until the src/seq trace confirms the physical source.
                     _lastEngineRun = now;
                     return;
                 }
@@ -435,6 +448,7 @@ namespace TradingRadar.NT
                     return;                       // normal ~20Hz forward throttle (keep _lastEngineRun at the last actual run)
             }
             _lastEngineRun = now;
+            long seq = ++_engineRunSeq;   // sig CSV provenance — monotonic per actual engine run
             _tracker.Update(_book, now);
             double m = (_book.MedianSize(Side.Bid) + _book.MedianSize(Side.Ask)) / 2.0;
             if (m > 0) _medianEwma = _medianEwma <= 0 ? m : EwmaAlpha * m + (1 - EwmaAlpha) * _medianEwma;
@@ -471,6 +485,10 @@ namespace TradingRadar.NT
             for (int i = 0; i < snapNodes.Count; i++)
             {
                 RadarNode wn = snapNodes[i];
+                // Deliberately asymmetric with SizeAtPrice's bounded blind-trust (round-6): picking a NEW
+                // wall to arm on must see it live right now, so this recompute keeps strict InWindow — an
+                // already-armed candidate tracking ITS wall through a blink is a different job, handled
+                // below via ResolveWallFeed/SizeAtPrice/WallTracker.TrustedSize, not here.
                 if (!wn.InWindow) continue;   // blind/remembered node — frozen size, must not count as a live dominant wall
                 if (wn.Price > pMid && wn.LastKnownSize > wallAboveSz) { wallAboveSz = wn.LastKnownSize; wallAbovePx = wn.Price; }
                 if (wn.Price < pMid && wn.LastKnownSize > wallBelowSz) { wallBelowSz = wn.LastKnownSize; wallBelowPx = wn.Price; }
@@ -604,7 +622,8 @@ namespace TradingRadar.NT
                             "{10:0.00},{11},{12:0.00},{13},{14:0.000},{15:0.000},{16:0.000},{17:0.000}," +
                             "{18},{19},{20},{21:0.000},{22},{23}," +
                             "{24:0.00},{25},{26:0.00},{27},{28}," +
-                            "{29},{30},{31:0.00},{32:0.00},{33},{34},{35}",
+                            "{29},{30},{31:0.00},{32:0.00},{33},{34},{35}," +
+                            "{36},{37}",
                             now.ToString("o"), mid, bidMass, askMass, bestBid, bestAsk, delta15, wf, wabove, wpx,
                             wallAbovePx, wallAboveSz, wallBelowPx, wallBelowSz,
                             cout.LongFraction, cout.LongTradeBacked, cout.ShortFraction, cout.ShortTradeBacked,
@@ -614,7 +633,7 @@ namespace TradingRadar.NT
                             cout.LongHoldCount, cout.ShortHoldCount, cout.LongDistTicks, cout.ShortDistTicks,
                             cout.LongCooldownUntil == DateTime.MinValue ? "" : cout.LongCooldownUntil.ToString("o"),
                             cout.ShortCooldownUntil == DateTime.MinValue ? "" : cout.ShortCooldownUntil.ToString("o"),
-                            _chartTrader.IsAutoArmed));
+                            _chartTrader.IsAutoArmed, src, seq));
                         _sigWriter.Flush();
                     }
                 }

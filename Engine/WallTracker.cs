@@ -128,6 +128,16 @@ namespace TradingRadar.Engine
             return _memory.Snapshot(_lastBestBid, _lastBestAsk, now);
         }
 
+        // Round-6: a node that just went blind (slid outside the MBP-10 window / momentarily unobserved)
+        // still EXISTS at the venue — MarkBlind only clears InWindow; LastKnownSize remains the last real
+        // observation. Feeding 0 the instant it blinks destroyed 95-96% of armed candidates (phantom
+        // cur<=0 abandons). Trust the last-known size for a BOUNDED blind window; after that, 0 — the
+        // abandon/reload logic must still catch a genuinely pulled wall, just with a grace period.
+        public static long TrustedSize(bool inWindow, double ageSeconds, long lastKnownSize, double blindTrustSeconds)
+        {
+            return (inWindow || ageSeconds < blindTrustSeconds) ? lastKnownSize : 0;
+        }
+
         // Test seam: lets a test supply the mid explicitly so the band filter is centred on the
         // node being observed rather than on the gap quote cached by the last Update call.
         public IReadOnlyList<RadarNode> GetSnapshot(double bestBid, double bestAsk, DateTime now)

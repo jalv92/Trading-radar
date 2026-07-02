@@ -154,4 +154,23 @@ public class WallTrackerTests
         Assert.False(node.InWindow, "Node must be blinded after a gap > MemoryBandTicks");
         Assert.Equal(NodeState.Remembered, node.State);
     }
+
+    // Round-6: WallTracker.TrustedSize backs the armed-wall identity feed's bounded blind-trust.
+    [Fact]
+    public void TrustedSize_returns_last_known_size_when_in_window_regardless_of_age()
+    {
+        Assert.Equal(500, WallTracker.TrustedSize(true, 999.0, 500, 1.0));
+    }
+
+    [Fact]
+    public void TrustedSize_trusts_last_known_size_while_blind_within_the_grace_window()
+    {
+        Assert.Equal(500, WallTracker.TrustedSize(false, 0.5, 500, 1.0));
+    }
+
+    [Fact]
+    public void TrustedSize_returns_zero_once_blind_past_the_grace_window()
+    {
+        Assert.Equal(0, WallTracker.TrustedSize(false, 1.5, 500, 1.0));
+    }
 }

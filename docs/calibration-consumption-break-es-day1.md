@@ -311,3 +311,90 @@ run projects ~2 fires. Re-derive once ~15–20 real fires exist; not a validated
 SAME day (2026-06-22) through ~16:10 must produce fires around 10:51 (SHORT), 13:19 (LONG) at the
 new FireFrac, and near 15:47 / 16:06 even at the old bar — each leaving a complete
 prestage→submit→order_update lifecycle in the AUTO log.
+
+## Round 6 (window-blink root cause — the big one)
+
+### Verdict
+
+**95-96% of ALL Armed/Countdown candidate resets this session were phantom blink-abandons**, not
+real setup failures. `RadarTab.SizeAtPrice` gated its match on `nodes[i].InWindow`, so the instant
+a pinned wall's `RadarNode.InWindow` flipped false (a momentary slide outside the MBP-10 window),
+the lookup fell through to `return 0` even though `LiquidityMemory.MarkBlind` only clears the
+`InWindow` flag — `LastKnownSize` is untouched and still the last real observation. That phantom 0
+fed into the engine's `cur <= 0` abandon check and destroyed the candidate regardless of distance
+from the wall or how mature the setup was. The 10:51:10.9 all-gates-green SHORT fire (frac 0.92, tb
+1.00, delta −309, z 2.91, at the wall — the exact episode round 5 flagged as dying on `FireFrac`
+alone) actually died 792ms later from this blink kill chain, not from consumption falling short.
+The identity-hop guard added in an earlier round (the "wall moved ≥1 tick, abandon" check) was
+never the culprit — it measured **0 firings across ~7,900 resets** this session. The blink was the
+whole story.
+
+### Fix: bounded blind-trust in the identity feed
+
+New static helper `WallTracker.TrustedSize(bool inWindow, double ageSeconds, long lastKnownSize,
+double blindTrustSeconds)` (`Engine/WallTracker.cs`) — trusts `LastKnownSize` while `inWindow`, OR
+while blind for less than `blindTrustSeconds`; returns 0 only once the blind window is exceeded.
+`RadarTab.SizeAtPrice` now calls this instead of gating the match on `InWindow` (the old gate meant
+a blind node was never even found, so the trust decision never had a chance to run). New
+`RadarTab.BlindTrustSeconds = 1.0` (`const double`, explicitly flagged placeholder — calibrate next
+round, same as `ControllerConfig.KWindow` in round 4).
+
+**Why unconditional trust was rejected** (i.e. why not just drop the InWindow check entirely and
+always read `LastKnownSize`): a genuinely pulled wall would then freeze the fed size forever instead
+of decaying to 0, and `Fraction`/`Peak` in the Controller are seeded off that fed wall size — an
+unbounded trust could let a stale, long-gone wall keep a Countdown alive indefinitely. The bounded
+window catches that: past `BlindTrustSeconds` the feed drops to 0 and the existing abandon/reload
+logic takes over exactly as it did before this fix. Separately, `TradeBackedFraction` is computed
+off real trade prints (not the wall-size feed), so even during the trust window no fire can complete
+on fabricated consumption — a fire still requires real tape evidence, the trust window only protects
+the wall-identity/size half of the setup from a one-tick observation gap.
+
+**Deliberate asymmetry, not an oversight:** the dominant-wall recompute loop in `MaybeRunEngine`
+(picks which wall is biggest above/below mid, to arm NEW candidates on) still gates strictly on
+`InWindow` — unchanged. Picking a new wall to arm on must see it live right now; tracking an
+already-armed candidate's own wall through a momentary blink is a different job, handled entirely by
+`SizeAtPrice`/`ResolveWallFeed`/`TrustedSize`. Both spots are commented to say so.
+
+### `AgeSeconds` semantics — verified before trusting them
+
+Confirmed against `Engine/LiquidityMemory.cs` (`ObserveLive` sets `LastSeen = now` on every
+observed tick; `MarkBlind` only clears `InWindow`, never touches `LastSeen`) and the `Snapshot`
+projection (`AgeSeconds = (now - LastSeen).TotalSeconds`, `Engine/Primitives.cs` doc comment "since
+lastSeen"): `AgeSeconds` sits at ~0 the entire time a node is observed and only starts climbing once
+it goes blind. That is exactly the semantics `TrustedSize` needs (age-since-last-real-observation),
+confirmed by reading the code rather than assumed.
+
+### Hardening: sig CSV provenance (`src`, `seq`)
+
+Two new trailing columns on `lr-signals-*`: `src` (`'D'` when the engine run was triggered from the
+depth handler, `'T'` from the trade handler — threaded as a `char` parameter through
+`MaybeRunEngine`'s two call sites) and `seq` (a monotonically incrementing `long`, `++_engineRunSeq`,
+incremented inside the engine-run critical section — i.e. only on ticks that actually ran the
+engine, not on throttled/rebased ticks). This instruments, but does NOT fix, the confirmed-but-
+deferred timestamp defect below.
+
+### Deferred defect (confirmed real, 0 lost fires measured, NOT patched)
+
+`MaybeRunEngine`'s `deltaMs < 0` branch (small backward replay steps / out-of-order feed ticks)
+re-bases `_lastEngineRun = now` and returns without running the engine. This re-clears the ~20Hz
+throttle on every sub-second out-of-order stamp — real, confirmed, but measured **0 lost fires**
+from it this session. Left exactly as-is, with a one-line comment pointing at this section: do not
+patch until the `src`/`seq` trace confirms whether the physical source is Replay itself or the feed
+ordering, rather than guessing at a fix for a defect that hasn't cost a single fire yet.
+
+### Acceptance criteria for the next run
+
+1. Re-running replay 2026-06-22 through 10:51–10:56 must produce the SHORT episode firing, not
+   resetting at 10:51:11.7 as it did this session.
+2. Hold progression 0→1→2→3 (or whatever K is that round) must be visible through a FIXED wall
+   identity — no phantom identity churn from a blink resetting the candidate mid-hold.
+3. `ctrlWallAboveSz`/`ctrlWallBelowSz` must stay nonzero through blinks shorter than
+   `BlindTrustSeconds`, and drop to 0 for blinks at or beyond it — the CSV should show this directly.
+4. The blink-abandon share of all resets must drop from ~95% to near-zero on the same replay day,
+   while genuine pulls (real 0s past the trust window) still abandon correctly.
+5. Any new fire gets audited for trade-backed integrity at the fire tick — the trust window must
+   never be the thing that let a fire fire.
+6. NO threshold retuning off this round's n=1 kill-chain finding — `BlindTrustSeconds = 1.0` stays a
+   placeholder until several real sessions establish a real blink-duration distribution.
+7. Re-measure duplicate/non-monotonic sig-CSV row rates using the new `src`/`seq` columns BEFORE
+   touching the round-6-deferred `deltaMs < 0` throttle branch — instrument first, patch second.
