@@ -108,6 +108,7 @@ namespace TradingRadar.NT
         // Persistent AUTO decision trail (round-3 diagnosis: 3 engine fires, zero positions, no way to
         // tell why beyond NT8's Output window). Lazily opened on first AUTO log event — see LogAuto below.
         private System.IO.StreamWriter _autoLogWriter;
+        private bool _cleanedUp;                 // closed for good — a late marshaled event must not reopen the log
 
         // Threading note: see the volatile comment on _autoArmed above.
         public bool IsAutoArmed { get { return _autoArmed; } }
@@ -939,6 +940,10 @@ namespace TradingRadar.NT
         // StreamWriter pattern (same MyDocuments/NinjaTrader 8/LiquidityRadar folder).
         private void EnsureAutoLogWriter()
         {
+            // A late Dispatcher-marshaled order_update can land AFTER Cleanup() disposed the writer —
+            // without this latch it would silently reopen a brand-new orphaned file that nothing ever
+            // disposes (review round-3).
+            if (_cleanedUp) return;
             if (_autoLogWriter != null) return;
             try
             {
@@ -1257,6 +1262,7 @@ namespace TradingRadar.NT
 
         public void Cleanup()
         {
+            _cleanedUp = true;   // set FIRST — see EnsureAutoLogWriter
             CancelActiveLimitIfWorking("cleanup");   // don't leave a live order orphaned on teardown
             _workingOrders.Clear();
             _ownOrders.Clear();
