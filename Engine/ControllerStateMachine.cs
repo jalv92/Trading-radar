@@ -208,7 +208,12 @@ namespace TradingRadar.Engine
 
             bool deltaOk = wallSide == Side.Ask ? inp.AggressorDelta >= _cfg.DeltaFloor
                                                 : inp.AggressorDelta <= -_cfg.DeltaFloor;
-            bool pre = r.Fraction >= _cfg.FireFrac
+            // Fire must be judged where the order will actually be staged — at the wall. Reuses JudgeTicks
+            // (no new knob): without this, HoldCount could keep accumulating while price drifts away
+            // mid-dwell and fire anywhere up to AwayTicks out (round-3 real fire: entered Countdown at 1.5
+            // ticks, fired at 5.0 after a fast snap during the K-dwell — the worst of the 3 fires).
+            bool nearWall = Math.Abs(inp.Mid - c.WallPrice) / _tick < _cfg.JudgeTicks;
+            bool pre = nearWall && r.Fraction >= _cfg.FireFrac
                        && r.TradeBackedFraction >= _cfg.MinTradeBackedRatio
                        && deltaOk && inp.TapeZScore >= _cfg.ZFloor && !chop;
 

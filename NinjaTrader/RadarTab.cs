@@ -169,7 +169,7 @@ namespace TradingRadar.NT
                     "wallAbovePx,wallAboveCur,wallBelowPx,wallBelowCur,consumeFracLong,tradeBackedLong," +
                     "consumeFracShort,tradeBackedShort,printsPerSec,buyVolPerSec,sellVolPerSec,tapeZ,ctrlLong,ctrlShort," +
                     "ctrlWallAbovePx,ctrlWallAboveSz,ctrlWallBelowPx,ctrlWallBelowSz,tapeAlternations," +
-                    "ctrlLongHold,ctrlShortHold,ctrlLongDistTicks,ctrlShortDistTicks,ctrlLongCooldownUntil,ctrlShortCooldownUntil");
+                    "ctrlLongHold,ctrlShortHold,ctrlLongDistTicks,ctrlShortDistTicks,ctrlLongCooldownUntil,ctrlShortCooldownUntil,autoArmed");
                 _sigWriter.Flush();
                 _capture = true;
             };
@@ -604,7 +604,7 @@ namespace TradingRadar.NT
                             "{10:0.00},{11},{12:0.00},{13},{14:0.000},{15:0.000},{16:0.000},{17:0.000}," +
                             "{18},{19},{20},{21:0.000},{22},{23}," +
                             "{24:0.00},{25},{26:0.00},{27},{28}," +
-                            "{29},{30},{31:0.00},{32:0.00},{33},{34}",
+                            "{29},{30},{31:0.00},{32:0.00},{33},{34},{35}",
                             now.ToString("o"), mid, bidMass, askMass, bestBid, bestAsk, delta15, wf, wabove, wpx,
                             wallAbovePx, wallAboveSz, wallBelowPx, wallBelowSz,
                             cout.LongFraction, cout.LongTradeBacked, cout.ShortFraction, cout.ShortTradeBacked,
@@ -613,7 +613,8 @@ namespace TradingRadar.NT
                             ctrlWallAbovePx, ctrlWallAboveSz, ctrlWallBelowPx, ctrlWallBelowSz, cin.TapeAlternations,
                             cout.LongHoldCount, cout.ShortHoldCount, cout.LongDistTicks, cout.ShortDistTicks,
                             cout.LongCooldownUntil == DateTime.MinValue ? "" : cout.LongCooldownUntil.ToString("o"),
-                            cout.ShortCooldownUntil == DateTime.MinValue ? "" : cout.ShortCooldownUntil.ToString("o")));
+                            cout.ShortCooldownUntil == DateTime.MinValue ? "" : cout.ShortCooldownUntil.ToString("o"),
+                            _chartTrader.IsAutoArmed));
                         _sigWriter.Flush();
                     }
                 }

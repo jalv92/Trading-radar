@@ -143,3 +143,95 @@ were the same number).
   play — `SignificanceBand` hysteresis (wall oscillating around the threshold) vs. zero-size depth
   blips (a momentary bad read, not a real pull) — diagnose which one it actually is before coding
   either fix.
+
+## Round 3 (5-day AUTO run, zero positions)
+
+Five AUTO replay days. **3 engine fires, ZERO positions opened.** The decision trail was lost
+almost immediately: `TryAutoFire`/`SetAutoArmed`/`MaybeAutoCancel` only ever called `Diag()`, which
+writes to NT8's Output window — nobody was watching it live, and NT8 doesn't persist it. By the
+time the gap was noticed, there was no way to reconstruct *why* 3 fires produced 0 orders. This is
+an **unresolvable-blindness finding**, not a diagnosis: the round closed without being able to pick
+a single root cause from the candidates below.
+
+### Ranked hypotheses (unconfirmed — this is why the observability package exists)
+
+1. **Never-armed at fire time** — `TryAutoFire`'s guard 1a (`if (!_autoArmed) return;`) was a silent
+   return with no Diag at all. If AUTO wasn't actually armed (checkbox state lost, arm never
+   completed, disarmed by a guard the operator didn't see) at the moment any of the 3 fires landed,
+   every one of them would vanish with zero trace — the single most likely candidate precisely
+   because it was the one guard that couldn't leave evidence.
+2. **Stale/busy guard eating the fire** — guard 2 (`_activeLimit != null || !IsFlat(...)`) or the
+   anti-stale guard 4 skipping silently-enough-to-miss in the Output tab scroll.
+3. **ATM lost at fire time** — guard 5 (`_atmSelector.SelectedAtmStrategy == null`) force-disarms;
+   plausible if the selector's async repopulate deselected the template between arm and fire without
+   raising `DropDownClosed` (the exact gap F20's own review flagged as unverified).
+4. **Pre-build / stale package** — the running add-on binary not actually containing the code being
+   reviewed (recompile not picked up, per the existing NT8 caveat that open Add-On windows don't
+   refresh on recompile).
+5. **Platform-level order/ATM failure** — `SubmitRaw`'s `CreateOrder`/`Submit`/`StartAtmStrategy`
+   throwing or silently rejecting in a way that never reached the Output tab (buried in NT8's own
+   log, not this control's).
+
+None of these could be ranked with confidence from Output-tab scrollback alone — that is the whole
+point of the fix below.
+
+### Fire-at-5-ticks bug (code-verified, fixed this round)
+
+`StepCountdown`'s only distance check was the `AwayTicks` (6-tick) abandon. Entry into Countdown
+requires `< JudgeTicks` (2 ticks, via `AdvanceArmedOrCountdown`), but once inside, `HoldCount` could
+keep accumulating while price drifted away — a fire could render anywhere up to `AwayTicks` out.
+**Real fire 1 (SHORT, 2026-06-22 20:12)** entered Countdown at 1.5 ticks and fired at 5.0 ticks after
+a fast snap during the 150ms K-dwell — pre-staged 5 ticks off the wall, mechanically the worst of
+the 3 fires (the other two weren't traceable well enough to measure their fire-time distance at
+all — another symptom of the blindness above).
+
+**Fix:** `Engine/ControllerStateMachine.cs`, `StepCountdown` — added a `nearWall` term to the `pre`
+conjunction, reusing `JudgeTicks` (no new knob): `Math.Abs(inp.Mid - c.WallPrice) / _tick <
+_cfg.JudgeTicks`. A drift outside the judge radius mid-dwell now resets `HoldCount` via the existing
+`if (!pre) { c.HoldCount = 0; ... }` path — consistent with how the veto-dwell side already treats a
+drift-away as "nothing judged, restart the count." Fire must be judged where the order will actually
+be staged: at the wall. Regression test:
+`Countdown_drift_beyond_judge_radius_resets_hold_and_blocks_fire_until_back_near_wall`.
+
+### Config: HOLD (grid re-confirms round-2, does not override it)
+
+A parameter grid was run across the round-3 data before any code changes. **Every one of the 54
+cells** (loosening `DeltaFloor`/`ZFloor` combinations) produced a **win-rate ≤ 46%**, and **loosening
+either Delta or Z made forward returns worse, not better** — the opposite of what a "gates too tight"
+theory would predict. With only **n=3** real fires feeding the grid, this is far too thin to move any
+threshold on — it argues against loosening, it does not argue for tightening either.
+**`ControllerConfig`'s thresholds are unchanged this round.** The blocker isn't threshold tuning; it's
+that 3 fires is not a sample, and the tooling to collect a real one (the observability package below)
+didn't exist until now.
+
+### Observability package shipped this round
+
+- `RadarChartTrader.cs` guard 1a now Diags before returning (`"AUTO skip — not armed at fire
+  time."`) — the #1 blind spot above can never recur silently.
+- `SetAutoArmed` now Diags the arm transition too (previously disarm-only): `"AUTO armed — account
+  X, ATM Y."`.
+- New persistent, append-only CSV: `lr-auto-<instrument>-<yyyyMMdd-HHmmss>.csv` in the same
+  `MyDocuments/NinjaTrader 8/LiquidityRadar` folder as `lr-signals-*`. Schema:
+  `time,event,side,price,mid,detail`, event ∈ `{arm, disarm, prestage, guard_skip, submit,
+  atm_attach, order_update, auto_cancel}`. **Independent of the Rec toggle** — it captures every AUTO
+  decision whether or not a capture session is running, so a repeat of "3 fires, 0 evidence" is
+  structurally impossible.
+- `lr-signals-*` gained an `autoArmed` column (from `RadarChartTrader.IsAutoArmed`), so every engine
+  snapshot row can be cross-referenced against whether AUTO was actually armed at that instant —
+  directly answers hypothesis #1 without needing the AUTO log at all.
+
+### Next-run acceptance criteria
+
+1. **The AUTO log is complete** — every fire in `lr-signals-*` has a matching `prestage` row in
+   `lr-auto-*`, and every `prestage` row resolves to either a `guard_skip` (with a specific guard
+   named) or a `submit`. No fire may vanish with zero trace again.
+2. **`autoArmed` column present and sane** — nonzero true/false transitions align with the operator's
+   actual arm/disarm clicks and the `arm`/`disarm` rows in the AUTO log.
+3. **100% of fires have `DistTicks < 2`** — the near-wall fix above verified against real data, not
+   just the unit test.
+4. **At least 1 order reaches a terminal state** (`order_update` shows Filled, Cancelled, or
+   Rejected) — proof the pipe from fire to broker/Sim actually completes end-to-end at least once.
+5. **`HoldCount` visibly progresses 0→K in the AUTO log/sig CSV** across at least one real Countdown
+   — proof the K-dwell is being exercised by real data, not just by tests.
+6. **No threshold gets declared "validated"** under roughly 15–20 real fires. n=3 was already too
+   thin for the grid above; the same bar applies to anything this round's data might suggest.

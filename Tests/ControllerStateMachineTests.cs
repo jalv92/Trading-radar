@@ -158,6 +158,50 @@ public class ControllerStateMachineTests
         Assert.Equal(SideState.Fired, o.Long);        // latched
     }
 
+    // Round-3 fix: fire must be judged AT the wall (< JudgeTicks), not just inside AwayTicks. A
+    // countdown that drifts to 3 ticks away (still short of the AwayTicks(6) abandon) must NOT fire
+    // even at full confluence — HoldCount resets instead. Real fire 1 (SHORT 2026-06-22 20:12) entered
+    // Countdown at 1.5 ticks and fired at 5.0 after a fast snap during the K-dwell.
+    [Fact]
+    public void Countdown_drift_beyond_judge_radius_resets_hold_and_blocks_fire_until_back_near_wall()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook())); // arm, peak 120
+        var b2 = BookWithBuys(100.25, 60, 2);
+        var o2 = m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2)); // -> Countdown
+        Assert.Equal(SideState.Countdown, o2.Long);
+
+        ControllerOutput o = default(ControllerOutput);
+        // K-1 = 2 consecutive holds, near the wall (1 tick).
+        for (int s = 3; s <= 4; s++)
+        {
+            var b = BookWithBuys(100.25, 90, s);
+            o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: s, book: b));
+        }
+        Assert.Equal(SideState.Countdown, o.Long);
+        Assert.Equal(2, o.LongHoldCount);
+        Assert.False(o.Fired);
+
+        // Fast snap: mid drifts to 3 ticks away (< AwayTicks(6), so no abandon) with every other term
+        // still passing -> the near-wall gate blocks `pre`, HoldCount resets to 0, no fire.
+        var bDrift = BookWithBuys(100.25, 90, 5);
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 99.50, sec: 5, book: bDrift));
+        Assert.Equal(SideState.Countdown, o.Long);
+        Assert.Equal(0, o.LongHoldCount);
+        Assert.False(o.Fired);
+
+        // Back near the wall with full confluence for a fresh K=3 -> fires.
+        int fires = 0;
+        for (int s = 6; s <= 8; s++)
+        {
+            var b = BookWithBuys(100.25, 90, s);
+            o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: s, book: b));
+            if (o.Fired) fires++;
+        }
+        Assert.Equal(1, fires);
+        Assert.Equal(SideState.Fired, o.Long);
+    }
+
     // Opposing delta blocks the fire even at high consumption.
     [Fact]
     public void Does_not_fire_long_when_delta_opposes()

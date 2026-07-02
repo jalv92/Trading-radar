@@ -204,6 +204,39 @@ clearance stands) reviewed `de91b2b`.
 
 Gates: `dotnet test` 88/88, `nt8c` staged build 0/0.
 
+### Round-3 observability hardening — 5-day AUTO run, 3 fires, 0 positions, decision trail lost
+
+Full writeup: `docs/calibration-consumption-break-es-day1.md` § Round 3. Guard 1a
+(`if (!_autoArmed) return;`) was a silent return — the #1 blind spot when trying to reconstruct why
+3 real fires produced zero orders, since `Diag()` only reaches NT8's Output window (nobody was
+watching it, nothing persists it). Fixed alongside the near-wall fire-time gate
+(`Engine/ControllerStateMachine.cs`, `StepCountdown` — see the calibration doc for the mechanism).
+
+Added, all in `RadarChartTrader.cs` unless noted:
+- Guard 1a now Diags before returning (`"AUTO skip — not armed at fire time."`).
+- `SetAutoArmed` Diags the arm transition too (previously disarm-only).
+- Every AUTO-path Diag routes through a new `DiagAuto`/`LogAuto` helper pair that ALSO appends a row
+  to a new persistent, append-only CSV — `lr-auto-<instrument>-<yyyyMMdd-HHmmss>.csv`, same
+  `MyDocuments/NinjaTrader 8/LiquidityRadar` folder as `lr-signals-*`. Schema:
+  `time,event,side,price,mid,detail`, events `{arm, disarm, prestage, guard_skip, submit,
+  atm_attach, order_update, auto_cancel}`. Independent of the Rec toggle — writes whenever an event
+  occurs. `submit`/`atm_attach` carry the order id (only available once `SubmitRaw` actually creates
+  the `Order`, so those two events log from there, not from `TryAutoFire`'s pre-submit intent
+  message, which was folded into the `submit` row to avoid a duplicate lower-detail entry).
+  `order_update` logs only for the auto-tracked order (`_autoOrder`), every state transition, CSV-only
+  (no Output spam).
+- `RadarChartTrader.IsAutoArmed` (new public property) exposes `_autoArmed`, now `volatile` — it's
+  written only on the UI thread but read from `RadarTab.MaybeRunEngine` on the **instrument** thread
+  for the new `lr-signals-*` `autoArmed` column. `volatile`'s eventual-visibility guarantee is enough
+  here (a diagnostic read, not a decision gate) and matches the pattern `RadarTab` already uses for
+  `_instrument`/`_latest`/`_replayResetPending` — no lock/marshal added.
+- `_autoLogWriter` lazily opens on first AUTO log event, flushes per write (events are rare),
+  disposed in `Cleanup()` alongside the existing writers.
+
+Gates: `dotnet test` 89/89 (new engine regression test for the near-wall gate), `nt8c` staged build
+0/0. `ControllerConfig` thresholds unchanged — see the calibration doc for why (grid re-confirms
+round-2, n=3 too thin to move anything).
+
 ### Sim test checklist for the ATM path (before trusting it)
 1. Open the tab, pick a Sim/Playback account + instrument → confirm the **ATM box shows nothing pre-selected** (blank), i.e. no auto-picked template.
 2. Select an ATM template, take a bracketed BUY/SELL MKT → let it fill → confirm the ATM's stop/target appear at the broker AND that the **ladder marker / ▲▼ do NOT latch onto the ATM's target** (F15 check — they should stay tied only to your own manual LMT, if any).

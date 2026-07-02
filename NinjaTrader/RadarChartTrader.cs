@@ -93,13 +93,24 @@ namespace TradingRadar.NT
 
         // AUTO mode (2026-07-01, Sim/Playback only) — auto-submits the pre-stage above through the SAME
         // SubmitLimit -> SubmitRaw path a manual click uses. See TryAutoFire/TryArmAuto below.
-        private bool _autoArmed;
+        // volatile: written only from the UI thread (checkbox/TryArmAuto/SetAutoArmed), but read via
+        // IsAutoArmed from RadarTab's MaybeRunEngine on the INSTRUMENT thread (round-3 diagnosis: the sig
+        // CSV needs "was AUTO armed" alongside every row). Same cross-thread-visibility pattern RadarTab
+        // already uses for _instrument/_latest/_replayResetPending — this is a diagnostic read, not a
+        // decision gate, so volatile's eventual-visibility guarantee is enough; no lock/marshal needed.
+        private volatile bool _autoArmed;
         private bool _suppressAutoChkEvent;      // true while SetAutoArmed programmatically (re)sets the checkbox
         private DateTime _now;                   // replay-aware "now", pushed every SetContext tick — NOT wall clock
         private DateTime _autoFireDay = DateTime.MinValue;   // REPLAY date the fire count below is keyed to
         private int _autoFireCount;
         private Order _autoOrder;                // the one working limit this control auto-submitted (null = none)
         private DateTime _autoSubmittedAt;        // replay time of that auto-submit, for the auto-cancel timeout
+        // Persistent AUTO decision trail (round-3 diagnosis: 3 engine fires, zero positions, no way to
+        // tell why beyond NT8's Output window). Lazily opened on first AUTO log event — see LogAuto below.
+        private System.IO.StreamWriter _autoLogWriter;
+
+        // Threading note: see the volatile comment on _autoArmed above.
+        public bool IsAutoArmed { get { return _autoArmed; } }
 
         private readonly ComboBox _accountCombo = new ComboBox { Margin = new Thickness(0, 0, 6, 0) };
         private SelectionChangedEventHandler _accountSelectionHandler;   // see PopulateAccounts
@@ -444,6 +455,11 @@ namespace TradingRadar.NT
 
             _pendingSetup = new PendingSetup { IsBuy = isBuy, Price = RoundToTick(price, tick) };
             ApplyPendingSetupUi();
+            // Logged unconditionally (armed or not) — round-3's blind spot was never knowing whether an
+            // engine fire even reached this layer. CSV-only: no Output spam for a routine, frequent event.
+            LogAuto("prestage", isBuy ? "Buy" : "Sell", _pendingSetup.Price, _lastPrice,
+                string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "wall {0:0.00}, fraction {1:0.00}.", f.WallPrice, f.Fraction));
             TryAutoFire(f, isBuy, tick);   // AUTO mode (2026-07-01) — guards 1-4, evaluated after the pre-stage above is stored
         }
 
@@ -456,17 +472,22 @@ namespace TradingRadar.NT
         // `tick` is passed in from OnSetupFire's own EffectiveTick() call — same fire event, same tick.
         private void TryAutoFire(FireEvent f, bool isBuy, double tick)
         {
-            if (!_autoArmed) return;                                     // guard 1a
+            string side = isBuy ? "Buy" : "Sell";
+            if (!_autoArmed)                                              // guard 1a — was a silent return; the #1 blind spot of round-3
+            {
+                DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — not armed at fire time.");
+                return;
+            }
             if (!IsSimAccount(_account))                                  // guard 1b: re-assert Sim at fire time
             {
-                Diag("AUTO skip — account no longer Sim at fire time.");  // fail-closed, mirrors CanTrade's per-submit re-check
+                DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — account no longer Sim at fire time."); // fail-closed, mirrors CanTrade's per-submit re-check
                 ForceDisarmAuto("cuenta no-Sim");
                 return;
             }
-            if (!ValidateForSubmit()) return;                            // no instrument/account, order in flight, not Sim/armed (Diag'd inside)
+            if (!ValidateForSubmit()) return;                            // no instrument/account, order in flight, not Sim/armed (Diag'd inside — shared with the manual path, not routed to the AUTO CSV)
             if (_activeLimit != null || !IsFlat(CurrentPosition()))         // guard 2: busy
             {
-                Diag("AUTO skip — busy (working limit or open position).");
+                DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — busy (working limit or open position).");
                 return;
             }
 
@@ -475,7 +496,7 @@ namespace TradingRadar.NT
             if (_autoFireCount >= AutoFireCapPerDay)                      // guard 3: daily cap (burns on every ATTEMPT below,
             {                                                             // including one whose submit throws — conservative, deliberate)
                 string capStatus = _autoFireCount + "/" + AutoFireCapPerDay;
-                Diag("AUTO skip — daily cap " + capStatus + " reached.");
+                DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — daily cap " + capStatus + " reached.");
                 ForceDisarmAuto("cap " + capStatus);   // route through the one disarm gate
                 return;
             }
@@ -490,7 +511,9 @@ namespace TradingRadar.NT
                 : _lastPrice - _pendingSetup.Price > AutoStaleTicks * tick;
             if (_lastPrice <= 0 || marketableThrough)
             {
-                Diag(string.Format("AUTO skip — stale at fire (setup {0:0.00} vs mid {1:0.00}).", _pendingSetup.Price, _lastPrice));
+                DiagAuto("guard_skip", side, _pendingSetup.Price, _lastPrice,
+                    string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "AUTO skip — stale at fire (setup {0:0.00} vs mid {1:0.00}).", _pendingSetup.Price, _lastPrice));
                 return;
             }
 
@@ -500,15 +523,13 @@ namespace TradingRadar.NT
             // at the actual submit instant (defense in depth); this is the earlier, cheaper trip.
             if (_atmSelector.SelectedAtmStrategy == null)
             {
-                Diag("AUTO skip — ATM lost at fire time.");
+                DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — ATM lost at fire time.");
                 ForceDisarmAuto("ATM perdido");
                 return;
             }
 
             _autoFireCount++;                                            // all clear — fire
-            Diag(string.Format("AUTO submit — {0} LMT @ {1:0.00} ({2}/{3} today).",
-                isBuy ? "BUY" : "SELL", _pendingSetup.Price, _autoFireCount, AutoFireCapPerDay));
-            SubmitLimit(isBuy, isAuto: true);
+            SubmitLimit(isBuy, isAuto: true);   // the "submit" log row (order id/qty/price) is written from SubmitRaw once the order exists
         }
 
         // Auto-cancel of an unfilled AUTO-submitted limit — never a manual one (reference-checked against
@@ -518,8 +539,11 @@ namespace TradingRadar.NT
         private void MaybeAutoCancel()
         {
             if (_autoOrder == null || !ReferenceEquals(_activeLimit, _autoOrder)) return;
-            if ((_now - _autoSubmittedAt).TotalSeconds < AutoCancelSeconds) return;
-            Diag("AUTO cancel — unfilled auto limit aged out after " + AutoCancelSeconds + "s.");
+            double elapsedSec = (_now - _autoSubmittedAt).TotalSeconds;
+            if (elapsedSec < AutoCancelSeconds) return;
+            DiagAuto("auto_cancel", _autoOrder.OrderAction.ToString(), _autoOrder.LimitPrice, _lastPrice,
+                string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "AUTO cancel — unfilled auto limit aged out after {0:0.0}s (limit {1}s).", elapsedSec, AutoCancelSeconds));
             CancelActiveLimitIfWorking("auto-cancel");   // same cancel path Rev/Close/opposite-side use
         }
 
@@ -551,7 +575,12 @@ namespace TradingRadar.NT
             _suppressAutoChkEvent = true;   // re-sync the checkbox without re-entering Checked/Unchecked
             _autoChk.IsChecked = armed;
             _suppressAutoChkEvent = false;
-            if (!armed && reason != null) Diag("AUTO disarmed — " + reason + ".");
+            if (armed)
+                DiagAuto("arm", null, 0, _lastPrice, string.Format("AUTO armed — account {0}, ATM {1}.",
+                    _account != null ? _account.Name : "?",
+                    _atmSelector.SelectedAtmStrategy != null ? _atmSelector.SelectedAtmStrategy.Name : "?"));
+            else if (reason != null)
+                DiagAuto("disarm", null, 0, _lastPrice, "AUTO disarmed — " + reason + ".");
             SolidColorBrush accent = armed ? Amber : Muted;
             _autoChk.Foreground = accent;
             _autoStatusText.Text = armed ? "AUTO armado" : reason != null ? "AUTO: " + reason : string.Empty;
@@ -783,6 +812,12 @@ namespace TradingRadar.NT
             OrderType  type  = ord.OrderType;
             Dispatcher.InvokeAsync((Action)(() =>
             {
+                // Captured BEFORE any mutation below can null _autoOrder on a terminal state — round-3's
+                // schema wants order_update logged "for auto-tracked orders" specifically (CSV-only, no
+                // Output spam: every state transition of an auto order lands here, not just Rejected).
+                if (ReferenceEquals(_autoOrder, ord))
+                    LogAuto("order_update", ord.OrderAction.ToString(), ord.LimitPrice, _lastPrice,
+                        "order #" + ord.Id + " -> " + state + ".");
                 if (Order.IsTerminalState(state))
                 {
                     _workingOrders.Remove(ord);   // HashSet.Remove is a no-op if already gone
@@ -894,6 +929,64 @@ namespace TradingRadar.NT
         private void Diag(string msg)
         {
             NinjaTrader.Code.Output.Process("[ChartTrader] " + msg, NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+        }
+
+        // ---- persistent AUTO decision trail (round-3 diagnosis) ----
+        // 5-day AUTO run, 3 engine fires, ZERO positions, and no way to tell why beyond NT8's Output
+        // window (which nobody was watching and which persists nothing). This CSV is INDEPENDENT of the
+        // Rec toggle — every event below writes here whenever it happens, Rec on or off. Schema:
+        // time,event,side,price,mid,detail. Mirrors RadarTab's Rec-writer dir-creation + invariant-culture
+        // StreamWriter pattern (same MyDocuments/NinjaTrader 8/LiquidityRadar folder).
+        private void EnsureAutoLogWriter()
+        {
+            if (_autoLogWriter != null) return;
+            try
+            {
+                string dir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "NinjaTrader 8", "LiquidityRadar");
+                System.IO.Directory.CreateDirectory(dir);
+                string inst = _instrument != null ? _instrument.MasterInstrument.Name : "X";
+                string path = System.IO.Path.Combine(dir,
+                    "lr-auto-" + inst + "-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".csv");
+                _autoLogWriter = new System.IO.StreamWriter(path, false);
+                _autoLogWriter.WriteLine("time,event,side,price,mid,detail");
+                _autoLogWriter.Flush();
+            }
+            catch (Exception ex) { Diag("AUTO log open failed: " + ex.Message); }
+        }
+
+        private static string CsvField(string s)
+        {
+            return string.IsNullOrEmpty(s) ? string.Empty : "\"" + s.Replace("\"", "\"\"") + "\"";
+        }
+
+        // event in {arm, disarm, prestage, guard_skip, submit, atm_attach, order_update, auto_cancel}.
+        // Time is the replay-aware market clock (_now, pushed by SetContext) where available — the same
+        // instant OnSetupFire/TryAutoFire's caller already used — with a wall-clock fallback (noted in the
+        // detail column) for the few AUTO-path call sites that can run off-tick (checkbox clicks, account/
+        // instrument switches) before any SetContext tick has ever landed.
+        private void LogAuto(string evt, string side, double price, double mid, string detail)
+        {
+            EnsureAutoLogWriter();
+            if (_autoLogWriter == null) return;
+            bool haveReplayTime = _now != DateTime.MinValue;
+            string time = (haveReplayTime ? _now : DateTime.Now).ToString("o");
+            string d = haveReplayTime ? detail : detail + " [wall-clock — no replay time yet]";
+            try
+            {
+                _autoLogWriter.WriteLine(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "{0},{1},{2},{3:0.00},{4:0.00},{5}", time, evt, side ?? "", price, mid, CsvField(d)));
+                _autoLogWriter.Flush();   // events are rare — flush-per-write is cheap insurance against losing the trail
+            }
+            catch (Exception ex) { Diag("AUTO log write failed: " + ex.Message); }
+        }
+
+        // Every AUTO-path Diag also lands a durable CSV row — Diag alone only reaches NT8's Output
+        // window, which round-3 proved is not enough on its own.
+        private void DiagAuto(string evt, string side, double price, double mid, string detail)
+        {
+            Diag(detail);
+            LogAuto(evt, side, price, mid, detail);
         }
 
         private bool ValidateForSubmit()
@@ -1099,7 +1192,11 @@ namespace TradingRadar.NT
             // is the actual submit instant — an AUTO entry must NEVER go out naked. Abort before CreateOrder
             // (no order at all), unlike the atm-attach-failure branch below, which only degrades a MANUAL
             // entry to plain because a human is watching it.
-            if (isAuto && atm == null) { Diag("AUTO blocked — no ATM at submit; refusing a naked auto entry."); return; }
+            if (isAuto && atm == null)
+            {
+                DiagAuto("guard_skip", action.ToString(), limitPrice, _lastPrice, "AUTO blocked — no ATM at submit; refusing a naked auto entry.");
+                return;
+            }
             // ATM requires the entry order's CreateOrder "name" argument to be EXACTLY "Entry" (NT8 docs).
             string orderName = atm != null ? "Entry" : tag;
             try
@@ -1110,12 +1207,20 @@ namespace TradingRadar.NT
                     TimeInForce.Day, qty, limitPrice, 0, string.Empty, orderName, NinjaTrader.Core.Globals.MaxDate, null);
                 _ownOrders.Add(o);   // F15: seed ownership the moment we create it — every order this control originates
                 if (isAuto) { _autoOrder = o; _autoSubmittedAt = _now; }
+                // "submit" carries the order id — this is the one place it exists (round-3 schema).
+                if (isAuto)
+                    DiagAuto("submit", action.ToString(), limitPrice, _lastPrice,
+                        string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                            "AUTO submit — {0} LMT @ {1:0.00}, order #{2}, qty {3} ({4}/{5} today).",
+                            action, limitPrice, o.Id, qty, _autoFireCount, AutoFireCapPerDay));
                 if (atm != null)
                 {
                     try
                     {
                         // StartAtmStrategy submits the entry order itself — do not also call Account.Submit.
                         NinjaTrader.NinjaScript.AtmStrategy.StartAtmStrategy(atm, o);
+                        if (isAuto) LogAuto("atm_attach", action.ToString(), limitPrice, _lastPrice,
+                            "ATM " + atm.Name + " attached to order #" + o.Id + ".");
                     }
                     catch (Exception atmEx)
                     {
@@ -1124,11 +1229,15 @@ namespace TradingRadar.NT
                         if (o.OrderState == OrderState.Initialized)
                         {
                             Diag("ATM attach failed (" + atm.Name + "): " + atmEx.Message + " — submitting plain entry instead.");
+                            if (isAuto) LogAuto("atm_attach", action.ToString(), limitPrice, _lastPrice,
+                                "FAILED (" + atm.Name + "): " + atmEx.Message + " — plain entry submitted instead.");
                             _account.Submit(new[] { o });
                         }
                         else
                         {
                             Diag("ATM attach failed after entry was already sent (" + o.OrderState + ") — NOT resubmitting (avoid duplicate).");
+                            if (isAuto) LogAuto("atm_attach", action.ToString(), limitPrice, _lastPrice,
+                                "FAILED after entry already sent (" + o.OrderState + ") — not resubmitted.");
                         }
                     }
                 }
@@ -1142,6 +1251,7 @@ namespace TradingRadar.NT
             catch (Exception ex)
             {
                 Diag("submit failed (" + tag + "): " + ex.Message);
+                if (isAuto) LogAuto("submit", action.ToString(), limitPrice, _lastPrice, "AUTO submit FAILED: " + ex.Message);
             }
         }
 
@@ -1152,6 +1262,7 @@ namespace TradingRadar.NT
             _ownOrders.Clear();
             Account.AccountStatusUpdate -= OnAccountStatusUpdate;
             UnsubscribeAccount();
+            if (_autoLogWriter != null) { _autoLogWriter.Flush(); _autoLogWriter.Dispose(); _autoLogWriter = null; }
         }
     }
 }
