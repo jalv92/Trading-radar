@@ -243,18 +243,21 @@ namespace TradingRadar.NT
                     // reuse the already-marshaled book mid + biggest-wall prices for live PnL + LMT anchoring;
                     // f.Now is the REPLAY-aware market clock AUTO mode's auto-cancel timer ages against.
                     _chartTrader.SetContext(f.Mid, f.WallAbove, f.WallBelow, f.Tick, f.Now);
-                    // Round-8: LATCHED consume, not a Frame.Fired sample. At high replay speed the one-shot
-                    // Frame.Fired flag lives only ~ms of wall time before the next engine run replaces the
-                    // Frame — far shorter than this ~33ms paint period — so sampling f.Fired here lost
-                    // almost every fire (measured 5/5 in a full-day capture). _pendingFireSet instead stays
-                    // true across paint ticks until explicitly consumed here, under the same _engineLock the
-                    // writer (MaybeRunEngine) uses, so no fire can land between the read and the clear.
-                    if (_pendingFireSet)
-                    {
-                        FireEvent pf;
-                        lock (_engineLock) { pf = _pendingFire; _pendingFireSet = false; }
-                        _chartTrader.OnSetupFire(pf);   // ChartTrader's own FireEvent.Time dedupe still guards double-delivery
-                    }
+                }
+                // Round-8: LATCHED consume, not a Frame.Fired sample. At high replay speed the one-shot
+                // Frame.Fired flag lives only ~ms of wall time before the next engine run replaces the
+                // Frame — far shorter than this ~33ms paint period — so sampling f.Fired here lost
+                // almost every fire (measured 5/5 in a full-day capture). _pendingFireSet instead stays
+                // true across paint ticks until explicitly consumed here, under the same _engineLock the
+                // writer (MaybeRunEngine) uses, so no fire can land between the read and the clear.
+                // Deliberately OUTSIDE the `f != null` guard (review round-8): delivery needs only
+                // _engineLock + _chartTrader — coupling it to _latest would silently stall fires if a
+                // future reset path nulls the frame without clearing the latch.
+                if (_pendingFireSet)
+                {
+                    FireEvent pf;
+                    lock (_engineLock) { pf = _pendingFire; _pendingFireSet = false; }
+                    _chartTrader.OnSetupFire(pf);   // ChartTrader's own FireEvent.Time dedupe still guards double-delivery
                 }
                 // Push the Chart Trader's active working limit order onto the ladder as an overlay marker.
                 double ordPx; bool ordBuy; int ordQty;
