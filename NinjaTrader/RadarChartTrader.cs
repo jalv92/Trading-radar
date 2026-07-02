@@ -391,6 +391,9 @@ namespace TradingRadar.NT
                 _atmSelector.SelectedItem = null;   // force "None" — don't trust the control's own default
                 _atmUserPicked = false;             // F16: switching instrument disarms ATM attach again
                 ForceDisarmAuto("cambio de instrumento");
+                // Roll the AUTO log so the next event opens a file named for the NEW instrument
+                // (review round-3 minor: the name is captured at first-open only).
+                if (_autoLogWriter != null) { _autoLogWriter.Flush(); _autoLogWriter.Dispose(); _autoLogWriter = null; }
                 RefreshArmUi();
                 RefreshPositionUi();
             }
