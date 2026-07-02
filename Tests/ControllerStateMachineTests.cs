@@ -4,12 +4,14 @@ using Xunit;
 
 public class ControllerStateMachineTests
 {
-    static DateTime T(int s) => new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(s);
+    // double, not int: round-7 z-latch tests need sub-second gaps (e.g. sec: 3.2) to exercise
+    // ZTrustSeconds without relying on the boundary-exact 1-second cadence every other test uses.
+    static DateTime T(double s) => new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(s);
 
     static BookMirror EmptyBook() => new BookMirror(0.25, TimeSpan.FromSeconds(30));
 
     static ControllerInputs In(double wallAbovePrice, long wallAboveCur, double wallBelowPrice, long wallBelowCur,
-                               long delta, double z, int alt, double mid, int sec, BookMirror book)
+                               long delta, double z, int alt, double mid, double sec, BookMirror book)
         => new ControllerInputs {
             WallAbovePrice = wallAbovePrice, WallAboveCurrent = wallAboveCur,
             WallBelowPrice = wallBelowPrice, WallBelowCurrent = wallBelowCur,
@@ -508,12 +510,16 @@ public class ControllerStateMachineTests
         Assert.Equal(SideState.Fired, o.Long);
     }
 
-    // Round-4 fix: full confluence broken only by a single-tick z dip (the measured real-world
-    // pattern — tapeZ/fraction jitter tick-to-tick at 20Hz) must not block a fire that would
-    // otherwise complete within the KWindow=5 register. pass,pass,FAIL(z dip),pass -> fires on the
-    // 4th tick (3 passes within the last 5 judged ticks), then stays latched (one-shot).
+    // Round-4 fix (reworked round-7): full confluence broken only by a single-tick miss must not
+    // block a fire that would otherwise complete within the KWindow=5 register. Originally this used
+    // a z dip to exercise the "single missed tick, window still fires" path, but the round-7 z-latch
+    // (ZTrustSeconds) now BRIDGES a same-cadence z dip right after a real pass (see
+    // ZLatch_bridges_a_jitter_dip_within_the_trust_window), so a z dip no longer isolates the window
+    // semantics on its own. Reworked to dip on FireFrac instead (a non-z term untouched by the latch):
+    // pass,pass,FAIL(frac dip),pass -> fires on the 4th tick (3 passes within the last 5 judged
+    // ticks), then stays latched (one-shot).
     [Fact]
-    public void Fires_on_3_of_5_window_tolerating_a_single_tick_z_dip()
+    public void Fires_on_3_of_5_window_tolerating_a_single_tick_frac_dip()
     {
         var m = Machine();
         m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));            // arm peak 120
@@ -525,7 +531,10 @@ public class ControllerStateMachineTests
         Assert.False(o.Fired);
         o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 4, book: BookWithBuys(100.25, 90, 4))); // pass 2
         Assert.False(o.Fired);
-        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 1.0, alt: 0, mid: 100.00, sec: 5, book: BookWithBuys(100.25, 90, 5))); // z dip below ZFloor(1.5) -> fail
+        // Frac dip: cur ticks up to 50 (Fraction 1-50/120=0.583 < FireFrac 0.6) without triggering the
+        // reload veto (50-Min(30)=20 < ReloadFrac(0.25)*Peak(120)=30) and without moving Peak/Min —
+        // isolates the fail to the FireFrac term alone, same role the z dip used to play pre-latch.
+        o = m.Update(In(100.25, 50, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 5, book: BookWithBuys(100.25, 70, 5))); // frac dip -> fail
         Assert.False(o.Fired);
         Assert.Equal(SideState.Countdown, o.Long);
         o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 6, book: BookWithBuys(100.25, 90, 6))); // pass 3 -> 3-of-5 AND current tick passes -> fire
@@ -537,9 +546,11 @@ public class ControllerStateMachineTests
         Assert.False(o.Fired);
     }
 
-    // Round-4 window-bound regression: an interruption pattern where the max passes in ANY 5-tick
-    // window never reaches K=3 must never fire, even though 3 total passes occur across the whole
-    // sequence. Sequence P,F,F,F,P,F,P — sliding 5-windows give passes {2,1,2}, always < K.
+    // Round-4 window-bound regression (reworked round-7: off z, same reason as the frac-dip test
+    // above — z is no longer a clean per-tick pass/fail isolator once the z-latch can bridge a
+    // same-cadence dip right after a pass). An interruption pattern where the max passes in ANY
+    // 5-tick window never reaches K=3 must never fire, even though 3 total passes occur across the
+    // whole sequence. Sequence P,F,F,F,P,F,P — sliding 5-windows give passes {2,1,2}, always < K.
     [Fact]
     public void Never_fires_when_max_passes_in_any_5_window_stays_below_k()
     {
@@ -548,25 +559,28 @@ public class ControllerStateMachineTests
         var b2 = BookWithBuys(100.25, 60, 2);
         m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2));                    // -> Countdown
 
-        // z=2.0 passes ZFloor(1.5); z=1.0 fails it — every other term (delta/consumption/near-wall)
-        // stays passing throughout, isolating the pass/fail axis to z the same way as the other tests.
-        double[] zs = { 2.0, 1.0, 1.0, 1.0, 2.0, 1.0, 2.0 }; // P F F F P F P
+        // cur=30 (Fraction 0.75 >= FireFrac) passes; cur=50 (Fraction 0.583 < FireFrac) fails — z,
+        // delta, near-wall and chop stay passing/green throughout, isolating the pass/fail axis to
+        // Fraction the same way the original version isolated it to z. Neither value trips the
+        // reload veto (cur - Min(30) never reaches ReloadFrac(0.25)*Peak(120)=30).
+        long[] curs = { 30, 50, 50, 50, 30, 50, 30 }; // P F F F P F P
         int fires = 0; ControllerOutput o = default(ControllerOutput);
-        for (int i = 0; i < zs.Length; i++)
+        for (int i = 0; i < curs.Length; i++)
         {
             int s = 3 + i;
-            o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: zs[i], alt: 0, mid: 100.00, sec: s, book: BookWithBuys(100.25, 90, s)));
+            long drop = 120 - curs[i];
+            o = m.Update(In(100.25, curs[i], 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: s, book: BookWithBuys(100.25, drop, s)));
             if (o.Fired) fires++;
         }
         Assert.Equal(0, fires);
         Assert.Equal(SideState.Countdown, o.Long);
     }
 
-    // Round-4 current-tick regression: even with 2 prior passes sitting in the window (one short of
-    // K=3), a tick that itself fails `pre` must never fire — firing requires the window to hold >= K
-    // passes AND the CURRENT tick to be a passing, near-wall tick (the order stages off THIS tick's
-    // values). This is the first 3 ticks of the sibling z-dip fire test, stopped before the recovery
-    // tick that would complete 3-of-5.
+    // Round-4 current-tick regression (reworked round-7: off z, same reason as the two tests above —
+    // the z-latch would bridge a same-cadence z dip right after a pass). Even with 2 prior passes
+    // sitting in the window (one short of K=3), a tick that itself fails `pre` must never fire —
+    // firing requires the window to hold >= K passes AND the CURRENT tick to be a passing, near-wall
+    // tick (the order stages off THIS tick's values).
     [Fact]
     public void Does_not_fire_on_a_failing_current_tick_even_with_two_prior_passes_in_window()
     {
@@ -578,8 +592,9 @@ public class ControllerStateMachineTests
         m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 3, book: BookWithBuys(100.25, 90, 3))); // pass 1
         var o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 4, book: BookWithBuys(100.25, 90, 4))); // pass 2
         Assert.Equal(2, o.LongHoldCount);
-        // Current tick fails (z dip) -> no fire regardless of the 2 passes already in the window.
-        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 1.0, alt: 0, mid: 100.00, sec: 5, book: BookWithBuys(100.25, 90, 5)));
+        // Current tick fails on a frac dip (cur=50 -> Fraction 0.583 < FireFrac 0.6) -> no fire
+        // regardless of the 2 passes already in the window.
+        o = m.Update(In(100.25, 50, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 5, book: BookWithBuys(100.25, 70, 5)));
         Assert.False(o.Fired);
         Assert.Equal(SideState.Countdown, o.Long);
     }
@@ -649,5 +664,107 @@ public class ControllerStateMachineTests
         var o2 = m.Update(In(100.25, 0, 0, 0, 0, 0, 0, 98.50, 2, EmptyBook()));   // wall vanishes -> abandon
         Assert.Equal(SideState.Waiting, o2.Long);
         Assert.Equal(0, o2.LongDistTicks);
+    }
+
+    // Round-7 z-latch (a): the 1s-trailing TapeZScore window can dip below ZFloor for a single tick
+    // from window-edge effects while every other confluence term stays green — measured 63% of killed
+    // episodes stalled on exactly this coincidence. A real pass (z=2.0) must bridge across a
+    // subsequent dip WITHIN ZTrustSeconds(1.0) — that dip tick now counts as a pass, and a genuine
+    // 3rd pass fires (no need to wait for a 4th "recovery" tick, unlike the old same-tick-only rule).
+    [Fact]
+    public void ZLatch_bridges_a_jitter_dip_within_the_trust_window()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));             // arm peak 120
+        var b2 = BookWithBuys(100.25, 60, 2);
+        m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2));                     // -> Countdown
+
+        var o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 3.0, book: BookWithBuys(100.25, 90, 3))); // pass 1, latches T(3.0)
+        Assert.False(o.Fired);
+        Assert.Equal(1, o.LongHoldCount);
+
+        // z swings to -1.5 only 300ms later with every other term still green — well inside
+        // ZTrustSeconds(1.0) of the T(3.0) pass, so the latch reads this tick's z-leg as PASS too.
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: -1.5, alt: 0, mid: 100.00, sec: 3.3, book: BookWithBuys(100.25, 90, 3)));
+        Assert.False(o.Fired);
+        Assert.Equal(2, o.LongHoldCount);
+
+        // A genuine third pass completes K=3 -> fires.
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 3.6, book: BookWithBuys(100.25, 90, 3)));
+        Assert.True(o.Fired);
+        Assert.Equal(SideState.Fired, o.Long);
+    }
+
+    // Round-7 z-latch (b): more than ZTrustSeconds of replay time after the last real pass, the latch
+    // has expired — a subsequent z dip genuinely fails the leg (not bridged), so the window does not
+    // advance.
+    [Fact]
+    public void ZLatch_expires_after_trust_window_elapses()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));             // arm peak 120
+        var b2 = BookWithBuys(100.25, 60, 2);
+        m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2));                     // -> Countdown
+
+        var o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 3.0, book: BookWithBuys(100.25, 90, 3))); // pass, latches T(3.0)
+        Assert.Equal(1, o.LongHoldCount);
+
+        // 1.5s later (> ZTrustSeconds(1.0)) z is still below ZFloor — the latch has expired, so this
+        // tick's z-leg genuinely fails; the window does not advance past the single earlier pass.
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 0.5, alt: 0, mid: 100.00, sec: 4.5, book: BookWithBuys(100.25, 90, 4)));
+        Assert.False(o.Fired);
+        Assert.Equal(1, o.LongHoldCount);
+    }
+
+    // Round-7 z-latch (c): the !nearWall drift reset must zero the z-latch too, not just PassBits —
+    // otherwise a pass from just before the drift (well within ZTrustSeconds by the wall clock alone)
+    // would wrongly survive it once price returns near the wall. Sub-second timestamps (via the
+    // fractional `sec` overload) keep the stale-pass gap under 1s so this actually exercises the
+    // reset instead of relying on the latch expiring naturally.
+    [Fact]
+    public void ZLatch_resets_on_near_wall_drift_stale_pass_does_not_carry_back()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));             // arm peak 120
+        var b2 = BookWithBuys(100.25, 60, 2);
+        m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2));                     // -> Countdown
+
+        var o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 3.0, book: BookWithBuys(100.25, 90, 3))); // pass, latches T(3.0)
+        Assert.Equal(1, o.LongHoldCount);
+
+        // Drift 3 ticks away (>= JudgeTicks(2), < AwayTicks(6)) only 200ms later — well inside
+        // ZTrustSeconds(1.0) of the T(3.0) pass by the clock alone. The !nearWall path must
+        // hard-reset BOTH PassBits and the z-latch (round-7), or the pass from just before the drift
+        // would wrongly survive it.
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 99.50, sec: 3.2, book: BookWithBuys(100.25, 90, 4)));
+        Assert.Equal(SideState.Countdown, o.Long);
+        Assert.Equal(0, o.LongHoldCount);
+
+        // Back near the wall 200ms later still (400ms total since the T(3.0) pass — inside
+        // ZTrustSeconds if the latch had survived) with z now genuinely failing — must NOT fire off
+        // the stale pass.
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 0.5, alt: 0, mid: 100.00, sec: 3.4, book: BookWithBuys(100.25, 90, 5)));
+        Assert.False(o.Fired);
+        Assert.Equal(0, o.LongHoldCount);
+    }
+
+    // Change 2: ControllerOutput.Long/ShortPeak/Min mirror the tracked candidate verbatim — 0/0
+    // before a side has ever armed (nothing tracked yet), then the Peak/Min the engine used to judge
+    // consumption, same lifecycle as LongFraction (no IsIdentityHeld gating, unlike *WallPrice).
+    [Fact]
+    public void Exposes_peak_and_min_from_the_tracked_candidate_verbatim()
+    {
+        var m = Machine();
+        var o0 = m.Update(In(0, 0, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook())); // no wall yet -> Waiting, verbatim 0/0
+        Assert.Equal(SideState.Waiting, o0.Long);
+        Assert.Equal(0, o0.LongPeak);
+        Assert.Equal(0, o0.LongMin);
+
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 2, EmptyBook()));   // arm, peak 120
+        var book = BookWithBuys(100.25, 60, 3);
+        var o = m.Update(In(100.25, 60, 0, 0, 0, 0, 0, 100.00, 3, book));   // consumed 120->60, trade-backed -> Countdown
+        Assert.Equal(SideState.Countdown, o.Long);
+        Assert.Equal(120, o.LongPeak);
+        Assert.Equal(60, o.LongMin);
     }
 }

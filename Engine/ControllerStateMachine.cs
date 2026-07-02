@@ -46,6 +46,13 @@ namespace TradingRadar.Engine
         public double ShortDistTicks;
         public DateTime LongCooldownUntil;
         public DateTime ShortCooldownUntil;
+        // Verbatim candidate Peak/Min (no IsIdentityHeld gating, unlike *WallPrice) — 0/0 before a side
+        // has ever armed, whatever the tracked candidate holds otherwise (including through Waiting,
+        // since Peak/Min are only ever reassigned on (re)arm, not zeroed on abandon).
+        public long LongPeak;
+        public long LongMin;
+        public long ShortPeak;
+        public long ShortMin;
     }
 
     // All placeholders — measured from Rec CSV (spec §9). No literal threshold lives in logic.
@@ -62,6 +69,7 @@ namespace TradingRadar.Engine
         // until Countdown-conditional data exists
         public long DeltaFloor = 30;              // |AggressorDelta| agreeing to confirm
         public double ZFloor = 1.5;              // tape-speed z-score to confirm
+        public double ZTrustSeconds = 1.0; // placeholder, mirrors BlindTrustSeconds precedent — calibrate once PassBits-triggered capture exists (round-7)
         public int K = 3;                        // snapshots meeting fire pre-conditions required within KWindow
         public int KWindow = 5; // MEASURED round-4 ES: full confluence exists but breaks on single-tick z/frac jitter before 3 consecutive; 3-of-5 keeps sustained-confluence semantics while tolerating 1-2 jitter dips — placeholder, calibrate with fires
         public double ReloadFrac = 0.25;         // refill above running-min (as frac of peak) => reload veto
@@ -89,6 +97,11 @@ namespace TradingRadar.Engine
             // separate from HoldCount, which stays the Armed-phase veto-dwell consecutive counter
             // (round-2, unchanged) so the two never share/clobber each other's semantics.
             public int PassBits;
+            // Round-7 z-latch: wall-clock time of the last tick where TapeZScore alone cleared ZFloor.
+            // MinValue = never passed. Reset alongside PassBits at every site that zeroes it (see the
+            // 5 StepCountdown reset sites + the Armed->Countdown entry) — its lifetime pins 1:1 to the
+            // PassBits invariant, no separate lifecycle.
+            public DateTime LastZPassTime = DateTime.MinValue;
             public DateTime CooldownUntil = DateTime.MinValue;
             public double Fraction;
             public double TradeBackedFraction;
@@ -135,6 +148,8 @@ namespace TradingRadar.Engine
             o.ShortDistTicks = DistTicksValid(_short.State) ? Math.Abs(inp.Mid - _short.WallPrice) / _tick : 0;
             o.LongCooldownUntil = _long.CooldownUntil;
             o.ShortCooldownUntil = _short.CooldownUntil;
+            o.LongPeak = _long.Peak; o.LongMin = _long.Min;
+            o.ShortPeak = _short.Peak; o.ShortMin = _short.Min;
             return o;
         }
 
@@ -208,11 +223,11 @@ namespace TradingRadar.Engine
         {
             double curWallPrice = wallSide == Side.Ask ? inp.WallAbovePrice : inp.WallBelowPrice;
             if (cur <= 0 || System.Math.Abs(curWallPrice - c.WallPrice) >= _tick)
-            { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; c.PassBits = 0; return false; }
+            { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; c.PassBits = 0; c.LastZPassTime = DateTime.MinValue; return false; }
             // The trade ring can no longer prove trades back to ArmTime — re-baseline instead of
             // silently under-counting Traded (which would misroute clean consumption into the pull veto).
             if (inp.Now - c.ArmTime >= inp.Book.TradeRetention)
-            { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; c.PassBits = 0; return false; }
+            { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; c.PassBits = 0; c.LastZPassTime = DateTime.MinValue; return false; }
             if (cur > c.Peak) c.Peak = cur;
             if (cur < c.Min) c.Min = cur;
 
@@ -220,11 +235,11 @@ namespace TradingRadar.Engine
             // are deliberately NOT zeroed here — Cooldown->Waiting (above) zeroes them once the veto elapses,
             // and the frozen value stays readable through Cooldown by the same design as c.Fraction.
             if (cur - c.Min >= _cfg.ReloadFrac * c.Peak)
-            { c.State = SideState.Cooldown; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.HoldCount = 0; c.PassBits = 0; return false; }
+            { c.State = SideState.Cooldown; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.HoldCount = 0; c.PassBits = 0; c.LastZPassTime = DateTime.MinValue; return false; }
 
             // Price fell away from the wall (mid too far) => abandon.
             if (Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick)
-            { c.State = SideState.Waiting; c.HoldCount = 0; c.PassBits = 0; c.Fraction = 0; c.TradeBackedFraction = 0; return false; }
+            { c.State = SideState.Waiting; c.HoldCount = 0; c.PassBits = 0; c.LastZPassTime = DateTime.MinValue; c.Fraction = 0; c.TradeBackedFraction = 0; return false; }
 
             ConsumptionRead r = ConsumptionTracker.Read(wallSide, c.WallPrice, c.Peak, cur, c.ArmTime, inp.Book);
             c.Fraction = r.Fraction; c.TradeBackedFraction = r.TradeBackedFraction;
@@ -239,11 +254,22 @@ namespace TradingRadar.Engine
             // Price drift is NOT jitter (review round-4): the 3-of-5 window tolerates single-tick
             // indicator dips (z/frac — the measured killer), but a wall snap-away must HARD-reset the
             // register, or one good tick after a snap-back completes the window — reviving the exact
-            // round-3 bad-fire pattern (entered Countdown at 1.5 ticks, fired at 5.0 mid-dwell).
-            if (!nearWall) { c.PassBits = 0; return false; }
+            // round-3 bad-fire pattern (entered Countdown at 1.5 ticks, fired at 5.0 mid-dwell). Also
+            // hard-resets the round-7 z-latch (below) — a pass from before the drift must not survive it.
+            if (!nearWall) { c.PassBits = 0; c.LastZPassTime = DateTime.MinValue; return false; }
+
+            // Round-7 z-latch: the 1s-trailing TapeZScore window can dip below ZFloor for a single tick
+            // (measured: swings up to -1.86 within ~236ms — a window-statistic edge effect, not a real
+            // tape-speed change) while every other confluence term stays green — 63% of killed episodes
+            // stalled on exactly this coincidence. Bridge a genuine ZFloor pass across a bounded
+            // wall-clock window (mirrors the shipped BlindTrustSeconds precedent) instead of requiring
+            // the SAME tick. LastZPassTime == MinValue ("never passed") makes the subtraction a huge
+            // TimeSpan, which correctly fails the comparison below with no separate guard needed.
+            if (inp.TapeZScore >= _cfg.ZFloor) c.LastZPassTime = inp.Now;
+            bool zPass = (inp.Now - c.LastZPassTime).TotalSeconds <= _cfg.ZTrustSeconds;
             bool pre = r.Fraction >= _cfg.FireFrac
                        && r.TradeBackedFraction >= _cfg.MinTradeBackedRatio
-                       && deltaOk && inp.TapeZScore >= _cfg.ZFloor && !chop;
+                       && deltaOk && zPass && !chop;
 
             // Round-4 K-window persistence: every surviving NEAR-WALL Countdown tick is judged and
             // shifts the register, pass or fail. This tolerates 1-2 jitter dips inside KWindow instead
@@ -296,8 +322,10 @@ namespace TradingRadar.Engine
             { c.HoldCount = 0; return; } // nothing eaten, noise-band jitter, or too far for TradedAt to be trusted — stay Armed, reset veto dwell
             if (r.TradeBackedFraction >= _cfg.MinTradeBackedRatio)
             // Entering Countdown zeroes BOTH counters: HoldCount (Armed veto-dwell, unrelated once
-            // here) and PassBits (the fresh K-window fire register — round-4).
-            { c.State = SideState.Countdown; c.HoldCount = 0; c.PassBits = 0; return; }
+            // here) and PassBits (the fresh K-window fire register — round-4), plus (round-7) the
+            // z-latch — a stale pass from a previous Countdown dwell on this same candidate must not
+            // carry into a fresh one.
+            { c.State = SideState.Countdown; c.HoldCount = 0; c.PassBits = 0; c.LastZPassTime = DateTime.MinValue; return; }
             // Thinning NOT explained by trades = pull/spoof candidate. Require K CONSECUTIVE judgeable
             // sub-ratio ticks (not one) before conceding the veto — a single sub-ratio read can be a
             // print-matching miss, not a real pull; HoldCount is reset above the instant any tick fails

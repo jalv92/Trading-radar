@@ -88,6 +88,11 @@ namespace TradingRadar.NT
         private System.IO.StreamWriter _sigWriter;
         private readonly Dictionary<long, NodeState> _prevStates = new Dictionary<long, NodeState>();
         private DateTime _lastMidLog = DateTime.MinValue;
+        // Round-7: last-logged HoldCount per side, so the sig writer can force a row the instant
+        // either one moves — see the holdChanged trigger where cout is computed. -1 so the very
+        // first tick (HoldCount starts at 0) doesn't need to special-case a match.
+        private int _lastLoggedHoldL = -1;
+        private int _lastLoggedHoldS = -1;
 
         public RadarTab()
         {
@@ -173,9 +178,14 @@ namespace TradingRadar.NT
                     "consumeFracShort,tradeBackedShort,printsPerSec,buyVolPerSec,sellVolPerSec,tapeZ,ctrlLong,ctrlShort," +
                     "ctrlWallAbovePx,ctrlWallAboveSz,ctrlWallBelowPx,ctrlWallBelowSz,tapeAlternations," +
                     "ctrlLongHold,ctrlShortHold,ctrlLongDistTicks,ctrlShortDistTicks,ctrlLongCooldownUntil,ctrlShortCooldownUntil,autoArmed," +
+                    "ctrlLongPeak,ctrlLongMin,ctrlShortPeak,ctrlShortMin," +
                     "src,seq");
                 _sigWriter.Flush();
                 _capture = true;
+                // Round-7: forces a sig row the instant either side's HoldCount moves (see the
+                // holdChanged trigger below) — reset on every Rec toggle-on, same as _prevStates.
+                _lastLoggedHoldL = -1;
+                _lastLoggedHoldS = -1;
             };
             recChk.Unchecked += (o, e) =>
             {
@@ -525,6 +535,11 @@ namespace TradingRadar.NT
             // two 2s heartbeat rows, leaving no trace in the CSV. Snapshot the state transition BEFORE
             // _lastCtrl is overwritten below, so the sig writer can force an immediate row on any change.
             bool ctrlStateChanged = cout.Long != _lastCtrl.Long || cout.Short != _lastCtrl.Short;
+            // Round-7: HoldCount was NEVER observed >0 in 241/241 captured rows despite the engine
+            // tracking it every run — the median 38-tick gap between heartbeat/state-change rows was
+            // silently skipping over the exact ticks HoldCount moves on. Force a row the instant
+            // either side's HoldCount changes, same "snapshot before overwrite" pattern as ctrlStateChanged.
+            bool holdChanged = cout.LongHoldCount != _lastLoggedHoldL || cout.ShortHoldCount != _lastLoggedHoldS;
             _lastCtrl = cout;   // read by the identity-contract lookup above on the NEXT engine run
             // Task 11: vote-less book-skew context for the Cockpit's demoted reference strip (spec §7) —
             // reuses the same pin assembled above; never a vote, never a trigger. `pin` itself is kept
@@ -590,10 +605,14 @@ namespace TradingRadar.NT
                     }
                     // enhanced PressureInputs snapshot (Plan D measurement) — on the 2s heartbeat, OR
                     // immediately when either side's SideState changed this run (ctrlStateChanged, captured
-                    // above before _lastCtrl was overwritten). Day-1 capture proved a full arm->drop->veto
-                    // cycle can complete and vanish between two heartbeat rows; the event trigger guarantees
-                    // every transition lands a row without touching the heartbeat's own cadence.
-                    if (_capture && _sigWriter != null && (heartbeat || ctrlStateChanged))
+                    // above before _lastCtrl was overwritten), OR (round-7) when either side's HoldCount
+                    // moved (holdChanged) — HoldCount had NEVER been observed >0 in 241/241 captured rows
+                    // despite the engine tracking it every run; the heartbeat/state-change cadence alone
+                    // was silently skipping over the exact ticks it changes on. Day-1 capture proved a full
+                    // arm->drop->veto cycle can complete and vanish between two heartbeat rows; these event
+                    // triggers guarantee every transition lands a row without touching the heartbeat's own
+                    // cadence.
+                    if (_capture && _sigWriter != null && (heartbeat || ctrlStateChanged || holdChanged))
                     {
                         var bids = _book.Levels(Side.Bid); var asks = _book.Levels(Side.Ask);
                         long bidMass = 0, askMass = 0;
@@ -623,7 +642,8 @@ namespace TradingRadar.NT
                             "{18},{19},{20},{21:0.000},{22},{23}," +
                             "{24:0.00},{25},{26:0.00},{27},{28}," +
                             "{29},{30},{31:0.00},{32:0.00},{33},{34},{35}," +
-                            "{36},{37}",
+                            "{36},{37},{38},{39}," +
+                            "{40},{41}",
                             now.ToString("o"), mid, bidMass, askMass, bestBid, bestAsk, delta15, wf, wabove, wpx,
                             wallAbovePx, wallAboveSz, wallBelowPx, wallBelowSz,
                             cout.LongFraction, cout.LongTradeBacked, cout.ShortFraction, cout.ShortTradeBacked,
@@ -633,8 +653,12 @@ namespace TradingRadar.NT
                             cout.LongHoldCount, cout.ShortHoldCount, cout.LongDistTicks, cout.ShortDistTicks,
                             cout.LongCooldownUntil == DateTime.MinValue ? "" : cout.LongCooldownUntil.ToString("o"),
                             cout.ShortCooldownUntil == DateTime.MinValue ? "" : cout.ShortCooldownUntil.ToString("o"),
-                            _chartTrader.IsAutoArmed, src, seq));
+                            _chartTrader.IsAutoArmed,
+                            cout.LongPeak, cout.LongMin, cout.ShortPeak, cout.ShortMin,
+                            src, seq));
                         _sigWriter.Flush();
+                        _lastLoggedHoldL = cout.LongHoldCount;
+                        _lastLoggedHoldS = cout.ShortHoldCount;
                     }
                 }
                 catch { }

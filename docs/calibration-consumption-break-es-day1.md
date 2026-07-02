@@ -398,3 +398,81 @@ ordering, rather than guessing at a fix for a defect that hasn't cost a single f
    placeholder until several real sessions establish a real blink-duration distribution.
 7. Re-measure duplicate/non-monotonic sig-CSV row rates using the new `src`/`seq` columns BEFORE
    touching the round-6-deferred `deltaMs < 0` throttle branch — instrument first, patch second.
+
+## Round 7 (final-gate calibration on real Countdown episodes)
+
+### Kill-chain shares (n=65 killed Countdown episodes, 4 captures)
+
+- **Reload veto — 34% of kills, working as designed.** Among ITS kills, 18–21% are good
+  (legitimate defense reload) vs **63–71% false** (the reload band is too wide, but every
+  loosening tested in the round-3 grid trades that false share for worse quality elsewhere — see
+  HOLDs below). Not touched this round.
+- **Vanish/identity abandon — 60% headline share, but 36/39 sampled kills were pre-fix
+  contaminated** (the round-6 blink false-positive, or an earlier reset path since closed) — once
+  those are excluded the real vanish share collapses; it is not the round-7 story.
+- **z-coincidence — the proximate staller in 63% of the remaining kills.** The 1s-trailing
+  TapeZScore window swings as low as −1.86 within ~236ms of a tick where every OTHER confluence
+  term (Fraction, TradeBackedFraction, delta, near-wall, !chop) was already green — a window-
+  statistic edge effect, not a real change in tape speed. This is Change 1.
+
+### The honest reset
+
+Forward-return arbitration against the 4 flagship episodes (10:51 SHORT, 13:19 LONG, plus the two
+round-5 15:47/16:06 moments) found **0 clean good-breaks** — every one that would have fired under
+the round-5/6 gates was, on a forward-return check, a false break, a reload-vetoed defense, or the
+z-coincidence staller above with no way to tell which without the fire actually happening. Round 7
+does NOT claim a validated edge. Expected outcome of these three changes: **~2–4 fires/day at
+coin-flip quality (~1:1 good:false)** — the point is observability to grade real fires against real
+forward returns, not a claimed win rate. Treat every fire from this build as a labeled sample, not
+a signal.
+
+### The three changes
+
+1. **z-latch (`ControllerConfig.ZTrustSeconds`, `Candidate.LastZPassTime`).** Bridges a genuine
+   `TapeZScore >= ZFloor` pass across a bounded wall-clock window (mirrors the shipped
+   `BlindTrustSeconds` precedent) instead of requiring the pass on the exact SAME tick as every
+   other confluence term. `ZFloor` itself is UNCHANGED — this fixes the coincidence requirement,
+   not the level (round-3 grid: lowering `ZFloor` costs quality). Reset alongside `PassBits` at
+   every site that already zeroes it (identity/vanish, retention re-baseline, reload veto, away,
+   `!nearWall` drift) plus the Armed→Countdown entry — the latch's lifetime pins 1:1 to the
+   `PassBits` invariant, no separate lifecycle to get wrong.
+2. **`ControllerOutput.Long/ShortPeak/Min` exposure.** Verbatim candidate `Peak`/`Min` surfaced for
+   the sig CSV — the tracked consumption bounds behind `Fraction`/`TradeBackedFraction` were
+   previously invisible to calibration.
+3. **`RadarTab` hold-triggered capture rows.** A third sig-CSV write trigger fires the instant
+   either side's `HoldCount` moves, on top of the existing 2s heartbeat and state-change triggers.
+   Measured: median 38-engine-tick gaps between Countdown rows, and **HoldCount had NEVER been
+   observed >0 across 241/241 captured rows** despite the engine tracking it every run — the
+   heartbeat/state-change cadence was silently skipping the exact ticks that matter. This is the
+   highest-leverage observability change this round and the prerequisite for grading everything
+   else: without it, a Countdown that holds for 2 judged ticks and then reload-vetoes leaves zero
+   trace that it ever got that far.
+
+### Explicit HOLDs (measured, not touched this round)
+
+- **`ReloadFrac` 0.25.** Every loosening tested in the round-3 grid admits a 63–71% false-break
+  share among the reload veto's kills — the veto is doing its job at the current width.
+- **`ZFloor` 1.5.** The z-latch fixes the SAME-tick coincidence requirement; lowering the level
+  itself was already measured (round-3) to cost quality independent of the coincidence problem.
+- **`KWindow`/`K` 5/3.** Unchanged 3-of-5 persistence window (round-4) — not implicated in this
+  round's kill-chain analysis.
+- **`FireFrac` 0.6 — flagged, not fixed.** Its round-5 justification (the only quality-neutral
+  volume lever in the 54-cell grid) was derived from threshold-crossing counts, not fired-episode
+  forward-return outcomes, and that justification failed forward-return arbitration this round.
+  Re-derive from actual fired-episode outcomes once this round's instrumentation produces enough of
+  them — not touched now because there is nothing yet to re-derive it FROM.
+
+### Acceptance criteria for the next run
+
+1. **Instrumentation gate first.** `ctrlLongHold`/`ctrlShortHold` must show a value `> 0` mid-
+   episode in the sig CSV — if every row still reads 0 outside a fire/veto tick, the hold-triggered
+   write isn't working and nothing else in this list can be graded.
+2. Replaying 10:51 (SHORT) must reach `HoldCount >= 2` at the tick that was previously the z-fail
+   staller — the z-latch bridging that tick — but the episode may still legitimately end in a
+   reload veto; a Cooldown outcome is NOT a regression here, only a frozen HoldCount is.
+3. Replaying 13:19 (LONG) must STILL end in Cooldown/no-fire. If it fires, the z-latch leaked past
+   a tick it should not have bridged (an over-wide `ZTrustSeconds`, or a missed reset site) —
+   treat as a bug, not a new signal.
+4. Quality bar: roughly 1:1 good:false across the fires this build produces. If it comes in worse
+   than 1:2, the fix is to shorten `ZTrustSeconds` alone — do not touch `ZFloor`, `FireFrac`, or
+   `ReloadFrac` off this signal, per the HOLDs above.
