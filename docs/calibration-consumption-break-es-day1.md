@@ -121,6 +121,19 @@ were the same number).
    blind exactly at the judgment moment. `WallPrice` is never cleared on the veto transition, so the
    veto row can now log the real judgment distance.
 
+### Review notes (round-2 gate)
+
+- The far-rebaseline branch also zeroes `HoldCount` now (reviewer reproduced a stale dwell count
+  surviving a one-tick gap past `AwayTicks` → veto committed K−n ticks early).
+- `ctrl*DistTicks` is nonzero for the WHOLE 10s Cooldown window (mid-to-vetoed-wall distance), not
+  just the veto row — the veto-row value is the judgment distance; later rows track the drift.
+- **Round-3 watch item:** the K-consecutive dwell is gameable by a timed pull → partial-refill →
+  pull cycle (dwell resets on each refill; the side just stays Armed and never vetoes — bounded,
+  can't cause a fire). If the next capture shows that pattern on real walls, consider "N sub-ratio
+  ticks in the last M" instead of pure consecutive.
+- Cosmetic: the Cockpit countdown bar can now sit past the `FireFrac` marker while plainly Armed at
+  3–5 ticks (no verdict zone) — banner stays truthful; retouch only if it misleads in Replay.
+
 ### Open investigations (NOT coded this round)
 
 - **8.3% non-monotonic CSV timestamps.** The lenses' race theory (two writers interleaving rows)

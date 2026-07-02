@@ -240,7 +240,9 @@ namespace TradingRadar.Engine
             // just deferred to the approach. Peak==Min==cur makes Fraction/TradeBackedFraction
             // deterministically 0 (Drop=0) — skip the trade-ring lookup and assign directly.
             if (Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick)
-            { c.Peak = cur; c.Min = cur; c.Fraction = 0; c.TradeBackedFraction = 0; return; }
+            // HoldCount too: a one-tick gap from inside the judge radius straight past AwayTicks must
+            // not bank dwell ticks across the excursion (review round-2: veto committed K-n ticks early).
+            { c.Peak = cur; c.Min = cur; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; return; }
             if (cur > c.Peak) c.Peak = cur;
             if (cur < c.Min) c.Min = cur;
             ConsumptionRead r = ConsumptionTracker.Read(wallSide, c.WallPrice, c.Peak, cur, c.ArmTime, inp.Book);
