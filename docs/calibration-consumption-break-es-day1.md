@@ -55,6 +55,8 @@ knob — and by construction Countdown can now only be entered near-touch, which
 - **Event-triggered sig rows**: a row is written immediately on any per-side state change (in
   addition to the 2 s heartbeat). Day-1 proved a full arm → 61%-drop → veto cycle can complete
   invisibly between two heartbeats (rows 9458–9459, 14:52).
+- `ctrl*CooldownUntil` is NOT reset when a side returns to Waiting — it shows the LAST cooldown's
+  expiry; cross-reference the state column when reading the CSV.
 
 ## Next-capture acceptance criteria
 

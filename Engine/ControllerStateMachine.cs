@@ -222,14 +222,20 @@ namespace TradingRadar.Engine
             // silently under-counting Traded (which would misroute clean consumption into the pull veto).
             if (inp.Now - c.ArmTime >= inp.Book.TradeRetention)
             { c.State = SideState.Waiting; c.Fraction = 0; c.TradeBackedFraction = 0; c.HoldCount = 0; return; }
+            // ponytail: reuse AwayTicks (no new knob) — too far from the wall to judge trade-backing
+            // (TradedAt only matches prints AT the wall). Re-baseline Peak/Min to the CURRENT size while
+            // far instead of letting them accumulate across the whole far period: without this, the FIRST
+            // near-touch tick reads Drop spanning the entire far window (where trades structurally
+            // couldn't print at the wall) and instant pull-vetoes on arrival — the same day-1 tautology,
+            // just deferred to the approach. Peak==Min==cur makes Fraction/TradeBackedFraction
+            // deterministically 0 (Drop=0) — skip the trade-ring lookup and assign directly.
+            if (Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick)
+            { c.Peak = cur; c.Min = cur; c.Fraction = 0; c.TradeBackedFraction = 0; return; }
             if (cur > c.Peak) c.Peak = cur;
             if (cur < c.Min) c.Min = cur;
             ConsumptionRead r = ConsumptionTracker.Read(wallSide, c.WallPrice, c.Peak, cur, c.ArmTime, inp.Book);
             c.Fraction = r.Fraction; c.TradeBackedFraction = r.TradeBackedFraction;
             if (r.Fraction <= 0 || r.Drop < _cfg.MinDropBand) return; // nothing eaten yet, or sub-band jitter — stay Armed
-            // ponytail: reuse AwayTicks (no new knob) — too far from the wall to judge trade-backing
-            // (TradedAt only matches prints AT the wall); far thinning stays Armed, never pull-vetoes.
-            if (Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick) return;
             if (r.TradeBackedFraction >= _cfg.MinTradeBackedRatio)
                 c.State = SideState.Countdown;
             else

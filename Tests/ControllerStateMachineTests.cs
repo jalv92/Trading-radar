@@ -49,6 +49,49 @@ public class ControllerStateMachineTests
         Assert.Equal(SideState.Armed, o.Long);
     }
 
+    // Reviewer follow-up: the proximity gate alone defers the judgment but not the accumulation — Peak
+    // tracked unconditionally across the far period means the FIRST near-touch tick reads Drop spanning
+    // the whole unjudgeable far window and instant pull-vetoes on arrival (same tautology, deferred).
+    // Re-baselining Peak/Min while far must prevent that: arriving near with the wall stable (no NEW
+    // drop since arrival) must stay Armed — nothing judgeable yet.
+    [Fact]
+    public void Far_thinning_does_not_poison_judgment_on_arrival()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 98.50, 1, EmptyBook()));         // arm far away (7 ticks), peak 120
+        m.Update(In(100.25, 30, 0, 0, 0, 0, 0, 98.50, 2, EmptyBook()));          // far tick: heavy thin, no trades -> re-baselines to 30
+        m.Update(In(100.25, 10, 0, 0, 0, 0, 0, 98.50, 3, EmptyBook()));          // another far tick: thins further -> re-baselines to 10
+        var o = m.Update(In(100.25, 10, 0, 0, 0, 0, 0, 100.00, 4, EmptyBook())); // arrives near (1 tick), wall STABLE -> no drop to judge
+        Assert.Equal(SideState.Armed, o.Long);                                  // no instant Cooldown
+    }
+
+    // Continues the trace: once near, a genuine trade-backed drop opens the clean Countdown path —
+    // the re-baselined Peak (10, not the original arm-time 120) is what makes this judgeable at all.
+    [Fact]
+    public void Far_candidate_enters_countdown_on_clean_consumption_after_arrival()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 98.50, 1, EmptyBook()));         // arm far away
+        m.Update(In(100.25, 30, 0, 0, 0, 0, 0, 98.50, 2, EmptyBook()));          // far thin -> re-baselines to 30
+        m.Update(In(100.25, 30, 0, 0, 0, 0, 0, 100.00, 3, EmptyBook()));         // arrives near, wall stable -> stays Armed
+        var book = BookWithBuys(100.25, 24, 4);                                 // 24 bought at the wall, matching the drop
+        var o = m.Update(In(100.25, 6, 0, 0, 0, 0, 0, 100.00, 4, book));         // near drop 30->6, fully trade-backed
+        Assert.Equal(SideState.Countdown, o.Long);
+    }
+
+    // Continues the negative: near-touch, a drop with NO prints is still the true false-wall signature
+    // and must still pull-veto — the re-baseline doesn't weaken the close-in veto, only the far one.
+    [Fact]
+    public void Far_candidate_still_pull_vetoes_on_untraded_drop_after_arrival()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 98.50, 1, EmptyBook()));         // arm far away
+        m.Update(In(100.25, 30, 0, 0, 0, 0, 0, 98.50, 2, EmptyBook()));          // far thin -> re-baselines to 30
+        m.Update(In(100.25, 30, 0, 0, 0, 0, 0, 100.00, 3, EmptyBook()));         // arrives near, wall stable -> stays Armed
+        var o = m.Update(In(100.25, 6, 0, 0, 0, 0, 0, 100.00, 4, EmptyBook()));  // near drop 30->6, NO trades -> pull veto
+        Assert.Equal(SideState.Cooldown, o.Long);
+    }
+
     // A wall below significance does not arm.
     [Fact]
     public void Does_not_arm_when_wall_below_significance()
