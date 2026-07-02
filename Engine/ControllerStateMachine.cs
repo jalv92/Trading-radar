@@ -32,8 +32,9 @@ namespace TradingRadar.Engine
         public double LongWallPrice;
         public double ShortWallPrice;
         // Fix 3 (day-1 capture observability): per-candidate diagnostics, not consumed by any decision
-        // logic — just surfaced for the next Rec capture. DistTicks follows the same validity rule as
-        // *WallPrice (0 unless that side is Armed/Countdown/Fired); HoldCount/CooldownUntil are verbatim.
+        // logic — just surfaced for the next Rec capture. DistTicks stays valid through Cooldown too
+        // (round-2: the veto row needs the judgment distance — see DistTicksValid), unlike *WallPrice
+        // which is 0 unless that side is Armed/Countdown/Fired; HoldCount/CooldownUntil are verbatim.
         public int LongHoldCount;
         public int ShortHoldCount;
         public double LongDistTicks;
@@ -58,7 +59,8 @@ namespace TradingRadar.Engine
         public double ChopSlowZ = -0.3;          // z at/below this = quiet tape
         public int ChopAltCount = 3;             // aggressor sign changes over the window => chop
         public TimeSpan Cooldown = TimeSpan.FromSeconds(10);
-        public long MinDropBand = 3;             // ignore sub-band size jitter before the pull-veto decision — MEASURED
+        public double MinDropBandFrac = 0.12;    // MEASURED round-2 ES: flat 3 sat AT the p90-p95 jitter ceiling (median Drop-at-veto was exactly 3.0); 12% of Peak clears p95 jitter at median wall sizes
+        public int JudgeTicks = 2;               // MEASURED round-2 ES: TradeBackedFraction was 0.000 in 100% of vetoes beyond 2 ticks (TradedAt only matches AT the wall) — verdicts render only inside this radius
     }
 
     // The anti-flip spine. Two per-side candidates + a global CHOP gate. Pure: time via inp.Now.
@@ -114,8 +116,8 @@ namespace TradingRadar.Engine
             o.ShortWallPrice = IsIdentityHeld(_short.State) ? _short.WallPrice : 0;
             o.LongHoldCount = _long.HoldCount;
             o.ShortHoldCount = _short.HoldCount;
-            o.LongDistTicks = IsIdentityHeld(_long.State) ? Math.Abs(inp.Mid - _long.WallPrice) / _tick : 0;
-            o.ShortDistTicks = IsIdentityHeld(_short.State) ? Math.Abs(inp.Mid - _short.WallPrice) / _tick : 0;
+            o.LongDistTicks = DistTicksValid(_long.State) ? Math.Abs(inp.Mid - _long.WallPrice) / _tick : 0;
+            o.ShortDistTicks = DistTicksValid(_short.State) ? Math.Abs(inp.Mid - _short.WallPrice) / _tick : 0;
             o.LongCooldownUntil = _long.CooldownUntil;
             o.ShortCooldownUntil = _short.CooldownUntil;
             return o;
@@ -126,6 +128,14 @@ namespace TradingRadar.Engine
         private static bool IsIdentityHeld(SideState s)
         {
             return s == SideState.Armed || s == SideState.Countdown || s == SideState.Fired;
+        }
+
+        // DistTicks additionally stays valid through Cooldown: WallPrice is never cleared on the veto
+        // transition (Armed/Countdown -> Cooldown), and inp.Mid this call is the same value the verdict
+        // just used — so the veto row can log the exact judgment distance instead of reading 0.
+        private static bool DistTicksValid(SideState s)
+        {
+            return IsIdentityHeld(s) || s == SideState.Cooldown;
         }
 
         private bool Chop(ControllerInputs inp)
@@ -235,14 +245,24 @@ namespace TradingRadar.Engine
             if (cur < c.Min) c.Min = cur;
             ConsumptionRead r = ConsumptionTracker.Read(wallSide, c.WallPrice, c.Peak, cur, c.ArmTime, inp.Book);
             c.Fraction = r.Fraction; c.TradeBackedFraction = r.TradeBackedFraction;
-            if (r.Fraction <= 0 || r.Drop < _cfg.MinDropBand) return; // nothing eaten yet, or sub-band jitter — stay Armed
+
+            // Judge radius: verdicts (Countdown vs veto-dwell) only render within JudgeTicks of the
+            // wall — TradedAt only matches prints AT the wall, so judging trade-backing beyond that
+            // radius is tautologically 0 (round-2 measured: 100% of vetoes beyond 2 ticks). Between
+            // JudgeTicks and AwayTicks, Peak/Min keep accumulating and telemetry stays live, but no
+            // verdict fires — thinning on approach is evidence the at-touch judgment will use.
+            double distTicks = Math.Abs(inp.Mid - c.WallPrice) / _tick;
+            if (r.Fraction <= 0 || r.Drop < _cfg.MinDropBandFrac * c.Peak || distTicks >= _cfg.JudgeTicks)
+            { c.HoldCount = 0; return; } // nothing eaten, noise-band jitter, or too far for TradedAt to be trusted — stay Armed, reset veto dwell
             if (r.TradeBackedFraction >= _cfg.MinTradeBackedRatio)
-                c.State = SideState.Countdown;
-            else
-            {
-                // Thinning NOT explained by trades = pull/spoof: veto + cooldown.
-                c.State = SideState.Cooldown; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.HoldCount = 0;
-            }
+            { c.State = SideState.Countdown; c.HoldCount = 0; return; }
+            // Thinning NOT explained by trades = pull/spoof candidate. Require K CONSECUTIVE judgeable
+            // sub-ratio ticks (not one) before conceding the veto — a single sub-ratio read can be a
+            // print-matching miss, not a real pull; HoldCount is reset above the instant any tick fails
+            // to reproduce it, so only a sustained sub-ratio run reaches Cooldown.
+            c.HoldCount++;
+            if (c.HoldCount < _cfg.K) return; // require K consecutive judgeable sub-ratio ticks before conceding pull/spoof
+            c.State = SideState.Cooldown; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.HoldCount = 0;
         }
 
         private bool StepShort(ControllerInputs inp, bool chop, ref FireEvent fire)

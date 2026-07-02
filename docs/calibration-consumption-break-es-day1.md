@@ -83,3 +83,50 @@ also resolves the "instant away-abandon on Countdown entry" concern.
 Zero trades occurred; no PF/Sharpe/expectancy layer applies yet. Every downstream-gate number
 (FireFrac, DeltaFloor, ZFloor, K, ReloadFrac, Chop*, Cooldown) is a marginal-distribution proxy
 measured while the funnel was blocked upstream — re-derive once Countdown is reachable.
+
+## Round 2 (post-fix capture, same replay day 2026-06-24)
+
+First capture with the day-1 proximity-gate fix live. Acceptance check against the day-1 criteria:
+Countdown reached **exactly once** (criterion 1 satisfied — the bottleneck was real, not the only
+one); Armed reached the near-touch judgment band 7 more times without a verdict; fires **0**;
+`tradeBacked*` nonzero in only ~0.7% of judged (near-touch) rows — real signal now reaches the gate,
+but still thin at this sample size (n=1 Countdown).
+
+Population-level analysis of the day's 543 pull-vetoes found the veto judgment itself was
+tautological at distance (same shape as day-1, one gate closer to the wall): 100% of vetoes beyond
+2 ticks read `TradeBackedFraction = 0.000` by construction, and the flat `MinDropBand = 3` sat AT
+the p90–p95 jitter ceiling (median Drop-at-veto was exactly 3.0 — the threshold and the noise floor
+were the same number).
+
+### Validated params (kept as-is)
+
+| Param | Value | Evidence |
+|---|---|---|
+| `FireFrac` | 0.7 | The only relaxation tested that would have fired on the day's one confirmed-bad episode (forward −10 ticks) — no looser threshold needed. |
+| `ReloadFrac` | 0.25 | Correctly vetoed that same episode before it could fire — the reload gate is doing its job, not blocking good setups. |
+| `ChopSlowZ` / `ChopAltCount` | keep | Chop pair joint trigger rate 8.6–10.6% — healthy (not over- or under-firing). |
+
+### Structural changes (this round)
+
+1. **`MinDropBand` → `MinDropBandFrac` (0.12 of Peak).** A flat contract count can't scale across
+   wall sizes; the old `3` sat exactly at the p90–p95 jitter ceiling (median Drop-at-veto == 3.0),
+   so it was measuring noise, not signal. 12% of Peak clears that ceiling at median wall sizes.
+2. **`JudgeTicks` (2) — judge radius inside `AwayTicks`.** `TradeBackedFraction` was 0.000 in 100%
+   of vetoes beyond 2 ticks (`TradedAt` only matches prints AT the wall) — verdicts now render only
+   inside this radius; Peak/Min keep accumulating between `JudgeTicks` and `AwayTicks` so the
+   at-touch judgment still sees the real approach drop, it just doesn't render a premature verdict.
+3. **K-dwell on the pull-veto path + `DistTicksValid` including Cooldown.** The veto now requires K
+   consecutive judgeable sub-ratio ticks (same debounce StepCountdown already had on the fire path),
+   and `ctrl*DistTicks` reads 0 on 100% of veto rows because `IsIdentityHeld` excluded Cooldown —
+   blind exactly at the judgment moment. `WallPrice` is never cleared on the veto transition, so the
+   veto row can now log the real judgment distance.
+
+### Open investigations (NOT coded this round)
+
+- **8.3% non-monotonic CSV timestamps.** The lenses' race theory (two writers interleaving rows)
+  partially contradicts `MaybeRunEngine` as written — needs a real trace before touching anything,
+  not a guess-and-fix.
+- **Sub-1s Waiting↔Armed flicker in ~53–57% of episodes.** Two conflicting root-cause theories in
+  play — `SignificanceBand` hysteresis (wall oscillating around the threshold) vs. zero-size depth
+  blips (a momentary bad read, not a real pull) — diagnose which one it actually is before coding
+  either fix.

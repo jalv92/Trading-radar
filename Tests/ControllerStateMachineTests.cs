@@ -88,7 +88,10 @@ public class ControllerStateMachineTests
         m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 98.50, 1, EmptyBook()));         // arm far away
         m.Update(In(100.25, 30, 0, 0, 0, 0, 0, 98.50, 2, EmptyBook()));          // far thin -> re-baselines to 30
         m.Update(In(100.25, 30, 0, 0, 0, 0, 0, 100.00, 3, EmptyBook()));         // arrives near, wall stable -> stays Armed
-        var o = m.Update(In(100.25, 6, 0, 0, 0, 0, 0, 100.00, 4, EmptyBook()));  // near drop 30->6, NO trades -> pull veto
+        ControllerOutput o = default(ControllerOutput);
+        // K=3 consecutive judged sub-ratio ticks (near drop 30->6, NO trades) before veto.
+        for (int s = 4; s <= 6; s++)
+            o = m.Update(In(100.25, 6, 0, 0, 0, 0, 0, 100.00, s, EmptyBook()));
         Assert.Equal(SideState.Cooldown, o.Long);
     }
 
@@ -126,7 +129,10 @@ public class ControllerStateMachineTests
     {
         var m = Machine();
         m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));          // arm
-        var o = m.Update(In(100.25, 60, 0, 0, 0, 0, 0, 100.00, 2, EmptyBook()));   // size dropped, NO prints => pull
+        ControllerOutput o = default(ControllerOutput);
+        // K=3 consecutive judged sub-ratio ticks (mid at the wall, well within JudgeTicks) before veto.
+        for (int s = 2; s <= 4; s++)
+            o = m.Update(In(100.25, 60, 0, 0, 0, 0, 0, 100.00, s, EmptyBook()));   // size dropped, NO prints => pull
         Assert.Equal(SideState.Cooldown, o.Long);
     }
 
@@ -259,8 +265,47 @@ public class ControllerStateMachineTests
     {
         var m = Machine();
         m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));            // arm peak 120
-        var o = m.Update(In(100.25, 119, 0, 0, 0, 0, 0, 100.00, 2, EmptyBook()));    // 1-lot drop, no trades, < MinDropBand -> stay Armed
+        var o = m.Update(In(100.25, 110, 0, 0, 0, 0, 0, 100.00, 2, EmptyBook()));    // drop 10, no trades, < 0.12*Peak(=14.4) -> stay Armed
         Assert.Equal(SideState.Armed, o.Long);
+    }
+
+    // Round-2: between JudgeTicks(2) and AwayTicks(6) a verdict must NOT render — TradedAt can't be
+    // trusted at that distance yet — but Peak/Min keep accumulating (no re-baseline, that stays
+    // exclusive to >= AwayTicks). Proof Peak wasn't reset to cur: if it had been, Fraction would read
+    // 0 every tick (Peak==Min==cur immediately); instead it holds at the real Drop-derived value.
+    [Fact]
+    public void Verdict_deferred_in_judge_to_away_band_peak_does_not_rebaseline()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 99.50, 1, EmptyBook()));         // arm, mid 3 ticks from wall (JudgeTicks < 3 < AwayTicks)
+        ControllerOutput o = default(ControllerOutput);
+        for (int s = 2; s <= 5; s++)
+            o = m.Update(In(100.25, 80, 0, 0, 0, 0, 0, 99.50, s, EmptyBook())); // heavy untraded drop, still 3 ticks away -> no verdict rendered
+        Assert.Equal(SideState.Armed, o.Long);                                  // no Cooldown despite a large untraded drop
+        Assert.True(o.LongFraction > 0);                                        // Peak carried over (120), not re-baselined to cur (80)
+    }
+
+    // K-dwell veto reset regression: a single tick where the wall refills enough to push Drop back
+    // under MinDropBandFrac*Peak must reset the veto-dwell counter — firing (here, conceding the pull
+    // veto) requires K CONSECUTIVE judged sub-ratio ticks, not K total across an interruption.
+    [Fact]
+    public void Veto_dwell_resets_on_partial_refill_needs_3_consecutive()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));          // arm peak 120, near-touch (1 tick)
+        m.Update(In(100.25, 80, 0, 0, 0, 0, 0, 100.00, 2, EmptyBook()));           // sub-ratio judged tick 1 (HoldCount=1)
+        var o = m.Update(In(100.25, 80, 0, 0, 0, 0, 0, 100.00, 3, EmptyBook()));   // sub-ratio judged tick 2 (HoldCount=2)
+        Assert.Equal(SideState.Armed, o.Long);
+
+        o = m.Update(In(100.25, 115, 0, 0, 0, 0, 0, 100.00, 4, EmptyBook()));      // partial refill: Drop(5) < 0.12*Peak(14.4) -> HoldCount resets to 0
+        Assert.Equal(SideState.Armed, o.Long);
+
+        m.Update(In(100.25, 80, 0, 0, 0, 0, 0, 100.00, 5, EmptyBook()));           // fresh run tick 1 (HoldCount=1)
+        o = m.Update(In(100.25, 80, 0, 0, 0, 0, 0, 100.00, 6, EmptyBook()));       // fresh run tick 2 (HoldCount=2)
+        Assert.Equal(SideState.Armed, o.Long);                                    // still armed — needs 3 CONSECUTIVE, not 2+2
+
+        o = m.Update(In(100.25, 80, 0, 0, 0, 0, 0, 100.00, 7, EmptyBook()));       // 3rd CONSECUTIVE sub-ratio judged tick -> veto
+        Assert.Equal(SideState.Cooldown, o.Long);
     }
 
     // Wall-identity guard: if NT's dominant ask wall hops to a different price after arming,
