@@ -65,6 +65,16 @@ namespace TradingRadar.NT
         private volatile Instrument _instrument;   // volatile: read in the handler guard on the instrument thread
         private volatile Frame _latest;       // immutable snapshot + mid + tick, swapped from instrument thread
         private volatile bool _replayResetPending;  // set on instrument thread by HandleReplayReset; consumed on the UI paint tick
+        // Round-8: LATCHED fire handoff. Frame.Fired is a one-shot flag on an immutable Frame — at high
+        // Market Replay speeds (~24x+) a Fired frame is replaced by the next engine run within a couple ms
+        // of WALL time, while the UI paint tick only samples _latest at ~30Hz wall (~33ms period), so the
+        // one-shot flag was sampled and lost almost every time (measured: 5/5 fires lost in a full-day
+        // capture). _pendingFire/_pendingFireSet decouple "a fire happened" from "which Frame is current" —
+        // written under _engineLock in MaybeRunEngine, consumed-and-cleared under the same lock on the next
+        // paint tick, so delivery no longer depends on the paint tick's sampling rate vs. the engine's.
+        private FireEvent _pendingFire;
+        private volatile bool _pendingFireSet;
+        private long _droppedFires;   // latest-wins overwrites of an unconsumed pending fire — should stay 0
         private DispatcherTimer _paintTimer;
         private bool _subscribed;
         private int      _depthEvents;
@@ -233,10 +243,18 @@ namespace TradingRadar.NT
                     // reuse the already-marshaled book mid + biggest-wall prices for live PnL + LMT anchoring;
                     // f.Now is the REPLAY-aware market clock AUTO mode's auto-cancel timer ages against.
                     _chartTrader.SetContext(f.Mid, f.WallAbove, f.WallBelow, f.Tick, f.Now);
-                    // ControllerOutput.Fired is one-shot by engine contract (see ControllerStateMachine),
-                    // so this delivers exactly once per fire even though the paint tick re-reads f.Fired
-                    // every ~33ms — the next Frame swap carries Fired=false again.
-                    if (f.Fired) _chartTrader.OnSetupFire(f.Fire);
+                    // Round-8: LATCHED consume, not a Frame.Fired sample. At high replay speed the one-shot
+                    // Frame.Fired flag lives only ~ms of wall time before the next engine run replaces the
+                    // Frame — far shorter than this ~33ms paint period — so sampling f.Fired here lost
+                    // almost every fire (measured 5/5 in a full-day capture). _pendingFireSet instead stays
+                    // true across paint ticks until explicitly consumed here, under the same _engineLock the
+                    // writer (MaybeRunEngine) uses, so no fire can land between the read and the clear.
+                    if (_pendingFireSet)
+                    {
+                        FireEvent pf;
+                        lock (_engineLock) { pf = _pendingFire; _pendingFireSet = false; }
+                        _chartTrader.OnSetupFire(pf);   // ChartTrader's own FireEvent.Time dedupe still guards double-delivery
+                    }
                 }
                 // Push the Chart Trader's active working limit order onto the ladder as an overlay marker.
                 double ordPx; bool ordBuy; int ordQty;
@@ -294,6 +312,7 @@ namespace TradingRadar.NT
                     _latest  = null;
                     _lastEngineRun = DateTime.MinValue;   // don't carry the old instrument's engine clock
                     _medianEwma    = 0;                   // (a stale high-water would spuriously reset/throttle)
+                    _pendingFireSet = false;               // a pre-switch fire must not fire into the new instrument
                 }
                 if (_chartTrader != null) _chartTrader.Instrument = value;
                 Subscribe();
@@ -531,6 +550,23 @@ namespace TradingRadar.NT
                 Mid = pMid, Now = now, Book = _book
             };
             ControllerOutput cout = _controller.Update(cin);
+            // Round-8: LATCH the fire immediately (still inside the caller's _engineLock). Overwrite
+            // latest-wins if a prior pending fire wasn't consumed yet by the paint tick — this is the
+            // rare/anomalous case (paint tick starved far longer than one engine run) and gets counted,
+            // not silently lost.
+            if (cout.Fired)
+            {
+                if (_pendingFireSet)
+                {
+                    _droppedFires++;
+                    NinjaTrader.Code.Output.Process(
+                        string.Format("[Radar] DROPPED FIRE #{0} @ {1:HH:mm:ss} — prior pending fire not yet consumed by the paint tick",
+                            _droppedFires, now),
+                        NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+                }
+                _pendingFire = cout.Fire;
+                _pendingFireSet = true;
+            }
             // Day-1 capture gap: a full arm->drop->veto cycle was observed to complete and reset between
             // two 2s heartbeat rows, leaving no trace in the CSV. Snapshot the state transition BEFORE
             // _lastCtrl is overwritten below, so the sig writer can force an immediate row on any change.
@@ -685,6 +721,7 @@ namespace TradingRadar.NT
             _lastMidLog = DateTime.MinValue;
             _medianEwma = 0;
             _latest     = null;
+            _pendingFireSet = false;   // a stale pre-rewind fire must not be delivered into replayed history
             _replayResetPending = true;   // paint tick (UI thread) drops RadarVisual's ladder memory + anchor
             NinjaTrader.Code.Output.Process(
                 string.Format("[Radar] replay reset detected @ {0:HH:mm:ss} — book+tracker reseeded", now),
@@ -702,10 +739,10 @@ namespace TradingRadar.NT
             int nodes = _latest != null && _latest.Nodes != null ? _latest.Nodes.Count : 0;
             string msg = string.Format(
                 "[Radar] {0:HH:mm:ss} depth#={1} trade#={2} | bids={3} asks={4} | maxBid={5} maxAsk={6}" +
-                " medBid={7} medAsk={8} | MinAbs={9} Kx={10} nodes={11}",
+                " medBid={7} medAsk={8} | MinAbs={9} Kx={10} nodes={11} dropped={12}",
                 now, _depthEvents, _tradeEvents, bids.Count, asks.Count, maxB, maxA,
                 _book.MedianSize(Side.Bid), _book.MedianSize(Side.Ask),
-                _cfg.MinAbsSize, _cfg.K_mult, nodes);
+                _cfg.MinAbsSize, _cfg.K_mult, nodes, _droppedFires);
             NinjaTrader.Code.Output.Process(msg, NinjaTrader.NinjaScript.PrintTo.OutputTab1);
         }
 

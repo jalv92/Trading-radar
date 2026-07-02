@@ -476,3 +476,57 @@ a signal.
 4. Quality bar: roughly 1:1 good:false across the fires this build produces. If it comes in worse
    than 1:2, the fix is to shorten `ZTrustSeconds` alone — do not touch `ZFloor`, `FireFrac`, or
    `ReloadFrac` off this signal, per the HOLDs above.
+
+## Round 8 (lossy fire delivery at replay speed)
+
+### The evidence
+
+A full-day AUTO capture (`lr-signals-ES-20260702-120805.csv` / `lr-auto-ES-20260702-120815.csv`)
+run at ~24x Market Replay speed (a 7h session replayed in ~17min wall) showed: the controller
+FIRED 5 times (Fired-state rows at 09:31/10:20/11:00/12:04/13:30, HoldCount progression finally
+visible per round-7's instrumentation), AUTO was armed 100% of the rows — yet the AUTO log
+contains ONLY the arm event. `OnSetupFire` was never invoked, for any of the 5 fires. Zero
+prestage rows, zero guard-skip rows, zero submits.
+
+### Root cause
+
+`ControllerOutput.Fired` (and the `Frame.Fired`/`Frame.Fire` copy `MaybeRunEngine` puts on the
+immutable `Frame`) is a one-shot flag by engine contract — true for exactly the one engine run
+that produced the fire, false again the next run. The UI paint tick (`DispatcherTimer`, ~33ms
+wall period) read `f.Fired` off `_latest` once per tick and delivered on a true read. At 1x replay
+speed a Fired frame lives ~50ms of WALL time (the engine's own ~20Hz throttle, `EngineIntervalMs`)
+— longer than the ~33ms paint period, so the paint tick was guaranteed to sample it before the
+next engine run replaced it. At ~24x replay speed the SAME 50ms of REPLAY time collapses to ~2ms
+of WALL time, because the engine throttle in `MaybeRunEngine` throttles on the replay clock
+(`now`, sourced from `e.Time`), not wall clock. A ~2ms-wide true window sampled by a ~33ms-period
+tick is missed on roughly 15 of every 16 attempts — the fire delivery was a **lossy sampled
+handoff**, and the loss rate is a direct function of replay speed. This also retroactively explains
+round-3's 3 undelivered fires across the 5-day run: round-3's hypothesis list never considered
+this mechanism because at 1x the frame lives long enough to be sampled reliably — the loss only
+appears once replay speed compresses the Fired frame's wall-clock lifetime below the paint period.
+
+### The fix
+
+Replaced the sampled `Frame.Fired` read with a LATCHED handoff in `NinjaTrader/RadarTab.cs`:
+- `_pendingFire`/`_pendingFireSet` (plus a `_droppedFires` counter) decouple "a fire happened" from
+  "which Frame is current." `MaybeRunEngine` sets them immediately after `_controller.Update(cin)`,
+  still inside the caller's `_engineLock` — no separate lock needed there.
+- The paint tick now checks `_pendingFireSet` (not `f.Fired`) and atomically consumes it under
+  `_engineLock` before calling `_chartTrader.OnSetupFire` (the ChartTrader call itself stays
+  outside the lock). `_pendingFireSet` stays true across as many paint ticks as it takes to be
+  consumed — no more racing the engine's replacement of `_latest`.
+- `Frame.Fired`/`Frame.Fire` are left in place (still the shape `CockpitVisual` could read, though
+  in practice `CockpitVisual.SetFrame` only takes `ControllerOutput`, which carries its own
+  longer-lived `SideState.Fired` — unaffected by this bug or this fix).
+- Reset hygiene: `_pendingFireSet` is cleared in the `Instrument` setter (alongside the rest of the
+  engine-state rebuild) and in `HandleReplayReset`, so a fire latched before an instrument switch
+  or a replay rewind can never fire into the new instrument/history.
+- A latest-wins overwrite of an unconsumed pending fire increments `_droppedFires` and prints an
+  immediate `[Radar] DROPPED FIRE #n` line — the existing periodic `[Radar]` diag line also now
+  reports the cumulative `dropped=` count.
+
+### Acceptance criterion for the next run
+
+Every Fired transition in the sig CSV must have a matching prestage row (and then a guard-outcome
+or submit row) in the AUTO log within the same second. `_droppedFires` should read 0, or if not,
+the `[Radar] DROPPED FIRE` lines should account for every miss.
