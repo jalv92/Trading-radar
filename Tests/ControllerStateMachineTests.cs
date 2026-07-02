@@ -683,8 +683,8 @@ public class ControllerStateMachineTests
         Assert.False(o.Fired);
         Assert.Equal(1, o.LongHoldCount);
 
-        // z swings to -1.5 only 300ms later with every other term still green — well inside
-        // ZTrustSeconds(1.0) of the T(3.0) pass, so the latch reads this tick's z-leg as PASS too.
+        // z swings to -1.5 only 300ms later with every other term still green — inside
+        // ZTrustSeconds(0.35) of the T(3.0) pass, so the latch reads this tick's z-leg as PASS too.
         o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: -1.5, alt: 0, mid: 100.00, sec: 3.3, book: BookWithBuys(100.25, 90, 3)));
         Assert.False(o.Fired);
         Assert.Equal(2, o.LongHoldCount);
@@ -709,7 +709,7 @@ public class ControllerStateMachineTests
         var o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 3.0, book: BookWithBuys(100.25, 90, 3))); // pass, latches T(3.0)
         Assert.Equal(1, o.LongHoldCount);
 
-        // 1.5s later (> ZTrustSeconds(1.0)) z is still below ZFloor — the latch has expired, so this
+        // 1.5s later (> ZTrustSeconds(0.35)) z is still below ZFloor — the latch has expired, so this
         // tick's z-leg genuinely fails; the window does not advance past the single earlier pass.
         o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 0.5, alt: 0, mid: 100.00, sec: 4.5, book: BookWithBuys(100.25, 90, 4)));
         Assert.False(o.Fired);
@@ -732,20 +732,42 @@ public class ControllerStateMachineTests
         var o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 3.0, book: BookWithBuys(100.25, 90, 3))); // pass, latches T(3.0)
         Assert.Equal(1, o.LongHoldCount);
 
-        // Drift 3 ticks away (>= JudgeTicks(2), < AwayTicks(6)) only 200ms later — well inside
-        // ZTrustSeconds(1.0) of the T(3.0) pass by the clock alone. The !nearWall path must
+        // Drift 3 ticks away (>= JudgeTicks(2), < AwayTicks(6)) only 100ms later — well inside
+        // ZTrustSeconds(0.35) of the T(3.0) pass by the clock alone. The !nearWall path must
         // hard-reset BOTH PassBits and the z-latch (round-7), or the pass from just before the drift
         // would wrongly survive it.
-        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 99.50, sec: 3.2, book: BookWithBuys(100.25, 90, 4)));
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 99.50, sec: 3.1, book: BookWithBuys(100.25, 90, 4)));
         Assert.Equal(SideState.Countdown, o.Long);
         Assert.Equal(0, o.LongHoldCount);
 
-        // Back near the wall 200ms later still (400ms total since the T(3.0) pass — inside
-        // ZTrustSeconds if the latch had survived) with z now genuinely failing — must NOT fire off
-        // the stale pass.
-        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 0.5, alt: 0, mid: 100.00, sec: 3.4, book: BookWithBuys(100.25, 90, 5)));
+        // Back near the wall 150ms later still (250ms total since the T(3.0) pass — still inside
+        // ZTrustSeconds(0.35) if the latch had survived the drift) with z now genuinely failing —
+        // must NOT count off the stale pass.
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 0.5, alt: 0, mid: 100.00, sec: 3.25, book: BookWithBuys(100.25, 90, 5)));
         Assert.False(o.Fired);
         Assert.Equal(0, o.LongHoldCount);
+    }
+
+    // Review round-7 (Important #1): the latch must fail CLOSED on a backward tick. RadarTab's
+    // small-backward branch passes sub-2s out-of-order stamps through without a reset; without the
+    // monotonic guard, (Now - LastZPassTime) goes negative — trivially <= ZTrustSeconds — and zPass
+    // sticks open regardless of the real z until some reset site fires.
+    [Fact]
+    public void ZLatch_fails_closed_on_a_backward_tick()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));             // arm peak 120
+        var b2 = BookWithBuys(100.25, 60, 2);
+        m.Update(In(100.25, 60, 0, 0, 20, 2.0, 0, 100.00, 2, b2));                     // -> Countdown
+
+        var o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: 5.0, book: BookWithBuys(100.25, 90, 3))); // pass, latches T(5.0)
+        Assert.Equal(1, o.LongHoldCount);
+
+        // Backward tick (T(4.8) < latch T(5.0)) with z genuinely failing and everything else green:
+        // the guard must read the z-leg as FAILED (a negative span must not count as "recent pass").
+        o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 0.5, alt: 0, mid: 100.00, sec: 4.8, book: BookWithBuys(100.25, 90, 4)));
+        Assert.False(o.Fired);
+        Assert.Equal(1, o.LongHoldCount);   // fail bit shifted in — the pass count must NOT advance
     }
 
     // Change 2: ControllerOutput.Long/ShortPeak/Min mirror the tracked candidate verbatim — 0/0

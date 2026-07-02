@@ -69,7 +69,12 @@ namespace TradingRadar.Engine
         // until Countdown-conditional data exists
         public long DeltaFloor = 30;              // |AggressorDelta| agreeing to confirm
         public double ZFloor = 1.5;              // tape-speed z-score to confirm
-        public double ZTrustSeconds = 1.0; // placeholder, mirrors BlindTrustSeconds precedent — calibrate once PassBits-triggered capture exists (round-7)
+        // Review round-7 arithmetic: KWindow(5) spans ~250ms at the 20Hz engine ceiling; a 1.0s latch
+        // would make the z-leg "one spike per second" (~4x the window) instead of "bridge a jitter dip".
+        // 0.35s ≈ 1.4x the window span and covers the measured ~236ms z swings. Placeholder — grade
+        // against fired-episode forward returns once the PassBits-triggered capture exists; if quality
+        // lands worse than 1:2 good:false, shorten THIS knob alone (acceptance criterion #4).
+        public double ZTrustSeconds = 0.35;
         public int K = 3;                        // snapshots meeting fire pre-conditions required within KWindow
         public int KWindow = 5; // MEASURED round-4 ES: full confluence exists but breaks on single-tick z/frac jitter before 3 consecutive; 3-of-5 keeps sustained-confluence semantics while tolerating 1-2 jitter dips — placeholder, calibrate with fires
         public double ReloadFrac = 0.25;         // refill above running-min (as frac of peak) => reload veto
@@ -266,7 +271,11 @@ namespace TradingRadar.Engine
             // the SAME tick. LastZPassTime == MinValue ("never passed") makes the subtraction a huge
             // TimeSpan, which correctly fails the comparison below with no separate guard needed.
             if (inp.TapeZScore >= _cfg.ZFloor) c.LastZPassTime = inp.Now;
-            bool zPass = (inp.Now - c.LastZPassTime).TotalSeconds <= _cfg.ZTrustSeconds;
+            // Monotonic guard (review round-7): a backward tick (sub-2s feed jitter passes RadarTab's
+            // small-backward branch without a reset) would make the subtraction negative — trivially
+            // <= ZTrustSeconds — sticking zPass open regardless of the real z. Fail closed instead.
+            bool zPass = inp.Now >= c.LastZPassTime
+                         && (inp.Now - c.LastZPassTime).TotalSeconds <= _cfg.ZTrustSeconds;
             bool pre = r.Fraction >= _cfg.FireFrac
                        && r.TradeBackedFraction >= _cfg.MinTradeBackedRatio
                        && deltaOk && zPass && !chop;
