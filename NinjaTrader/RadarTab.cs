@@ -23,6 +23,11 @@ namespace TradingRadar.NT
             public IReadOnlyList<DepthLevel> Asks;
             public double Mid;
             public double Tick;
+            // REPLAY-aware market-data clock (the `now` MaybeRunEngine already threads through — sourced
+            // from e.Time on the instrument thread, not wall clock). Fed to RadarChartTrader.SetContext so
+            // its AUTO-mode auto-cancel timer ages against market time, which is what a Market Replay
+            // calibration run (variable/paused speed) actually needs — not DateTime.Now/UtcNow.
+            public DateTime Now;
             public double WallAbove;   // price of the biggest wall above mid this run (0 = none found)
             public double WallBelow;   // price of the biggest wall below mid this run (0 = none found)
             // Task 10: Controller spine + tape-speed reads, rendered by CockpitVisual (Task 11) and
@@ -211,8 +216,9 @@ namespace TradingRadar.NT
                 {
                     _visual.SetFrame(f.Nodes, f.Bids, f.Asks, f.Mid, f.Tick);
                     _cockpit.SetFrame(f.Ctrl, f.BuyPerSec, f.SellPerSec, f.TapeZ, f.BookSkew);
-                    // reuse the already-marshaled book mid + biggest-wall prices for live PnL + LMT anchoring
-                    _chartTrader.SetContext(f.Mid, f.WallAbove, f.WallBelow, f.Tick);
+                    // reuse the already-marshaled book mid + biggest-wall prices for live PnL + LMT anchoring;
+                    // f.Now is the REPLAY-aware market clock AUTO mode's auto-cancel timer ages against.
+                    _chartTrader.SetContext(f.Mid, f.WallAbove, f.WallBelow, f.Tick, f.Now);
                     // ControllerOutput.Fired is one-shot by engine contract (see ControllerStateMachine),
                     // so this delivers exactly once per fire even though the paint tick re-reads f.Fired
                     // every ~33ms — the next Frame swap carries Fired=false again.
@@ -515,6 +521,7 @@ namespace TradingRadar.NT
                 Asks  = new List<DepthLevel>(pAsks),
                 Mid   = pMid,
                 Tick  = _cfg.TickSize,
+                Now   = now,
                 WallAbove = wallAbovePx,
                 WallBelow = wallBelowPx,
                 Ctrl = cout, Fired = cout.Fired, Fire = cout.Fire,

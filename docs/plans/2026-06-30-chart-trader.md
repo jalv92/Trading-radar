@@ -53,6 +53,68 @@ Order ticket docked under the Cockpit in RadarTab's right column. **Layout (NT8-
 
 **Real-money VETO stands; preconditions are now F1(re-scoped)–F19** (F11/F12/F15/F16/F17 done; F1/F2/F6/F7/F14 widened; F13/F14 + F1(bracket-mandate)/F2/F9/F10 + **F18/F19** deferred to the real gate). **The Consumption-Break pre-stage (commit `43b9934`) is CLEARED for Sim/Playback only** — verified no auto-submit, ARM LIVE + Sim-default intact. Re-submit for VETO review once F1(re-scoped)–F8, F13/F14 and F18/F19 (plus F9 if prop) are implemented. Until then: **Sim/Playback testing only.**
 
+## AUTO mode (2026-07-01, Sim/Playback only)
+
+Built on top of the Consumption-Break pre-stage above, in `RadarChartTrader.cs` only (`RadarTab.cs`
+gained one plumbing field — see Time source below). When armed, a Controller fire auto-submits the
+already-pre-staged limit through the SAME `SubmitLimit` → `SubmitRaw` path a manual LMT click uses — no
+parallel order logic, no new NT8 Account/Order API.
+
+**Toggle:** an "AUTO" checkbox + status label, docked in Row 1 next to the "SETUP listo" indicator (the
+340px dock height in `RadarTab` is unchanged). Amber accent when armed, Muted otherwise; the status label
+shows why the system disarmed it (e.g. "AUTO: cap 5/5", "AUTO: cuenta no-Sim"). Can only ARM
+(`TryArmAuto`) when `IsSimAccount` (the same fail-closed helper the ARM LIVE gate trusts) is true AND an
+ATM template is selected (`_atmUserPicked` + `SelectedAtmStrategy != null`).
+
+**Force-disarm** (`ForceDisarmAuto`, no-op if already disarmed) fires on: account switch, instrument
+switch, the ATM selector closing on None, the daily cap being reached, and a manual **Flat** click
+(kill-switch semantics). It does NOT disarm across `OnReplayReset` — a Playback rewind is the
+calibration workflow this mode exists for, not a reason to drop the arm.
+
+**The 6 guards** (evaluated in `TryAutoFire`, called from `OnSetupFire` right after the pre-stage is
+stored; every skip Diag's and leaves the pre-stage lit for manual use):
+1. AUTO not armed → no-op (today's behavior, unchanged).
+2. Busy — `_activeLimit` still working OR the position isn't flat (`IsFlat()`, reuses `CurrentPosition()`).
+3. Daily cap — `AutoFireCapPerDay = 5` (placeholder, "matches the setup's expected 0-5 fires/day"),
+   counted per REPLAY date (`FireEvent.Time.Date`, not wall clock) so a new replay day resets the count.
+   Hitting the cap force-disarms.
+4. Anti-stale (F18's essence, enforced pre-emptively at fire time) — skip if `_lastPrice <= 0` or the
+   pre-stage is already marketable-through by more than `AutoStaleTicks = 2` (placeholder) ticks, so a
+   reversed/late break can never auto-become an unconditional marketable fill.
+5. All clear → `SubmitLimit(isBuy, isAuto: true)` — identical validation/ATM-attach/ownership path a
+   manual click takes.
+6. Auto-cancel of the unfilled AUTO limit — a still-working AUTO-submitted order (tracked via
+   `_autoOrder`/`_autoSubmittedAt`, a manual order never sets these) is cancelled through the existing
+   `CancelActiveLimitIfWorking` path once `AutoCancelSeconds = 15` (placeholder) of REPLAY time have
+   elapsed unfilled. Checked every `SetContext` tick (~30Hz UI feed), never on manual limits.
+
+**Time source (the one RadarTab.cs change):** the auto-cancel clock uses the REPLAY-aware market-data
+clock, not wall clock. `RadarTab`'s internal `Frame` gained a `Now` field carrying the `now`/`e.Time`
+value `MaybeRunEngine` already threads through every engine run, and `SetContext` gained a `DateTime now`
+parameter to receive it. Wall clock (`DateTime.Now`/`UtcNow`) would desync from Playback's speed
+(paused, sped up, rewound) — exactly during the calibration runs AUTO mode exists to support — so a
+15-wall-second timeout could fire early or late relative to how much market time the order actually
+aged. This is the only edit to `RadarTab.cs`; no engine file changed.
+
+**Constants — all placeholders pending the Rec-CSV calibration pass (spec §9), like every other
+Controller threshold in this file:** `AutoFireCapPerDay = 5`, `AutoStaleTicks = 2`,
+`AutoCancelSeconds = 15`.
+
+**Scope: Sim/Playback only.** AUTO adds no new path to a real account — `TryArmAuto`'s `IsSimAccount`
+check fails closed exactly like ARM LIVE, so AUTO can never arm on a real account regardless of ARM LIVE
+state. **Real-account AUTO is out of scope until the risk-manager re-reviews it post-calibration**, under
+the same F1–F19 preconditions above (F18's stale-price fail-safe is now also pre-emptively enforced by
+guard 4, but the click-time re-check F18 calls for is still unimplemented for the manual path).
+
+**Follow-ups (deferred, not blocking):**
+- `_autoOrder`/`_autoSubmittedAt` are tracked alongside `_activeLimit` rather than folded into it, so
+  the two are mirrored/nulled at 4 call sites instead of 1 — deliberate for this pass (the lifecycle was
+  just reviewed fresh); revisit if a 5th mirror site appears or the two drift. Not pure duplication
+  though: an auto order rejected before ever reaching `Working` never touches `_activeLimit` at all —
+  only `_autoOrder` lets `OnOrderUpdate`'s terminal-state branch clean up that case.
+- The checkbox+status-label WrapPanel pattern (ARM LIVE, now AUTO) is inlined twice — extract a shared
+  helper if a 3rd toggle needs it.
+
 ### Sim test checklist for the ATM path (before trusting it)
 1. Open the tab, pick a Sim/Playback account + instrument → confirm the **ATM box shows nothing pre-selected** (blank), i.e. no auto-picked template.
 2. Select an ATM template, take a bracketed BUY/SELL MKT → let it fill → confirm the ATM's stop/target appear at the broker AND that the **ladder marker / ▲▼ do NOT latch onto the ATM's target** (F15 check — they should stay tied only to your own manual LMT, if any).

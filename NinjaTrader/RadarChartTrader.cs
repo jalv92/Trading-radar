@@ -18,6 +18,7 @@ namespace TradingRadar.NT
     {
         private static readonly SolidColorBrush Emerald = Brush(0x34, 0xd3, 0x99);
         private static readonly SolidColorBrush Coral    = Brush(0xfb, 0x71, 0x85);
+        private static readonly SolidColorBrush Amber    = Brush(0xf5, 0xa8, 0x23);   // AUTO-armed accent
         private static readonly SolidColorBrush Ink      = Brush(0x0f, 0x14, 0x20);
         private static readonly SolidColorBrush Panel    = Brush(0x12, 0x18, 0x26);
         private static readonly SolidColorBrush Muted    = Brush(0x9a, 0xa4, 0xb2);
@@ -90,6 +91,16 @@ namespace TradingRadar.NT
         // OnSetupFire can be called twice with the IDENTICAL FireEvent. FireEvent.Time is unique per fire.
         private DateTime _lastFireTime = DateTime.MinValue;
 
+        // AUTO mode (2026-07-01, Sim/Playback only) — auto-submits the pre-stage above through the SAME
+        // SubmitLimit -> SubmitRaw path a manual click uses. See TryAutoFire/TryArmAuto below.
+        private bool _autoArmed;
+        private bool _suppressAutoChkEvent;      // true while SetAutoArmed programmatically (re)sets the checkbox
+        private DateTime _now;                   // replay-aware "now", pushed every SetContext tick — NOT wall clock
+        private DateTime _autoFireDay = DateTime.MinValue;   // REPLAY date the fire count below is keyed to
+        private int _autoFireCount;
+        private Order _autoOrder;                // the one working limit this control auto-submitted (null = none)
+        private DateTime _autoSubmittedAt;        // replay time of that auto-submit, for the auto-cancel timeout
+
         private readonly ComboBox _accountCombo = new ComboBox { Margin = new Thickness(0, 0, 6, 0) };
         private readonly CheckBox _armChk = new CheckBox { Content = "ARM LIVE", Visibility = Visibility.Collapsed,
             Foreground = Coral, FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
@@ -104,6 +115,13 @@ namespace TradingRadar.NT
         private readonly TextBlock _setupText = new TextBlock { FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
             FontWeight = FontWeights.SemiBold, HorizontalAlignment = HorizontalAlignment.Center,
             Margin = new Thickness(0, 0, 0, 2), Visibility = Visibility.Collapsed, Cursor = Cursors.Hand };
+        // AUTO arm toggle + status label (why it's off when the system disarmed it) — see TryArmAuto.
+        // Foreground toggles Muted/Amber with armed state in SetAutoArmed (amber = the "live" accent).
+        private readonly CheckBox _autoChk = new CheckBox { Content = "AUTO",
+            Foreground = Muted, FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
+            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
+        private readonly TextBlock _autoStatusText = new TextBlock { FontFamily = new FontFamily("Segoe UI"), FontSize = 10,
+            VerticalAlignment = VerticalAlignment.Center, Foreground = Muted };
         private readonly Button _buyBtn;
         private readonly Button _sellBtn;
         private readonly Button _buyLmtBtn;
@@ -156,6 +174,8 @@ namespace TradingRadar.NT
             _accountCombo.SelectionChanged += (o, e) => OnAccountSelected();
             _armChk.Checked   += (o, e) => { _armedFor = _account; RefreshArmUi(); };
             _armChk.Unchecked += (o, e) => { _armedFor = null; RefreshArmUi(); };
+            _autoChk.Checked   += (o, e) => { if (!_suppressAutoChkEvent) TryArmAuto(); };
+            _autoChk.Unchecked += (o, e) => { if (!_suppressAutoChkEvent) SetAutoArmed(false, null); };
 
             Action commitQty = () =>
             {
@@ -170,8 +190,10 @@ namespace TradingRadar.NT
             AddRow(0, TwoColRow(_buyBtn, _sellBtn, 8, 4));
 
             // Row 1: BUY LMT / SELL LMT — wall-anchored (see LimitAnchorPrice()), plus the "listo"
-            // pre-stage indicator (Task 12) directly underneath — same row slot, stacked content.
-            AddRow(1, new StackPanel { Children = { TwoColRow(_buyLmtBtn, _sellLmtBtn, 8, 0), _setupText } });
+            // pre-stage indicator (Task 12) and the AUTO arm toggle (2026-07-01) directly underneath —
+            // same row slot, stacked content, so the 340px dock height (RadarTab) is untouched.
+            AddRow(1, new StackPanel { Children = { TwoColRow(_buyLmtBtn, _sellLmtBtn, 8, 0), _setupText,
+                new WrapPanel { Margin = new Thickness(8, 0, 8, 2), Children = { _autoChk, _autoStatusText } } } });
 
             // Row 2: ▲ / ▼ — move the active working limit 1 tick; disabled when none is working.
             AddRow(2, TwoColRow(_upBtn, _dnBtn, 8, 0));
@@ -217,7 +239,11 @@ namespace TradingRadar.NT
                 _atmSelector.HorizontalAlignment = HorizontalAlignment.Stretch;
                 // F16: only DropDownClosed (a real open+close by the user) can arm ATM attach — the
                 // control's own async repopulation (on Account/Instrument push) never fires this event.
-                _atmSelector.DropDownClosed += (o, e) => { _atmUserPicked = _atmSelector.SelectedAtmStrategy != null; };
+                _atmSelector.DropDownClosed += (o, e) =>
+                {
+                    _atmUserPicked = _atmSelector.SelectedAtmStrategy != null;
+                    if (!_atmUserPicked) ForceDisarmAuto("ATM en None");   // guard 2 of the AUTO arm precondition broke
+                };
                 var atmRow = new DockPanel();
                 atmRow.Children.Add(atmLbl);
                 atmRow.Children.Add(_atmSelector);
@@ -340,6 +366,7 @@ namespace TradingRadar.NT
                 _wallAbove = 0;
                 _wallBelow = 0;
                 _activeLimit = null;
+                _autoOrder = null;
                 _pendingReplace = null;
                 _workingOrders.Clear();
                 _ownOrders.Clear();
@@ -347,6 +374,7 @@ namespace TradingRadar.NT
                 _atmSelector.Instrument = value;
                 _atmSelector.SelectedItem = null;   // force "None" — don't trust the control's own default
                 _atmUserPicked = false;             // F16: switching instrument disarms ATM attach again
+                ForceDisarmAuto("cambio de instrumento");
                 RefreshArmUi();
                 RefreshPositionUi();
             }
@@ -354,18 +382,28 @@ namespace TradingRadar.NT
 
         // Called by RadarTab's UI-thread paint timer with the already-marshaled book mid + biggest-wall
         // prices above/below mid — reuses the existing instrument subscription instead of a new feed.
-        public void SetContext(double mid, double wallAbove, double wallBelow, double tick)
+        // `now` is the REPLAY-aware market-data clock (RadarTab's Frame.Now, sourced from e.Time on the
+        // instrument thread), not wall clock — Playback can run faster/slower/paused than real time, so
+        // the AUTO auto-cancel timeout below must age against market time, not DateTime.Now/UtcNow.
+        public void SetContext(double mid, double wallAbove, double wallBelow, double tick, DateTime now)
         {
             if (mid > 0) _lastPrice = mid;
             _wallAbove = wallAbove;
             _wallBelow = wallBelow;
             if (tick > 0) _tick = tick;
+            _now = now;
+            MaybeAutoCancel();
             RefreshPositionUi();
         }
 
         // Placeholder join-tolerance for the break pre-stage price, in ticks — MEASURED later from Rec
         // CSV (spec §9), like every other Controller threshold.
         private const int SetupJoinToleranceTicks = 1;
+
+        // AUTO mode placeholders (2026-07-01) — pending the same Rec-CSV calibration pass (spec §9).
+        private const int AutoFireCapPerDay = 5;    // matches the setup's expected 0-5 fires/day
+        private const int AutoStaleTicks = 2;       // MEASURED later — anti-stale tolerance at auto-fire time (F18)
+        private const int AutoCancelSeconds = 15;   // MEASURED later — unfilled auto limit auto-cancels after this long
 
         // Called by RadarTab's UI-thread paint tick (same thread as SetContext/Instrument — no Dispatcher
         // marshal needed) when the Controller fires. PRE-STAGES ONLY: pre-fills price+side for the next
@@ -402,6 +440,98 @@ namespace TradingRadar.NT
 
             _pendingSetup = new PendingSetup { IsBuy = isBuy, Price = RoundToTick(price, tick) };
             ApplyPendingSetupUi();
+            TryAutoFire(f, isBuy, tick);   // AUTO mode (2026-07-01) — guards 1-4, evaluated after the pre-stage above is stored
+        }
+
+        // ---- AUTO mode (2026-07-01, Sim/Playback only) ----
+        // Armed only via TryArmAuto/SetAutoArmed below. When armed, a Controller fire auto-submits the
+        // pre-stage OnSetupFire just stored, through the SAME SubmitLimit -> SubmitRaw path a human LMT
+        // click uses (ValidateForSubmit/CanTrade/ATM-attach/ownership all apply unchanged) — no parallel
+        // order path, no new NT8 Account/Order API. Each skip below Diag's and leaves the pre-stage lit
+        // for manual use (only the daily-cap skip also force-disarms).
+        // `tick` is passed in from OnSetupFire's own EffectiveTick() call — same fire event, same tick.
+        private void TryAutoFire(FireEvent f, bool isBuy, double tick)
+        {
+            if (!_autoArmed) return;                                     // guard 1
+            if (!ValidateForSubmit()) return;                            // no instrument/account, order in flight, not Sim/armed (Diag'd inside)
+            if (_activeLimit != null || !IsFlat(CurrentPosition()))         // guard 2: busy
+            {
+                Diag("AUTO skip — busy (working limit or open position).");
+                return;
+            }
+
+            DateTime day = f.Time.Date;                                  // REPLAY time — a new replay day resets the count
+            if (day != _autoFireDay) { _autoFireDay = day; _autoFireCount = 0; }
+            if (_autoFireCount >= AutoFireCapPerDay)                      // guard 3: daily cap
+            {
+                string capStatus = _autoFireCount + "/" + AutoFireCapPerDay;
+                Diag("AUTO skip — daily cap " + capStatus + " reached.");
+                ForceDisarmAuto("cap " + capStatus);   // route through the one disarm gate
+                return;
+            }
+
+            // guard 4: anti-stale (F18 essence) — a fire whose pre-stage is already marketable-through
+            // beyond tolerance must not become an unconditional marketable entry (F18's late-signal case).
+            bool marketableThrough = isBuy
+                ? _pendingSetup.Price - _lastPrice > AutoStaleTicks * tick
+                : _lastPrice - _pendingSetup.Price > AutoStaleTicks * tick;
+            if (_lastPrice <= 0 || marketableThrough)
+            {
+                Diag(string.Format("AUTO skip — stale at fire (setup {0:0.00} vs mid {1:0.00}).", _pendingSetup.Price, _lastPrice));
+                return;
+            }
+
+            _autoFireCount++;                                            // all clear — fire
+            Diag(string.Format("AUTO submit — {0} LMT @ {1:0.00} ({2}/{3} today).",
+                isBuy ? "BUY" : "SELL", _pendingSetup.Price, _autoFireCount, AutoFireCapPerDay));
+            SubmitLimit(isBuy, isAuto: true);
+        }
+
+        // Auto-cancel of an unfilled AUTO-submitted limit — never a manual one (reference-checked against
+        // _autoOrder, which only SubmitRaw's isAuto branch sets). Checked every SetContext tick (the
+        // ~30Hz UI feed) against the REPLAY-aware _now (see SetContext) — see that comment for why wall
+        // clock would be wrong here (Playback speed != 1x, or paused, decouples wall time from market time).
+        private void MaybeAutoCancel()
+        {
+            if (_autoOrder == null || !ReferenceEquals(_activeLimit, _autoOrder)) return;
+            if ((_now - _autoSubmittedAt).TotalSeconds < AutoCancelSeconds) return;
+            Diag("AUTO cancel — unfilled auto limit aged out after " + AutoCancelSeconds + "s.");
+            CancelActiveLimitIfWorking("auto-cancel");   // same cancel path Rev/Close/opposite-side use
+        }
+
+        // One definition of "flat", 4 users: guard 2 below, RefreshPositionUi, Reverse, ClosePosition —
+        // all paired with their own CurrentPosition() call (some need the non-flat Position afterward).
+        private static bool IsFlat(Position pos)
+        {
+            return pos == null || pos.MarketPosition == MarketPosition.Flat || pos.Quantity == 0;
+        }
+
+        private void TryArmAuto()
+        {
+            if (!IsSimAccount(_account)) { SetAutoArmed(false, "cuenta no-Sim"); return; }
+            if (!_atmUserPicked || _atmSelector.SelectedAtmStrategy == null) { SetAutoArmed(false, "selecciona ATM"); return; }
+            SetAutoArmed(true, null);
+        }
+
+        // Force-disarm from a broken precondition or the Flat kill-switch. No-op if already disarmed, so
+        // routine account/instrument switches don't spam Diag when AUTO was never armed.
+        private void ForceDisarmAuto(string reason)
+        {
+            if (!_autoArmed) return;
+            SetAutoArmed(false, reason);
+        }
+
+        private void SetAutoArmed(bool armed, string reason)
+        {
+            _autoArmed = armed;
+            _suppressAutoChkEvent = true;   // re-sync the checkbox without re-entering Checked/Unchecked
+            _autoChk.IsChecked = armed;
+            _suppressAutoChkEvent = false;
+            if (!armed && reason != null) Diag("AUTO disarmed — " + reason + ".");
+            SolidColorBrush accent = armed ? Amber : Muted;
+            _autoChk.Foreground = accent;
+            _autoStatusText.Text = armed ? "AUTO armado" : reason != null ? "AUTO: " + reason : string.Empty;
+            _autoStatusText.Foreground = accent;
         }
 
         // Lights the pre-staged LMT button in the Aurora fire color (same glow the MKT buttons already
@@ -505,6 +635,7 @@ namespace TradingRadar.NT
             _armedFor = null;           // arming never carries over to a newly selected account
             _armChk.IsChecked = false;
             _activeLimit = null;        // order tracking is per-account (orders/positions differ)
+            _autoOrder = null;
             _pendingReplace = null;
             _workingOrders.Clear();
             _ownOrders.Clear();
@@ -512,6 +643,7 @@ namespace TradingRadar.NT
             _atmSelector.Account = _account;
             _atmSelector.SelectedItem = null;   // force "None" — don't trust the control's own default
             _atmUserPicked = false;             // F16: switching account disarms ATM attach again
+            ForceDisarmAuto("cambio de cuenta");
             SubscribeAccount();
             RefreshArmUi();
             RefreshPositionUi();
@@ -547,6 +679,7 @@ namespace TradingRadar.NT
                 {
                     _ownOrders.Remove(ord);
                     _activeLimit = null;   // TryGetActiveOrder now returns false → the paint tick clears the marker
+                    if (ReferenceEquals(_autoOrder, ord)) _autoOrder = null;
                 }
                 else
                     // Still present + non-terminal after a reset trip: either a false trip (order genuinely
@@ -615,6 +748,7 @@ namespace TradingRadar.NT
                     _workingOrders.Remove(ord);   // HashSet.Remove is a no-op if already gone
                     _ownOrders.Remove(ord);
                     if (ReferenceEquals(_activeLimit, ord)) _activeLimit = null;
+                    if (ReferenceEquals(_autoOrder, ord)) _autoOrder = null;
                     // Opposite-side flip: the old order we cancelled just reached its terminal state —
                     // fire the stashed replacement now (only if it actually got Cancelled, not Filled/Rejected).
                     if (_pendingReplace != null && ReferenceEquals(_pendingReplace.WaitingOn, ord))
@@ -680,11 +814,9 @@ namespace TradingRadar.NT
                 _pnlText.Text = string.Empty;
                 return;
             }
-            Position pos;
-            lock (_account.Positions)
-                pos = _account.Positions.FirstOrDefault(p => p.Instrument == _instrument);
+            Position pos = CurrentPosition();
 
-            if (pos == null || pos.MarketPosition == MarketPosition.Flat || pos.Quantity == 0)
+            if (IsFlat(pos))
             {
                 _posText.Text = "FLAT";
                 _posText.Foreground = Muted;
@@ -774,7 +906,10 @@ namespace TradingRadar.NT
             return RoundToTick(_lastPrice + tick, tick);
         }
 
-        private void SubmitLimit(bool isBuy)
+        // isAuto=true only from TryAutoFire (AUTO mode) — guard 2 there guarantees _activeLimit is null,
+        // so the re-anchor/flip branches below are unreachable on that path; it always falls through to
+        // the fresh SubmitRaw call at the bottom, which is where isAuto is threaded to _autoOrder.
+        private void SubmitLimit(bool isBuy, bool isAuto = false)
         {
             if (!ValidateForSubmit()) return;
             if (_lastPrice <= 0) { Diag("blocked — no price context yet."); return; }
@@ -826,7 +961,7 @@ namespace TradingRadar.NT
                 return;
             }
 
-            SubmitRaw(action, OrderType.Limit, qty, price, tag, isEntry: true);
+            SubmitRaw(action, OrderType.Limit, qty, price, tag, isEntry: true, isAuto: isAuto);
         }
 
         // Change()'s the active working limit to a new price — used by both the ▲/▼ move and a
@@ -879,7 +1014,7 @@ namespace TradingRadar.NT
         {
             if (!ValidateForSubmit()) return;
             Position pos = CurrentPosition();
-            if (pos == null || pos.MarketPosition == MarketPosition.Flat || pos.Quantity == 0)
+            if (IsFlat(pos))
             {
                 Diag("Rev: no open position to reverse.");
                 return;
@@ -893,6 +1028,7 @@ namespace TradingRadar.NT
             if (!ValidateForSubmit()) return;
             if (cancelOrdersFirst)
             {
+                ForceDisarmAuto("Flat manual");   // kill-switch semantics — a manual Flat always disarms AUTO
                 // Flat = platform-native cancel-all-orders + close-position for this instrument/account.
                 try { _account.Flatten(new[] { _instrument }); }
                 catch (Exception ex) { Diag("Flat failed: " + ex.Message); }
@@ -901,7 +1037,7 @@ namespace TradingRadar.NT
             // A resting limit from this control could otherwise fill later and silently re-open the position.
             CancelActiveLimitIfWorking("close");
             Position pos = CurrentPosition();
-            if (pos == null || pos.MarketPosition == MarketPosition.Flat || pos.Quantity == 0)
+            if (IsFlat(pos))
                 return;
             OrderAction action = pos.MarketPosition == MarketPosition.Long ? OrderAction.Sell : OrderAction.Buy;
             SubmitRaw(action, OrderType.Market, pos.Quantity, 0, "Close");
@@ -911,7 +1047,9 @@ namespace TradingRadar.NT
         // ponytail: bracket SL/TP editor / TIF selector deferred. MKT + LMT (+ optional ATM) only.
         // isEntry=true (MKT/LMT buttons only — never Rev/Close) is the only path allowed to attach the
         // selected ATM template; Rev/Close always submit plain regardless of what's in the ATM selector.
-        private void SubmitRaw(OrderAction action, OrderType type, int qty, double limitPrice, string tag, bool isEntry = false)
+        // isAuto=true (AUTO mode, threaded from SubmitLimit only) seeds _autoOrder/_autoSubmittedAt so
+        // MaybeAutoCancel can later age this specific order out — a manual order never sets it.
+        private void SubmitRaw(OrderAction action, OrderType type, int qty, double limitPrice, string tag, bool isEntry = false, bool isAuto = false)
         {
             if (qty < 1) { Diag("blocked — qty < 1."); return; }
             // F16: ATM only attaches once the user has actually picked one via the dropdown (DropDownClosed) —
@@ -926,6 +1064,7 @@ namespace TradingRadar.NT
                 Order o = _account.CreateOrder(_instrument, action, type, OrderEntry.Manual,
                     TimeInForce.Day, qty, limitPrice, 0, string.Empty, orderName, NinjaTrader.Core.Globals.MaxDate, null);
                 _ownOrders.Add(o);   // F15: seed ownership the moment we create it — every order this control originates
+                if (isAuto) { _autoOrder = o; _autoSubmittedAt = _now; }
                 if (atm != null)
                 {
                     try
