@@ -183,22 +183,23 @@ public class ControllerStateMachineTests
         Assert.False(o.Fired);
 
         // Fast snap: mid drifts to 3 ticks away (< AwayTicks(6), so no abandon) with every other term
-        // still passing -> the near-wall gate blocks `pre` this tick, no fire. Round-4: the K-window
-        // register is NOT zeroed by a single miss (only abandon paths reset it) — it shifts in a fail
-        // bit, so the 2 earlier passes stay counted (reported count 2, unchanged from before the drift).
+        // still passing. Review round-4: price drift is NOT jitter — a near-wall miss HARD-resets the
+        // K-window register (unlike a z/frac dip, which only shifts a fail bit). The 2 banked passes
+        // are gone: one good tick after a snap-back must NOT complete the window (that would revive
+        // the round-3 bad-fire pattern: entered Countdown at 1.5 ticks, fired at 5.0 mid-dwell).
         var bDrift = BookWithBuys(100.25, 90, 5);
         o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 99.50, sec: 5, book: bDrift));
         Assert.Equal(SideState.Countdown, o.Long);
-        Assert.Equal(2, o.LongHoldCount);
+        Assert.Equal(0, o.LongHoldCount);
         Assert.False(o.Fired);
 
-        // Back near the wall with full confluence -> fires as soon as the window has K=3 passes AND
-        // the current tick passes (round-4: fires at the first of these ticks, not after a fresh K=3).
+        // Back near the wall with full confluence -> needs a FRESH K=3 passes; fires on the 3rd.
         int fires = 0;
-        for (int s = 6; s <= 8; s++)
+        for (int s = 6; s <= 9; s++)
         {
             var b = BookWithBuys(100.25, 90, s);
             o = m.Update(In(100.25, 30, 0, 0, delta: 40, z: 2.0, alt: 0, mid: 100.00, sec: s, book: b));
+            if (s == 7) Assert.False(o.Fired);   // 2 fresh passes only — the pre-drift bank must not count
             if (o.Fired) fires++;
         }
         Assert.Equal(1, fires);

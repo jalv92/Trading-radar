@@ -232,18 +232,22 @@ namespace TradingRadar.Engine
             // mid-dwell and fire anywhere up to AwayTicks out (round-3 real fire: entered Countdown at 1.5
             // ticks, fired at 5.0 after a fast snap during the K-dwell — the worst of the 3 fires).
             bool nearWall = Math.Abs(inp.Mid - c.WallPrice) / _tick < _cfg.JudgeTicks;
-            bool pre = nearWall && r.Fraction >= _cfg.FireFrac
+            // Price drift is NOT jitter (review round-4): the 3-of-5 window tolerates single-tick
+            // indicator dips (z/frac — the measured killer), but a wall snap-away must HARD-reset the
+            // register, or one good tick after a snap-back completes the window — reviving the exact
+            // round-3 bad-fire pattern (entered Countdown at 1.5 ticks, fired at 5.0 mid-dwell).
+            if (!nearWall) { c.PassBits = 0; return false; }
+            bool pre = r.Fraction >= _cfg.FireFrac
                        && r.TradeBackedFraction >= _cfg.MinTradeBackedRatio
                        && deltaOk && inp.TapeZScore >= _cfg.ZFloor && !chop;
 
-            // Round-4 K-window persistence: every surviving (non-abandoned) Countdown tick is judged
-            // — no non-judgeable tick exists here — so every tick shifts the register, pass or fail.
-            // This tolerates 1-2 jitter dips inside KWindow instead of the old "any single miss zeroes
-            // everything" consecutive-hold rule (measured: full confluence existed but never held 3
-            // CONSECUTIVE 20Hz ticks). Fire still requires THIS tick to be a passing, near-wall tick
-            // (the `pre` term below) — the order stages off the CURRENT tick's values, a sustained-but-
-            // stale window must not fire on a tick that itself failed.
-            int mask = (1 << _cfg.KWindow) - 1;
+            // Round-4 K-window persistence: every surviving NEAR-WALL Countdown tick is judged and
+            // shifts the register, pass or fail. This tolerates 1-2 jitter dips inside KWindow instead
+            // of the old "any single miss zeroes everything" consecutive-hold rule (measured: full
+            // confluence existed but never held 3 CONSECUTIVE 20Hz ticks). Fire still requires THIS
+            // tick to be a passing tick — the order stages off the CURRENT tick's values, a sustained-
+            // but-stale window must not fire on a tick that itself failed.
+            int mask = (1 << Math.Min(_cfg.KWindow, 30)) - 1;   // shift guard: KWindow >= 31 would silently break (int shift is mod-32)
             c.PassBits = ((c.PassBits << 1) | (pre ? 1 : 0)) & mask;
             if (!pre || PassCount(c.PassBits) < _cfg.K) return false;
 
