@@ -1,5 +1,10 @@
 # Liquidity Radar
 
+<p align="center">
+  <img src="docs/images/liquidity-radar-auto-fire.gif" alt="Liquidity Radar live on ES Market Replay: the Consumption-Break Controller goes WAITING → COUNTDOWN (83% of the wall consumed by trades) → FIRE; AUTO submits the pre-staged limit, fills LONG 1 @ 7608.00 with the ATM bracket attached, and the ATM target closes the trade at +281.25 $ (+22.5 ticks)" width="720">
+</p>
+<p align="center"><em>Live on ES (Market Replay): the Controller counts down a wall being <strong>eaten by trades</strong>, fires, <strong>AUTO</strong> submits the pre-staged limit — <code>LONG 1 @ 7608.00</code> with the ATM bracket attached — and the target closes it at <strong>+281.25 $ (+22.5 t)</strong>.</em></p>
+
 A standalone **NinjaTrader 8** add-on that reads Level-2 market depth and renders a vertical **"sonar ladder"** of resting liquidity, a **Consumption-Break Controller cockpit** — a stateful setup detector built on wall consumption and tape speed — and an integrated **order-entry ticket** with an optional **AUTO fire mode** — all in one floating window, independent of any chart.
 
 Unlike a plain DOM or heatmap, it **tracks each large order wall as an object with memory**: it remembers walls after they scroll beyond the visible 10 levels, and when price returns it classifies what happened — **Absorbed** (trades hit it, price held, it refilled — iceberg), **Pulled** (size vanished *without* trades — probable spoof), or **Consumed-through** (trades ate it and price broke past). Each read carries a **confidence score that decays while the level is out of view**.
