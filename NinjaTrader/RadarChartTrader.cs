@@ -135,10 +135,16 @@ namespace TradingRadar.NT
             VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
         private readonly TextBlock _autoStatusText = new TextBlock { FontFamily = new FontFamily("Segoe UI"), FontSize = 10,
             VerticalAlignment = VerticalAlignment.Center, Foreground = Muted };
+        // Configurable AUTO daily trade cap (2026-07-03, replaces the AutoFireCapPerDay const) — sits
+        // where the AUTO toggle used to, beside the ATM selector. Parsed at use (GetAutoCap), same
+        // late-parse pattern as _qtyBox, so raising it mid-day lets a cap-disarmed AUTO be re-armed.
+        private readonly TextBox _autoCapBox = new TextBox { Text = "10", Width = 40, Height = 22, FontSize = 11,
+            TextAlignment = TextAlignment.Center, Background = Ink, Foreground = TextCol, BorderBrush = BorderBr,
+            VerticalContentAlignment = VerticalAlignment.Center };
         // Trading-hours schedule for AUTO (2026-07-03): fires allowed only inside [start, end]; any
         // open position / working limit force-flattened once per day at the flat time. All three times
         // are judged against the REPLAY-aware clock (_now / FireEvent.Time) — i.e. the platform/feed
-        // timezone (ET on this setup) — never wall clock. UI row lives directly under the AUTO toggle.
+        // timezone (ET on this setup) — never wall clock. The AUTO toggle row sits directly below this one.
         private readonly CheckBox _hoursChk = new CheckBox { Content = "HOURS", IsChecked = true,
             Foreground = Muted, FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
             VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
@@ -307,7 +313,7 @@ namespace TradingRadar.NT
                 _atmSelector.DropDownClosed += (o, e) =>
                 {
                     _atmUserPicked = _atmSelector.SelectedAtmStrategy != null;
-                    if (!_atmUserPicked) ForceDisarmAuto("ATM en None");   // guard 2 of the AUTO arm precondition broke
+                    if (!_atmUserPicked) ForceDisarmAuto("ATM set to None");   // guard 2 of the AUTO arm precondition broke
                 };
                 // Same right margin as the account combo so both combos share the same right edge.
                 var atmRow = new DockPanel { Margin = new Thickness(0, 0, 10, 0) };
@@ -316,9 +322,16 @@ namespace TradingRadar.NT
 
                 _accountCombo.Margin = new Thickness(0, 0, 10, 6);   // gap to qty (right) + gap above ATM
 
-                // AUTO toggle + status sit under the qty group, beside the ATM selector.
-                var autoGroup = new WrapPanel { VerticalAlignment = VerticalAlignment.Center,
-                    Children = { _autoChk, _autoStatusText } };
+                // Daily trade cap for AUTO sits under the qty group, beside the ATM selector (the slot
+                // the AUTO toggle occupied before it moved below the HOURS row).
+                var capLbl = new TextBlock { Text = "Cap/day:", Margin = new Thickness(0, 0, 6, 0),
+                    VerticalAlignment = VerticalAlignment.Center, FontFamily = new FontFamily("Segoe UI"),
+                    FontSize = 11, Foreground = Muted };
+                var capGroup = new StackPanel { Orientation = Orientation.Horizontal,
+                    VerticalAlignment = VerticalAlignment.Center, Children = { capLbl, _autoCapBox } };
+                Action commitCap = () => { _autoCapBox.Text = GetAutoCap().ToString(); };
+                _autoCapBox.LostFocus += (o, e) => commitCap();
+                _autoCapBox.KeyDown   += (o, e) => { if (e.Key == Key.Enter) commitCap(); };
 
                 var grid = new Grid { Margin = new Thickness(8, 4, 8, 0) };
                 grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -326,10 +339,11 @@ namespace TradingRadar.NT
                 grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
                 grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
                 grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
                 Grid.SetColumn(_accountCombo, 0); Grid.SetRow(_accountCombo, 0); grid.Children.Add(_accountCombo);
                 Grid.SetColumn(qtyGroup, 1);      Grid.SetRow(qtyGroup, 0);      grid.Children.Add(qtyGroup);
                 Grid.SetColumn(atmRow, 0);        Grid.SetRow(atmRow, 1);        grid.Children.Add(atmRow);
-                Grid.SetColumn(autoGroup, 1);     Grid.SetRow(autoGroup, 1);     grid.Children.Add(autoGroup);
+                Grid.SetColumn(capGroup, 1);      Grid.SetRow(capGroup, 1);      grid.Children.Add(capGroup);
 
                 // Trading-hours row — directly under the ATM/AUTO row, spanning both columns and
                 // stretching edge to edge: labels take their natural width, the three time boxes each
@@ -350,6 +364,13 @@ namespace TradingRadar.NT
                 Grid.SetColumn(_hoursFlatBox, 5);  hoursRow.Children.Add(_hoursFlatBox);
                 Grid.SetColumn(hoursRow, 0); Grid.SetRow(hoursRow, 2); Grid.SetColumnSpan(hoursRow, 2);
                 grid.Children.Add(hoursRow);
+
+                // AUTO toggle + status — own full-width row directly below HOURS (moved 2026-07-03 from
+                // the ATM row's right slot, which the daily-cap box now occupies).
+                var autoGroup = new WrapPanel { VerticalAlignment = VerticalAlignment.Center,
+                    Margin = new Thickness(0, 5, 0, 0), Children = { _autoChk, _autoStatusText } };
+                Grid.SetColumn(autoGroup, 0); Grid.SetRow(autoGroup, 3); Grid.SetColumnSpan(autoGroup, 2);
+                grid.Children.Add(autoGroup);
 
                 var armWrap = new WrapPanel { Margin = new Thickness(8, 4, 8, 4),
                     Children = { _armChk, _warnText } };
@@ -466,7 +487,7 @@ namespace TradingRadar.NT
                 _atmSelector.Instrument = value;
                 _atmSelector.SelectedItem = null;   // force "None" — don't trust the control's own default
                 _atmUserPicked = false;             // F16: switching instrument disarms ATM attach again
-                ForceDisarmAuto("cambio de instrumento");
+                ForceDisarmAuto("instrument changed");
                 // Roll the AUTO log so the next event opens a file named for the NEW instrument
                 // (review round-3 minor: the name is captured at first-open only).
                 if (_autoLogWriter != null) { _autoLogWriter.Flush(); _autoLogWriter.Dispose(); _autoLogWriter = null; }
@@ -510,7 +531,7 @@ namespace TradingRadar.NT
                 "HOURS — forced flatten at {0:00}:{1:00} (open position/working order past session end).",
                 _hoursFlat.Hours, _hoursFlat.Minutes));
             ClosePosition(cancelOrdersFirst: true);   // also force-disarms AUTO inside (kill-switch semantics)
-            // Re-state the disarm reason as the schedule (ClosePosition's internal disarm says "Flat manual").
+            // Re-state the disarm reason as the schedule (ClosePosition's internal disarm says "manual Flat").
             ForceDisarmAuto(string.Format("auto-flat {0:00}:{1:00}", _hoursFlat.Hours, _hoursFlat.Minutes));
         }
 
@@ -519,9 +540,18 @@ namespace TradingRadar.NT
         private const int SetupJoinToleranceTicks = 1;
 
         // AUTO mode placeholders (2026-07-01) — pending the same Rec-CSV calibration pass (spec §9).
-        private const int AutoFireCapPerDay = 5;    // matches the setup's expected 0-5 fires/day
         private const int AutoStaleTicks = 2;       // MEASURED later — anti-stale tolerance at auto-fire time (F18)
         private const int AutoCancelSeconds = 15;   // MEASURED later — unfilled auto limit auto-cancels after this long
+
+        // AUTO daily trade cap, read from the Cap/day box (default 10, was the AutoFireCapPerDay=5
+        // const). Parsed at use on the UI thread — every caller (guard 3, submit log) runs on the
+        // SetContext paint tick. Clamped to >=1: 0 would silently dead-arm AUTO forever.
+        private int GetAutoCap()
+        {
+            int cap;
+            if (!int.TryParse(_autoCapBox.Text, out cap) || cap < 1) cap = 1;
+            return cap;
+        }
 
         // Called by RadarTab's UI-thread paint tick (same thread as SetContext/Instrument — no Dispatcher
         // marshal needed) when the Controller fires. PRE-STAGES ONLY: pre-fills price+side for the next
@@ -584,7 +614,7 @@ namespace TradingRadar.NT
             if (!IsSimAccount(_account))                                  // guard 1b: re-assert Sim at fire time
             {
                 DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — account no longer Sim at fire time."); // fail-closed, mirrors CanTrade's per-submit re-check
-                ForceDisarmAuto("cuenta no-Sim");
+                ForceDisarmAuto("non-Sim account");
                 return;
             }
             // guard 1c (2026-07-03): trading-hours window — with the schedule enabled, AUTO only fires
@@ -612,9 +642,9 @@ namespace TradingRadar.NT
 
             DateTime day = f.Time.Date;                                  // REPLAY time — a new replay day resets the count
             if (day != _autoFireDay) { _autoFireDay = day; _autoFireCount = 0; }
-            if (_autoFireCount >= AutoFireCapPerDay)                      // guard 3: daily cap (burns on every ATTEMPT below,
+            if (_autoFireCount >= GetAutoCap())                           // guard 3: daily cap (burns on every ATTEMPT below,
             {                                                             // including one whose submit throws — conservative, deliberate)
-                string capStatus = _autoFireCount + "/" + AutoFireCapPerDay;
+                string capStatus = _autoFireCount + "/" + GetAutoCap();
                 DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — daily cap " + capStatus + " reached.");
                 ForceDisarmAuto("cap " + capStatus);   // route through the one disarm gate
                 return;
@@ -643,7 +673,7 @@ namespace TradingRadar.NT
             if (_atmSelector.SelectedAtmStrategy == null)
             {
                 DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — ATM lost at fire time.");
-                ForceDisarmAuto("ATM perdido");
+                ForceDisarmAuto("ATM lost");
                 return;
             }
 
@@ -675,8 +705,8 @@ namespace TradingRadar.NT
 
         private void TryArmAuto()
         {
-            if (!IsSimAccount(_account)) { SetAutoArmed(false, "cuenta no-Sim"); return; }
-            if (!_atmUserPicked || _atmSelector.SelectedAtmStrategy == null) { SetAutoArmed(false, "selecciona ATM"); return; }
+            if (!IsSimAccount(_account)) { SetAutoArmed(false, "non-Sim account"); return; }
+            if (!_atmUserPicked || _atmSelector.SelectedAtmStrategy == null) { SetAutoArmed(false, "select an ATM"); return; }
             SetAutoArmed(true, null);
         }
 
@@ -717,7 +747,7 @@ namespace TradingRadar.NT
             _buyLmtBtn.Effect = buyLive ? SetupGlow(Emerald.Color) : null;
             _sellLmtBtn.Effect = sellLive ? SetupGlow(Coral.Color) : null;
             _setupText.Visibility = _pendingSetup != null ? Visibility.Visible : Visibility.Collapsed;
-            _setupText.Text = buyLive ? "SETUP LONG listo · calibrando" : sellLive ? "SETUP SHORT listo · calibrando" : string.Empty;
+            _setupText.Text = buyLive ? "SETUP LONG ready · calibrating" : sellLive ? "SETUP SHORT ready · calibrating" : string.Empty;
             _setupText.Foreground = buyLive ? Emerald : Coral;
         }
 
@@ -832,7 +862,7 @@ namespace TradingRadar.NT
             _atmSelector.Account = _account;
             _atmSelector.SelectedItem = null;   // force "None" — don't trust the control's own default
             _atmUserPicked = false;             // F16: switching account disarms ATM attach again
-            ForceDisarmAuto("cambio de cuenta");
+            ForceDisarmAuto("account changed");
             SubscribeAccount();
             RefreshArmUi();
             RefreshPositionUi();
@@ -1295,7 +1325,7 @@ namespace TradingRadar.NT
             if (!ValidateForSubmit()) return;
             if (cancelOrdersFirst)
             {
-                ForceDisarmAuto("Flat manual");   // kill-switch semantics — a manual Flat always disarms AUTO
+                ForceDisarmAuto("manual Flat");   // kill-switch semantics — a manual Flat always disarms AUTO
                 // Flat = platform-native cancel-all-orders + close-position for this instrument/account.
                 try { _account.Flatten(new[] { _instrument }); }
                 catch (Exception ex) { Diag("Flat failed: " + ex.Message); }
@@ -1346,7 +1376,7 @@ namespace TradingRadar.NT
                     DiagAuto("submit", action.ToString(), limitPrice, _lastPrice,
                         string.Format(System.Globalization.CultureInfo.InvariantCulture,
                             "AUTO submit — {0} LMT @ {1:0.00}, order #{2}, qty {3} ({4}/{5} today).",
-                            action, limitPrice, o.Id, qty, _autoFireCount, AutoFireCapPerDay));
+                            action, limitPrice, o.Id, qty, _autoFireCount, GetAutoCap()));
                 if (atm != null)
                 {
                     try

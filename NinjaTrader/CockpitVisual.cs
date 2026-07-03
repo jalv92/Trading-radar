@@ -153,11 +153,11 @@ namespace TradingRadar.NT
             switch (bs.Kind)
             {
                 case BannerKind.SetupLong:
-                case BannerKind.SetupShort: sub = "● LATCHED · reset al cruzar / fallar el break"; break;
-                case BannerKind.Countdown:  sub = "muro comiéndose con trades"; break;
-                case BannerKind.Armed:      sub = "muro intacto — esperando erosión"; break;
-                case BannerKind.Chop:       sub = "tape lento y alternando"; break;
-                default:                    sub = "sin muro dominante armado"; break;
+                case BannerKind.SetupShort: sub = "● LATCHED · resets on break cross / fail"; break;
+                case BannerKind.Countdown:  sub = "wall being eaten by trades"; break;
+                case BannerKind.Armed:      sub = "wall intact — waiting for erosion"; break;
+                case BannerKind.Chop:       sub = "slow, alternating tape"; break;
+                default:                    sub = "no dominant wall armed"; break;
             }
             Left(dc, sub, x + 14, y + 56, 10, Muted2, dpi);
             return y + bh + Gap;
@@ -169,7 +169,7 @@ namespace TradingRadar.NT
             double ch = 62;
             if (y + ch > h - pad) return y;
             dc.DrawRoundedRectangle(CardBg, CardLn, new Rect(x, y, cw, ch), 8, 8);
-            Left(dc, "CONSUMO DEL MURO", x + 12, y + 10, 11, Muted, dpi);
+            Left(dc, "WALL CONSUMPTION", x + 12, y + 10, 11, Muted, dpi);
             // Same rank-based side resolution as the banner (ResolveActiveSide) — an idle side (Waiting
             // or a reload-vetoed Cooldown, which deliberately keeps its frozen Fraction in the engine)
             // paints as 0, never a stale bar the banner itself reads as inactive.
@@ -177,7 +177,7 @@ namespace TradingRadar.NT
             double frac = a.Any ? Clamp01(a.Fraction) : 0.0;
             Color fillColor = a.Any ? (a.IsLong ? Bid : Ask) : SlateC;
             int pct = (int)Math.Round(frac * 100);
-            RightM(dc, pct + "% comido", x + cw - 12, y + 6, 16, a.Any ? new SolidColorBrush(fillColor) : Slate, dpi);
+            RightM(dc, pct + "% eaten", x + cw - 12, y + 6, 16, a.Any ? new SolidColorBrush(fillColor) : Slate, dpi);
             double bx = x + 12, by = y + 34, bw = cw - 24, bh2 = 14;
             dc.DrawRoundedRectangle(Track, CardLn, new Rect(bx, by, bw, bh2), 7, 7);
             double fillW = bw * frac;
@@ -194,7 +194,7 @@ namespace TradingRadar.NT
             double ch = 76;
             if (y + ch > h - pad) return y;
             dc.DrawRoundedRectangle(CardBg, CardLn, new Rect(x, y, cw, ch), 8, 8);
-            Left(dc, "VELOCIDAD DEL TAPE", x + 12, y + 10, 11, Muted, dpi);
+            Left(dc, "TAPE SPEED", x + 12, y + 10, 11, Muted, dpi);
             double buy = Math.Max(0, _buyPerSec), sell = Math.Max(0, _sellPerSec);
             LeftM(dc, "-" + sell.ToString("0", CultureInfo.InvariantCulture) + "/s", x + 12, y + 24, 13, AskTxt, dpi);
             RightM(dc, "+" + buy.ToString("0", CultureInfo.InvariantCulture) + "/s", x + cw - 12, y + 24, 13, BidTxt, dpi);
@@ -232,7 +232,7 @@ namespace TradingRadar.NT
             dc.DrawRoundedRectangle(CardBg, CardLn, new Rect(x, y, cw, ch), 8, 8);
             bool lit = _ctrl.Chop;
             dc.DrawEllipse(lit ? new SolidColorBrush(AmberC) : B(Color.FromArgb(40, 0x94, 0xa3, 0xb8)), null, new Point(x + 22, y + ch / 2), 6, 6);
-            Left(dc, lit ? "CHOP · tape lento y alternando" : "CHOP", x + 38, y + (ch - 14) / 2, 12, lit ? AmberTxt : Muted2, dpi);
+            Left(dc, lit ? "CHOP · slow, alternating tape" : "CHOP", x + 38, y + (ch - 14) / 2, 12, lit ? AmberTxt : Muted2, dpi);
             Right(dc, "display-only", x + cw - 12, y + (ch - 11) / 2, 9.5, Muted2, dpi);
             return y + ch + Gap;
         }
@@ -242,7 +242,7 @@ namespace TradingRadar.NT
         {
             double sh = 24;
             if (y + sh > h - pad) return;
-            Left(dc, "SESGO DE LIBRO · contexto, no dispara", x, y, 9.5, Muted2, dpi);
+            Left(dc, "BOOK SKEW · context only, never fires", x, y, 9.5, Muted2, dpi);
             double by = y + 13, bw = cw, bh2 = 5, half = bw / 2.0;
             dc.DrawRoundedRectangle(Track, null, new Rect(x, by, bw, bh2), 3, 3);
             double v = Clamp(_bookSkew, -1, 1);
