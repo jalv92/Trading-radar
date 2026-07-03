@@ -16,6 +16,11 @@ namespace TradingRadar.Engine
         public double WallBelowPrice; public long WallBelowCurrent;   // dominant bid wall below (short candidate)
         public long AggressorDelta; public double TapeZScore; public int TapeAlternations;
         public double Mid; public DateTime Now; public BookMirror Book;
+        // Spec §5 / ADR 2026-07-03: rolling p85 of recent depth (DepthBaseline, fed by the NT layer).
+        // 0 while warming up. The arm gate uses max(cfg.SignificanceBand, this) — adaptive can only
+        // RAISE the bar above the compiled floor, and being a percentile of observed sizes it is
+        // bounded above by the max observed depth, so "never arm" is structurally unreachable.
+        public long AdaptiveSignificance;
     }
 
     public struct ControllerOutput
@@ -195,7 +200,7 @@ namespace TradingRadar.Engine
             switch (c.State)
             {
                 case SideState.Waiting:
-                    if (cur >= _cfg.SignificanceBand && inp.Now >= c.CooldownUntil)
+                    if (cur >= Math.Max(_cfg.SignificanceBand, inp.AdaptiveSignificance) && inp.Now >= c.CooldownUntil)
                     {
                         c.State = SideState.Armed; c.WallPrice = price;
                         c.Peak = cur; c.Min = cur; c.ArmTime = inp.Now; c.HoldCount = 0;
@@ -351,7 +356,7 @@ namespace TradingRadar.Engine
             switch (c.State)
             {
                 case SideState.Waiting:
-                    if (cur >= _cfg.SignificanceBand && inp.Now >= c.CooldownUntil)
+                    if (cur >= Math.Max(_cfg.SignificanceBand, inp.AdaptiveSignificance) && inp.Now >= c.CooldownUntil)
                     {
                         c.State = SideState.Armed; c.WallPrice = price;
                         c.Peak = cur; c.Min = cur; c.ArmTime = inp.Now; c.HoldCount = 0;

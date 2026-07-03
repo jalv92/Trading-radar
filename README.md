@@ -197,6 +197,7 @@ nt8c build --custom-dir build/.stage/Custom      # expect 0 errors
 - [`docs/plans/`](docs/plans) — the six build plans (engine, NT UI, pressure engine, anchored ladder, cockpit render, Chart Trader).
 - [`docs/measurement-cockpit-signals.md`](docs/measurement-cockpit-signals.md) — how the cockpit weights are (to be) measured from captured data.
 - [`docs/calibration-es-day1.md`](docs/calibration-es-day1.md) / [`docs/calibration-consumption-break-es-day1.md`](docs/calibration-consumption-break-es-day1.md) — day-1 ES calibration reports (root causes, config tables, acceptance criteria for the next capture).
+- [`docs/decisions/2026-07-03-ml-calibration-strategy.md`](docs/decisions/2026-07-03-ml-calibration-strategy.md) — ADR: how calibration becomes ML-driven (offline counterfactual calibrator, structural anti-collapse, the 10-distinct-day data gate, Phase 0 instrumentation).
 - [`docs/playbook-entries.md`](docs/playbook-entries.md) — the tape-reading playbook the setup was distilled from.
 - [`docs/mockups/radar-cockpit-demo.html`](docs/mockups/radar-cockpit-demo.html) — the interactive Aurora mockup the UI was built from.
 

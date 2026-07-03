@@ -829,6 +829,15 @@ namespace TradingRadar.NT
                         "order #" + ord.Id + " -> " + state + ".");
                 if (Order.IsTerminalState(state))
                 {
+                    // ADR 2026-07-03 Phase 0: realized-fill telemetry for EVERY own order (manual and
+                    // AUTO) — the future calibration label needs AverageFillPrice + filled qty, which
+                    // the order_update rows above (limit price only) cannot provide. Logged BEFORE the
+                    // bookkeeping below nulls _autoOrder, so the [auto] tag stays accurate.
+                    LogAuto("fill", ord.OrderAction.ToString(), ord.AverageFillPrice, _lastPrice,
+                        string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                            "order #{0} {1} — filled {2}/{3} @ {4:0.00}{5}",
+                            ord.Id, state, ord.Filled, ord.Quantity, ord.AverageFillPrice,
+                            ReferenceEquals(_autoOrder, ord) ? " [auto]" : ""));
                     _workingOrders.Remove(ord);   // HashSet.Remove is a no-op if already gone
                     _ownOrders.Remove(ord);
                     if (ReferenceEquals(_activeLimit, ord)) _activeLimit = null;

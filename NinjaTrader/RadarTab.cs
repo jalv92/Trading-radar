@@ -94,6 +94,14 @@ namespace TradingRadar.NT
         private TextBox  _minSizeBox;
         private CheckBox _autoChk;
         private volatile bool _capture;
+        // ADR 2026-07-03 Phase 0 — adaptive SignificanceBand baseline (spec §5: percentile of recent
+        // depth, never a fixed count) + per-Rec-session funnel counters for lr-sessions.csv.
+        private readonly DepthBaseline _depthBase = new DepthBaseline(16384);
+        private DateTime _lastDepthSample = DateTime.MinValue;
+        // Written on the instrument thread under _engineLock; every UI-thread read/reset also takes
+        // _engineLock (review 2026-07-03: an unlocked read-then-reset could clobber an in-flight
+        // increment and silently under-count the very funnel the fires=0 alarm watches).
+        private int _recArms, _recFires;
         private System.IO.StreamWriter _capWriter;
         private System.IO.StreamWriter _sigWriter;
         private readonly Dictionary<long, NodeState> _prevStates = new Dictionary<long, NodeState>();
@@ -189,19 +197,21 @@ namespace TradingRadar.NT
                     "ctrlWallAbovePx,ctrlWallAboveSz,ctrlWallBelowPx,ctrlWallBelowSz,tapeAlternations," +
                     "ctrlLongHold,ctrlShortHold,ctrlLongDistTicks,ctrlShortDistTicks,ctrlLongCooldownUntil,ctrlShortCooldownUntil,autoArmed," +
                     "ctrlLongPeak,ctrlLongMin,ctrlShortPeak,ctrlShortMin," +
-                    "src,seq");
+                    "src,seq,adaptiveSig");
                 _sigWriter.Flush();
                 _capture = true;
                 // Round-7: forces a sig row the instant either side's HoldCount moves (see the
                 // holdChanged trigger below) — reset on every Rec toggle-on, same as _prevStates.
                 _lastLoggedHoldL = -1;
                 _lastLoggedHoldS = -1;
+                lock (_engineLock) { _recArms = 0; _recFires = 0; }
             };
             recChk.Unchecked += (o, e) =>
             {
                 _capture = false;
                 if (_capWriter != null) { _capWriter.Flush(); _capWriter.Dispose(); _capWriter = null; }
                 if (_sigWriter != null) { _sigWriter.Flush(); _sigWriter.Dispose(); _sigWriter = null; }
+                WriteSessionSummary();
             };
             topBar.Children.Add(recChk);
             DockPanel.SetDock(topBar, Dock.Top);
@@ -316,6 +326,8 @@ namespace TradingRadar.NT
                     _lastEngineRun = DateTime.MinValue;   // don't carry the old instrument's engine clock
                     _medianEwma    = 0;                   // (a stale high-water would spuriously reset/throttle)
                     _pendingFireSet = false;               // a pre-switch fire must not fire into the new instrument
+                    _depthBase.Reset();                    // new instrument = new size distribution; don't inherit the old bar
+                    _lastDepthSample = DateTime.MinValue;
                 }
                 if (_chartTrader != null) _chartTrader.Instrument = value;
                 Subscribe();
@@ -488,6 +500,16 @@ namespace TradingRadar.NT
                 _cfg.MinAbsSize = Math.Max(1, (long)Math.Round(_autoFactor * _medianEwma));
             // Cockpit pressure inputs (same assembly as the lr-signals capture).
             var pBids = _book.Levels(Side.Bid); var pAsks = _book.Levels(Side.Ask);
+            // ADR 2026-07-03: sample the live book's level sizes into the depth-percentile baseline —
+            // one batch per second of market time, not per engine run (20Hz would resample the same
+            // resting book 20x and just autocorrelate). Reset on instrument switch / replay rewind.
+            if (_lastDepthSample == DateTime.MinValue || (now - _lastDepthSample).TotalSeconds >= 1.0)
+            {
+                _lastDepthSample = now;
+                for (int i = 0; i < pBids.Count; i++) _depthBase.Add(pBids[i].Volume);
+                for (int i = 0; i < pAsks.Count; i++) _depthBase.Add(pAsks[i].Volume);
+                _depthBase.EndBatch();
+            }
             long pBidMass = 0, pAskMass = 0;
             for (int i = 0; i < pBids.Count; i++) pBidMass += pBids[i].Volume;
             for (int i = 0; i < pAsks.Count; i++) pAskMass += pAsks[i].Volume;
@@ -550,7 +572,8 @@ namespace TradingRadar.NT
                 AggressorDelta = aggDelta15,
                 TapeZScore = _tape.ZScore,
                 TapeAlternations = _book.RecentAlternations(8),
-                Mid = pMid, Now = now, Book = _book
+                Mid = pMid, Now = now, Book = _book,
+                AdaptiveSignificance = _depthBase.P85
             };
             ControllerOutput cout = _controller.Update(cin);
             // Round-8: LATCH the fire immediately (still inside the caller's _engineLock). Overwrite
@@ -579,6 +602,14 @@ namespace TradingRadar.NT
             // silently skipping over the exact ticks HoldCount moves on. Force a row the instant
             // either side's HoldCount changes, same "snapshot before overwrite" pattern as ctrlStateChanged.
             bool holdChanged = cout.LongHoldCount != _lastLoggedHoldL || cout.ShortHoldCount != _lastLoggedHoldS;
+            // ADR 2026-07-03: per-Rec-session funnel counters (arms + fires) for lr-sessions.csv —
+            // snapshot the Waiting->Armed edges BEFORE _lastCtrl is overwritten below.
+            if (_capture)
+            {
+                if (cout.Long == SideState.Armed && _lastCtrl.Long == SideState.Waiting) _recArms++;
+                if (cout.Short == SideState.Armed && _lastCtrl.Short == SideState.Waiting) _recArms++;
+                if (cout.Fired) _recFires++;
+            }
             _lastCtrl = cout;   // read by the identity-contract lookup above on the NEXT engine run
             // Task 11: vote-less book-skew context for the Cockpit's demoted reference strip (spec §7) —
             // reuses the same pin assembled above; never a vote, never a trigger. `pin` itself is kept
@@ -682,7 +713,7 @@ namespace TradingRadar.NT
                             "{24:0.00},{25},{26:0.00},{27},{28}," +
                             "{29},{30},{31:0.00},{32:0.00},{33},{34},{35}," +
                             "{36},{37},{38},{39}," +
-                            "{40},{41}",
+                            "{40},{41},{42}",
                             now.ToString("o"), mid, bidMass, askMass, bestBid, bestAsk, delta15, wf, wabove, wpx,
                             wallAbovePx, wallAboveSz, wallBelowPx, wallBelowSz,
                             cout.LongFraction, cout.LongTradeBacked, cout.ShortFraction, cout.ShortTradeBacked,
@@ -694,7 +725,7 @@ namespace TradingRadar.NT
                             cout.ShortCooldownUntil == DateTime.MinValue ? "" : cout.ShortCooldownUntil.ToString("o"),
                             _chartTrader.IsAutoArmed,
                             cout.LongPeak, cout.LongMin, cout.ShortPeak, cout.ShortMin,
-                            src, seq));
+                            src, seq, cin.AdaptiveSignificance));
                         _sigWriter.Flush();
                         _lastLoggedHoldL = cout.LongHoldCount;
                         _lastLoggedHoldS = cout.ShortHoldCount;
@@ -723,12 +754,65 @@ namespace TradingRadar.NT
             _lastDiag   = DateTime.MinValue;
             _lastMidLog = DateTime.MinValue;
             _medianEwma = 0;
+            _depthBase.Reset();               // rewound history must not inherit the pre-rewind size distribution
+            _lastDepthSample = DateTime.MinValue;
             _latest     = null;
             _pendingFireSet = false;   // a stale pre-rewind fire must not be delivered into replayed history
             _replayResetPending = true;   // paint tick (UI thread) drops RadarVisual's ladder memory + anchor
             NinjaTrader.Code.Output.Process(
                 string.Format("[Radar] replay reset detected @ {0:HH:mm:ss} — book+tracker reseeded", now),
                 NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+        }
+
+        // ADR 2026-07-03 Phase 0: one summary row per Rec session (lr-sessions.csv) plus the quiet-
+        // degradation alarm — fires=0 across 3 consecutive Rec sessions that still ARMED normally
+        // means the fire gates (not the market) are suffocating the funnel. Report-only: it writes a
+        // flag row and an Output line, it never touches the Controller or the AUTO gates.
+        // Wall-clock DateTime.Now is deliberate here (session bookkeeping, not market data).
+        private void WriteSessionSummary()
+        {
+            try
+            {
+                string dir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "NinjaTrader 8", "LiquidityRadar");
+                System.IO.Directory.CreateDirectory(dir);
+                string path = System.IO.Path.Combine(dir, "lr-sessions.csv");
+                bool fresh = !System.IO.File.Exists(path);
+                // Snapshot + reset under the same lock the instrument thread increments with, so an
+                // in-flight engine run can't have its count clobbered by this read-then-reset.
+                int arms, fires;
+                lock (_engineLock) { arms = _recArms; fires = _recFires; _recArms = 0; _recFires = 0; }
+                // This session counts as "quiet" only if it armed but never fired; then extend the
+                // streak backwards over the previous rows until a firing (or arm-less) session breaks it.
+                int zeroStreak = (fires == 0 && arms > 0) ? 1 : 0;
+                if (!fresh && zeroStreak > 0)
+                {
+                    string[] lines = System.IO.File.ReadAllLines(path);
+                    for (int i = lines.Length - 1; i >= 1; i--)
+                    {
+                        string[] p = lines[i].Split(',');
+                        long rowArms, rowFires;
+                        if (p.Length < 4 || !long.TryParse(p[2], out rowArms) || !long.TryParse(p[3], out rowFires)) continue;
+                        if (rowFires == 0 && rowArms > 0) zeroStreak++; else break;
+                    }
+                }
+                string alert = zeroStreak >= 3
+                    ? "ALERT: fires=0 for " + zeroStreak + " consecutive Rec sessions with arms present — check the fire gates before blaming the market"
+                    : "";
+                using (var w = new System.IO.StreamWriter(path, true))
+                {
+                    if (fresh) w.WriteLine("time,instrument,arms,fires,alert");
+                    w.WriteLine(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "{0},{1},{2},{3},{4}",
+                        DateTime.Now.ToString("o"),
+                        _instrument != null ? _instrument.MasterInstrument.Name : "X",
+                        _recArms, _recFires, alert));
+                }
+                if (alert.Length > 0)
+                    NinjaTrader.Code.Output.Process("[Radar] " + alert, NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+                _recArms = 0; _recFires = 0;
+            }
+            catch { }   // diagnostics must never take down the tab
         }
 
         private void MaybeDiag(DateTime now)
