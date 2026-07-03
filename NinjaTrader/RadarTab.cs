@@ -786,11 +786,26 @@ namespace TradingRadar.NT
                 // logo's blue and magenta drifting endlessly behind the lockup. Transform/opacity
                 // animations run on WPF's render thread (independent animation) — no per-tick CPU work
                 // lands on the paint/engine threads.
+                // The blobs live on their own layer under a radial vignette OpacityMask: the smoke
+                // fades out BEFORE reaching any card edge, so the rectangular clip never slices a
+                // cloud in half (2026-07-03 screenshot feedback — hard straight cuts at the borders).
+                var smokeLayer = new Grid();
+                AddSmokeBlob(smokeLayer, Color.FromRgb(0x2f, 0x4d, 0x9e), 280, 110, -90, -26, 0.42, 17);   // deep blue
+                AddSmokeBlob(smokeLayer, Color.FromRgb(0xa0, 0x30, 0x60), 320, 120,  160, -32, 0.40, 23);  // wine magenta
+                AddSmokeBlob(smokeLayer, Color.FromRgb(0x24, 0x3a, 0x77), 240, 100,   40, -12, 0.34, 28);  // blue, slower
+                AddSmokeBlob(smokeLayer, Color.FromRgb(0xc2, 0x3d, 0x78), 260, 100,  340, -20, 0.36, 13);  // magenta, faster
+                var vignette = new RadialGradientBrush
+                {
+                    Center = new Point(0.5, 0.5), GradientOrigin = new Point(0.5, 0.5),
+                    RadiusX = 0.62, RadiusY = 1.05
+                };
+                vignette.GradientStops.Add(new GradientStop(Color.FromArgb(0xFF, 0xFF, 0xFF, 0xFF), 0.45));
+                vignette.GradientStops.Add(new GradientStop(Color.FromArgb(0x00, 0xFF, 0xFF, 0xFF), 1.0));
+                vignette.Freeze();
+                smokeLayer.OpacityMask = vignette;
+
                 var smokeHost = new Grid { ClipToBounds = true };
-                AddSmokeBlob(smokeHost, Color.FromRgb(0x2f, 0x4d, 0x9e), 280, 110, -90, -30, 0.42, 17);   // deep blue
-                AddSmokeBlob(smokeHost, Color.FromRgb(0xa0, 0x30, 0x60), 320, 120,  160, -40, 0.40, 23);  // wine magenta
-                AddSmokeBlob(smokeHost, Color.FromRgb(0x24, 0x3a, 0x77), 240, 100,   40,  -8, 0.34, 28);  // blue, slower
-                AddSmokeBlob(smokeHost, Color.FromRgb(0xc2, 0x3d, 0x78), 260, 100,  340, -18, 0.36, 13);  // magenta, faster
+                smokeHost.Children.Add(smokeLayer);
                 smokeHost.Children.Add(lockup);
 
                 return new Border
