@@ -152,7 +152,9 @@ namespace TradingRadar.NT
 
         private static TextBox MakeTimeBox(string text)
         {
-            return new TextBox { Text = text, Width = 44, Height = 20, FontSize = 11,
+            // No fixed Width — each box sits in a star column of the HOURS row and stretches so the
+            // row fills the ticket's full width instead of clustering left.
+            return new TextBox { Text = text, MinWidth = 44, Height = 22, FontSize = 11,
                 TextAlignment = TextAlignment.Center, Background = Ink, Foreground = TextCol,
                 BorderBrush = BorderBr, VerticalContentAlignment = VerticalAlignment.Center,
                 Margin = new Thickness(2, 0, 2, 0) };
@@ -329,17 +331,23 @@ namespace TradingRadar.NT
                 Grid.SetColumn(atmRow, 0);        Grid.SetRow(atmRow, 1);        grid.Children.Add(atmRow);
                 Grid.SetColumn(autoGroup, 1);     Grid.SetRow(autoGroup, 1);     grid.Children.Add(autoGroup);
 
-                // Trading-hours row — directly under the ATM/AUTO row, spanning both columns so the
-                // compact controls never widen the qty column. One line: HOURS 09:30–15:55 · flat 16:00.
-                var hoursRow = new WrapPanel { Margin = new Thickness(0, 5, 0, 0), VerticalAlignment = VerticalAlignment.Center };
-                hoursRow.Children.Add(_hoursChk);
-                hoursRow.Children.Add(_hoursStartBox);
-                hoursRow.Children.Add(MakeHoursLabel("–"));
-                hoursRow.Children.Add(_hoursEndBox);
+                // Trading-hours row — directly under the ATM/AUTO row, spanning both columns and
+                // stretching edge to edge: labels take their natural width, the three time boxes each
+                // fill a star column so the line covers the ticket's full width.
+                var hoursRow = new Grid { Margin = new Thickness(0, 5, 0, 0) };
+                for (int c = 0; c < 6; c++)
+                    hoursRow.ColumnDefinitions.Add(new ColumnDefinition {
+                        Width = c % 2 == 0 ? GridLength.Auto : new GridLength(1, GridUnitType.Star) });
+                var dashLbl = MakeHoursLabel("–");
+                dashLbl.Margin = new Thickness(4, 0, 4, 0);
                 var flatLbl = MakeHoursLabel("· flat");
-                flatLbl.Margin = new Thickness(6, 0, 0, 0);
-                hoursRow.Children.Add(flatLbl);
-                hoursRow.Children.Add(_hoursFlatBox);
+                flatLbl.Margin = new Thickness(8, 0, 4, 0);
+                Grid.SetColumn(_hoursChk, 0);      hoursRow.Children.Add(_hoursChk);
+                Grid.SetColumn(_hoursStartBox, 1); hoursRow.Children.Add(_hoursStartBox);
+                Grid.SetColumn(dashLbl, 2);        hoursRow.Children.Add(dashLbl);
+                Grid.SetColumn(_hoursEndBox, 3);   hoursRow.Children.Add(_hoursEndBox);
+                Grid.SetColumn(flatLbl, 4);        hoursRow.Children.Add(flatLbl);
+                Grid.SetColumn(_hoursFlatBox, 5);  hoursRow.Children.Add(_hoursFlatBox);
                 Grid.SetColumn(hoursRow, 0); Grid.SetRow(hoursRow, 2); Grid.SetColumnSpan(hoursRow, 2);
                 grid.Children.Add(hoursRow);
 
