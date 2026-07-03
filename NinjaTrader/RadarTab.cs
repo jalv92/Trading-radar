@@ -786,14 +786,17 @@ namespace TradingRadar.NT
                 // logo's blue and magenta drifting endlessly behind the lockup. Transform/opacity
                 // animations run on WPF's render thread (independent animation) — no per-tick CPU work
                 // lands on the paint/engine threads.
-                // The blobs live on their own layer under a radial vignette OpacityMask: the smoke
-                // fades out BEFORE reaching any card edge, so the rectangular clip never slices a
-                // cloud in half (2026-07-03 screenshot feedback — hard straight cuts at the borders).
-                var smokeLayer = new Grid();
-                AddSmokeBlob(smokeLayer, Color.FromRgb(0x2f, 0x4d, 0x9e), 280, 110, -90, -26, 0.42, 17);   // deep blue
-                AddSmokeBlob(smokeLayer, Color.FromRgb(0xa0, 0x30, 0x60), 320, 120,  160, -32, 0.40, 23);  // wine magenta
-                AddSmokeBlob(smokeLayer, Color.FromRgb(0x24, 0x3a, 0x77), 240, 100,   40, -12, 0.34, 28);  // blue, slower
-                AddSmokeBlob(smokeLayer, Color.FromRgb(0xc2, 0x3d, 0x78), 260, 100,  340, -20, 0.36, 13);  // magenta, faster
+                // The blobs live on a CANVAS (not a Grid): WPF's Measure pass clamps a child's
+                // DesiredSize to the available slot, so inside a Grid the 100-120px-tall blobs were
+                // silently squashed to the card's 58px and the up-shifted transforms left the smoke's
+                // bottom edge stranded mid-card (2026-07-03 screenshot: "cortado por la mitad"). A
+                // Canvas measures children with infinite space — blobs keep their full size and are
+                // centered on the card's vertical middle, overflowing both edges symmetrically.
+                var smokeLayer = new Canvas();
+                AddSmokeBlob(smokeLayer, Color.FromRgb(0x2f, 0x4d, 0x9e), 280, 130, -90, 0.42, 17);   // deep blue
+                AddSmokeBlob(smokeLayer, Color.FromRgb(0xa0, 0x30, 0x60), 320, 140,  160, 0.40, 23);  // wine magenta
+                AddSmokeBlob(smokeLayer, Color.FromRgb(0x24, 0x3a, 0x77), 240, 120,   40, 0.34, 28);  // blue, slower
+                AddSmokeBlob(smokeLayer, Color.FromRgb(0xc2, 0x3d, 0x78), 260, 120,  340, 0.36, 13);  // magenta, faster
                 var vignette = new RadialGradientBrush
                 {
                     Center = new Point(0.5, 0.5), GradientOrigin = new Point(0.5, 0.5),
@@ -821,12 +824,17 @@ namespace TradingRadar.NT
             catch { return null; }   // branding must never take down the tab
         }
 
+        // The branding card's fixed height — blob vertical centering below keys off it.
+        private const double BrandingCardHeight = 58;
+
         // One drifting smoke puff: an oversized ellipse filled with a frozen radial gradient (color
         // core fading to transparent), sliding back and forth across the card on a slow sine while its
         // opacity breathes. AutoReverse + Forever = the infinite loop; staggered durations keep the
         // four blobs from ever synchronizing, which is what reads as "smoke" instead of "carousel".
-        private static void AddSmokeBlob(Panel host, Color c, double width, double height,
-            double fromX, double y, double maxOpacity, double driftSeconds)
+        // Host must be a Canvas (infinite measure — see the caller's comment); each blob is centered
+        // on the card's vertical middle so it overflows top and bottom symmetrically.
+        private static void AddSmokeBlob(Canvas host, Color c, double width, double height,
+            double fromX, double maxOpacity, double driftSeconds)
         {
             var brush = new RadialGradientBrush();
             brush.GradientStops.Add(new GradientStop(Color.FromArgb(0xB0, c.R, c.G, c.B), 0.0));
@@ -835,12 +843,12 @@ namespace TradingRadar.NT
             var blob = new System.Windows.Shapes.Ellipse
             {
                 Width = width, Height = height, Fill = brush,
-                HorizontalAlignment = HorizontalAlignment.Left,
-                VerticalAlignment = VerticalAlignment.Top,
                 Opacity = maxOpacity,
                 IsHitTestVisible = false
             };
-            var slide = new TranslateTransform(fromX, y);
+            Canvas.SetLeft(blob, 0);
+            Canvas.SetTop(blob, (BrandingCardHeight - height) / 2.0);   // vertical center on the card
+            var slide = new TranslateTransform(fromX, 0);
             blob.RenderTransform = slide;
             host.Children.Add(blob);
 
