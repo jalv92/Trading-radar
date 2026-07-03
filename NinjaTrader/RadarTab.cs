@@ -757,27 +757,29 @@ namespace TradingRadar.NT
                 bmp.UriSource = new Uri(path, UriKind.Absolute);
                 bmp.EndInit();
                 bmp.Freeze();
+                // Sized for the real gap under the book-skew strip (~55px in the default layout) —
+                // a taller lockup rides up over the strip (2026-07-03 screenshot feedback).
                 var logo = new Border
                 {
-                    Width = 68, Height = 68,
-                    CornerRadius = new CornerRadius(10),
+                    Width = 44, Height = 44,
+                    CornerRadius = new CornerRadius(8),
                     Background = new ImageBrush(bmp) { Stretch = Stretch.UniformToFill },
                     VerticalAlignment = VerticalAlignment.Center
                 };
                 var ink = new SolidColorBrush(Color.FromRgb(0xf2, 0xf5, 0xfa));
                 var l1 = new TextBlock { Text = "TRADERS", Foreground = ink,
-                    FontFamily = new FontFamily("Segoe UI"), FontWeight = FontWeights.SemiBold, FontSize = 27 };
+                    FontFamily = new FontFamily("Segoe UI"), FontWeight = FontWeights.SemiBold, FontSize = 18 };
                 var l2 = new TextBlock { Text = "DE FUTUROS", Foreground = ink,
-                    FontFamily = new FontFamily("Segoe UI"), FontWeight = FontWeights.SemiBold, FontSize = 27,
-                    Margin = new Thickness(0, -6, 0, 0) };
-                var words = new StackPanel { Margin = new Thickness(14, 0, 0, 0),
+                    FontFamily = new FontFamily("Segoe UI"), FontWeight = FontWeights.SemiBold, FontSize = 18,
+                    Margin = new Thickness(0, -4, 0, 0) };
+                var words = new StackPanel { Margin = new Thickness(12, 0, 0, 0),
                     VerticalAlignment = VerticalAlignment.Center, Children = { l1, l2 } };
                 return new StackPanel
                 {
                     Orientation = Orientation.Horizontal,
                     HorizontalAlignment = HorizontalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Bottom,
-                    Margin = new Thickness(20, 0, 20, 8),
+                    Margin = new Thickness(20, 0, 20, 5),
                     Children = { logo, words }
                 };
             }
