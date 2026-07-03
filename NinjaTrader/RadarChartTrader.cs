@@ -206,10 +206,8 @@ namespace TradingRadar.NT
             AddRow(0, TwoColRow(_buyBtn, _sellBtn, 8, 4));
 
             // Row 1: BUY LMT / SELL LMT — wall-anchored (see LimitAnchorPrice()), plus the "listo"
-            // pre-stage indicator (Task 12) and the AUTO arm toggle (2026-07-01) directly underneath —
-            // same row slot, stacked content, so the 340px dock height (RadarTab) is untouched.
-            AddRow(1, new StackPanel { Children = { TwoColRow(_buyLmtBtn, _sellLmtBtn, 8, 0), _setupText,
-                new WrapPanel { Margin = new Thickness(8, 0, 8, 2), Children = { _autoChk, _autoStatusText } } } });
+            // pre-stage indicator (Task 12). The AUTO arm toggle lives in Row 4 next to the ATM selector.
+            AddRow(1, new StackPanel { Children = { TwoColRow(_buyLmtBtn, _sellLmtBtn, 8, 0), _setupText } });
 
             // Row 2: ▲ / ▼ — move the active working limit 1 tick; disabled when none is working.
             AddRow(2, TwoColRow(_upBtn, _dnBtn, 8, 0));
@@ -260,11 +258,16 @@ namespace TradingRadar.NT
                     _atmUserPicked = _atmSelector.SelectedAtmStrategy != null;
                     if (!_atmUserPicked) ForceDisarmAuto("ATM en None");   // guard 2 of the AUTO arm precondition broke
                 };
-                var atmRow = new DockPanel();
+                // Same right margin as the account combo so both combos share the same right edge.
+                var atmRow = new DockPanel { Margin = new Thickness(0, 0, 10, 0) };
                 atmRow.Children.Add(atmLbl);
                 atmRow.Children.Add(_atmSelector);
 
                 _accountCombo.Margin = new Thickness(0, 0, 10, 6);   // gap to qty (right) + gap above ATM
+
+                // AUTO toggle + status sit under the qty group, beside the ATM selector.
+                var autoGroup = new WrapPanel { VerticalAlignment = VerticalAlignment.Center,
+                    Children = { _autoChk, _autoStatusText } };
 
                 var grid = new Grid { Margin = new Thickness(8, 4, 8, 0) };
                 grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -274,6 +277,7 @@ namespace TradingRadar.NT
                 Grid.SetColumn(_accountCombo, 0); Grid.SetRow(_accountCombo, 0); grid.Children.Add(_accountCombo);
                 Grid.SetColumn(qtyGroup, 1);      Grid.SetRow(qtyGroup, 0);      grid.Children.Add(qtyGroup);
                 Grid.SetColumn(atmRow, 0);        Grid.SetRow(atmRow, 1);        grid.Children.Add(atmRow);
+                Grid.SetColumn(autoGroup, 1);     Grid.SetRow(autoGroup, 1);     grid.Children.Add(autoGroup);
 
                 var armWrap = new WrapPanel { Margin = new Thickness(8, 4, 8, 4),
                     Children = { _armChk, _warnText } };
@@ -587,7 +591,8 @@ namespace TradingRadar.NT
                 DiagAuto("disarm", null, 0, _lastPrice, "AUTO disarmed — " + reason + ".");
             SolidColorBrush accent = armed ? Amber : Muted;
             _autoChk.Foreground = accent;
-            _autoStatusText.Text = armed ? "AUTO armado" : reason != null ? "AUTO: " + reason : string.Empty;
+            // The checkbox already says "AUTO" — the status only adds the state, so it reads "AUTO armed".
+            _autoStatusText.Text = armed ? "armed" : reason != null ? reason : string.Empty;
             _autoStatusText.Foreground = accent;
         }
 
