@@ -774,16 +774,80 @@ namespace TradingRadar.NT
                     Margin = new Thickness(0, -4, 0, 0) };
                 var words = new StackPanel { Margin = new Thickness(12, 0, 0, 0),
                     VerticalAlignment = VerticalAlignment.Center, Children = { l1, l2 } };
-                return new StackPanel
+                var lockup = new StackPanel
                 {
                     Orientation = Orientation.Horizontal,
                     HorizontalAlignment = HorizontalAlignment.Center,
-                    VerticalAlignment = VerticalAlignment.Bottom,
-                    Margin = new Thickness(20, 0, 20, 5),
+                    VerticalAlignment = VerticalAlignment.Center,
                     Children = { logo, words }
+                };
+
+                // Smoke layer — the logo's neon-lit smoke, recreated live: soft radial blobs in the
+                // logo's blue and magenta drifting endlessly behind the lockup. Transform/opacity
+                // animations run on WPF's render thread (independent animation) — no per-tick CPU work
+                // lands on the paint/engine threads.
+                var smokeHost = new Grid { ClipToBounds = true };
+                AddSmokeBlob(smokeHost, Color.FromRgb(0x2f, 0x4d, 0x9e), 280, 110, -90, -30, 0.42, 17);   // deep blue
+                AddSmokeBlob(smokeHost, Color.FromRgb(0xa0, 0x30, 0x60), 320, 120,  160, -40, 0.40, 23);  // wine magenta
+                AddSmokeBlob(smokeHost, Color.FromRgb(0x24, 0x3a, 0x77), 240, 100,   40,  -8, 0.34, 28);  // blue, slower
+                AddSmokeBlob(smokeHost, Color.FromRgb(0xc2, 0x3d, 0x78), 260, 100,  340, -18, 0.36, 13);  // magenta, faster
+                smokeHost.Children.Add(lockup);
+
+                return new Border
+                {
+                    Height = 58,
+                    VerticalAlignment = VerticalAlignment.Bottom,
+                    Margin = new Thickness(8, 0, 8, 4),
+                    CornerRadius = new CornerRadius(8),
+                    Background = new SolidColorBrush(Color.FromRgb(0x0a, 0x0e, 0x16)),
+                    Child = smokeHost
                 };
             }
             catch { return null; }   // branding must never take down the tab
+        }
+
+        // One drifting smoke puff: an oversized ellipse filled with a frozen radial gradient (color
+        // core fading to transparent), sliding back and forth across the card on a slow sine while its
+        // opacity breathes. AutoReverse + Forever = the infinite loop; staggered durations keep the
+        // four blobs from ever synchronizing, which is what reads as "smoke" instead of "carousel".
+        private static void AddSmokeBlob(Panel host, Color c, double width, double height,
+            double fromX, double y, double maxOpacity, double driftSeconds)
+        {
+            var brush = new RadialGradientBrush();
+            brush.GradientStops.Add(new GradientStop(Color.FromArgb(0xB0, c.R, c.G, c.B), 0.0));
+            brush.GradientStops.Add(new GradientStop(Color.FromArgb(0x00, c.R, c.G, c.B), 1.0));
+            brush.Freeze();
+            var blob = new System.Windows.Shapes.Ellipse
+            {
+                Width = width, Height = height, Fill = brush,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Top,
+                Opacity = maxOpacity,
+                IsHitTestVisible = false
+            };
+            var slide = new TranslateTransform(fromX, y);
+            blob.RenderTransform = slide;
+            host.Children.Add(blob);
+
+            var drift = new System.Windows.Media.Animation.DoubleAnimation(
+                fromX, fromX + 380, TimeSpan.FromSeconds(driftSeconds))
+            {
+                RepeatBehavior = System.Windows.Media.Animation.RepeatBehavior.Forever,
+                AutoReverse = true,
+                EasingFunction = new System.Windows.Media.Animation.SineEase
+                    { EasingMode = System.Windows.Media.Animation.EasingMode.EaseInOut }
+            };
+            slide.BeginAnimation(TranslateTransform.XProperty, drift);
+
+            var breathe = new System.Windows.Media.Animation.DoubleAnimation(
+                maxOpacity * 0.5, maxOpacity, TimeSpan.FromSeconds(driftSeconds * 0.6))
+            {
+                RepeatBehavior = System.Windows.Media.Animation.RepeatBehavior.Forever,
+                AutoReverse = true,
+                EasingFunction = new System.Windows.Media.Animation.SineEase
+                    { EasingMode = System.Windows.Media.Animation.EasingMode.EaseInOut }
+            };
+            blob.BeginAnimation(UIElement.OpacityProperty, breathe);
         }
 
         // NT8 exposes no "replay was reset" event for add-ons, so a large backward jump in the replay
