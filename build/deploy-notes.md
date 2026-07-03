@@ -6,6 +6,8 @@
    ```
    %USERPROFILE%\Documents\NinjaTrader 8\bin\Custom\AddOns\LiquidityRadar\
    ```
+   Also copy `docs/images/channel-logo.jpg` into the same folder — the branding lockup in the
+   cockpit loads it from there (missing file = no branding, everything else unaffected).
 
 2. Open NinjaTrader 8 → NinjaScript Editor → Compile (F5).
    Fix any compile error in the NT classes ONLY (never the engine).

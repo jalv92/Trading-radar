@@ -222,6 +222,10 @@ namespace TradingRadar.NT
             rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1.0, GridUnitType.Star) });
             rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(340) });
             Grid.SetRow(_cockpit, 0);     rightCol.Children.Add(_cockpit);
+            // Channel branding (2026-07-03): logo + wordmark in the cockpit's slack space, as a
+            // bottom-aligned OVERLAY in the same star row — it never adds height or moves a control.
+            UIElement branding = BuildBranding();
+            if (branding != null) { Grid.SetRow(branding, 0); rightCol.Children.Add(branding); }
             Grid.SetRow(_chartTrader, 1); rightCol.Children.Add(_chartTrader);
 
             Grid split = new Grid();
@@ -733,6 +737,51 @@ namespace TradingRadar.NT
                 }
                 catch { }
             }
+        }
+
+        // Channel branding lockup — the "Traders de Futuros" logo (channel-logo.jpg, deployed next to
+        // the .cs files) + the channel wordmark, landscape, sized for the gap between the cockpit's
+        // book-skew strip and the Chart Trader. Fail-soft: missing/corrupt image = no branding, the
+        // rest of the tab is untouched. OnLoad caching releases the file handle immediately.
+        private static UIElement BuildBranding()
+        {
+            try
+            {
+                string path = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "NinjaTrader 8", "bin", "Custom", "AddOns", "LiquidityRadar", "channel-logo.jpg");
+                if (!System.IO.File.Exists(path)) return null;
+                var bmp = new System.Windows.Media.Imaging.BitmapImage();
+                bmp.BeginInit();
+                bmp.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
+                bmp.UriSource = new Uri(path, UriKind.Absolute);
+                bmp.EndInit();
+                bmp.Freeze();
+                var logo = new Border
+                {
+                    Width = 68, Height = 68,
+                    CornerRadius = new CornerRadius(10),
+                    Background = new ImageBrush(bmp) { Stretch = Stretch.UniformToFill },
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                var ink = new SolidColorBrush(Color.FromRgb(0xf2, 0xf5, 0xfa));
+                var l1 = new TextBlock { Text = "TRADERS", Foreground = ink,
+                    FontFamily = new FontFamily("Segoe UI"), FontWeight = FontWeights.SemiBold, FontSize = 27 };
+                var l2 = new TextBlock { Text = "DE FUTUROS", Foreground = ink,
+                    FontFamily = new FontFamily("Segoe UI"), FontWeight = FontWeights.SemiBold, FontSize = 27,
+                    Margin = new Thickness(0, -6, 0, 0) };
+                var words = new StackPanel { Margin = new Thickness(14, 0, 0, 0),
+                    VerticalAlignment = VerticalAlignment.Center, Children = { l1, l2 } };
+                return new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Bottom,
+                    Margin = new Thickness(20, 0, 20, 8),
+                    Children = { logo, words }
+                };
+            }
+            catch { return null; }   // branding must never take down the tab
         }
 
         // NT8 exposes no "replay was reset" event for add-ons, so a large backward jump in the replay
