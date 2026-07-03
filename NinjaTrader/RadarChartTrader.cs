@@ -135,6 +135,34 @@ namespace TradingRadar.NT
             VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
         private readonly TextBlock _autoStatusText = new TextBlock { FontFamily = new FontFamily("Segoe UI"), FontSize = 10,
             VerticalAlignment = VerticalAlignment.Center, Foreground = Muted };
+        // Trading-hours schedule for AUTO (2026-07-03): fires allowed only inside [start, end]; any
+        // open position / working limit force-flattened once per day at the flat time. All three times
+        // are judged against the REPLAY-aware clock (_now / FireEvent.Time) — i.e. the platform/feed
+        // timezone (ET on this setup) — never wall clock. UI row lives directly under the AUTO toggle.
+        private readonly CheckBox _hoursChk = new CheckBox { Content = "HOURS", IsChecked = true,
+            Foreground = Muted, FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
+            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
+        private readonly TextBox _hoursStartBox = MakeTimeBox("09:30");
+        private readonly TextBox _hoursEndBox   = MakeTimeBox("15:55");
+        private readonly TextBox _hoursFlatBox  = MakeTimeBox("16:00");
+        private TimeSpan _hoursStart = new TimeSpan(9, 30, 0);
+        private TimeSpan _hoursEnd   = new TimeSpan(15, 55, 0);
+        private TimeSpan _hoursFlat  = new TimeSpan(16, 0, 0);
+        private DateTime _hoursFlattenDay = DateTime.MinValue;   // replay date already flatten-attempted (once per day, never a retry loop)
+
+        private static TextBox MakeTimeBox(string text)
+        {
+            return new TextBox { Text = text, Width = 44, Height = 20, FontSize = 11,
+                TextAlignment = TextAlignment.Center, Background = Ink, Foreground = TextCol,
+                BorderBrush = BorderBr, VerticalContentAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(2, 0, 2, 0) };
+        }
+
+        private static TextBlock MakeHoursLabel(string text)
+        {
+            return new TextBlock { Text = text, FontFamily = new FontFamily("Segoe UI"), FontSize = 10,
+                Foreground = Muted, VerticalAlignment = VerticalAlignment.Center };
+        }
         private readonly Button _buyBtn;
         private readonly Button _sellBtn;
         private readonly Button _buyLmtBtn;
@@ -201,6 +229,27 @@ namespace TradingRadar.NT
             };
             _qtyBox.LostFocus += (o, e) => commitQty();
             _qtyBox.KeyDown   += (o, e) => { if (e.Key == Key.Enter) commitQty(); };
+
+            // Trading-hours boxes: parse "H:mm" on commit, revert/normalize to the effective value on
+            // any invalid input (fail-closed — a typo never silently disables the schedule).
+            Action<TextBox, Action<TimeSpan>, Func<TimeSpan>> wireTime = (box, set, get) =>
+            {
+                Action commit = () =>
+                {
+                    DateTime parsed;
+                    if (DateTime.TryParseExact(box.Text.Trim(), "H:mm",
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.None, out parsed))
+                        set(parsed.TimeOfDay);
+                    TimeSpan eff = get();
+                    box.Text = string.Format("{0:00}:{1:00}", eff.Hours, eff.Minutes);
+                };
+                box.LostFocus += (o, e) => commit();
+                box.KeyDown   += (o, e) => { if (e.Key == Key.Enter) commit(); };
+            };
+            wireTime(_hoursStartBox, v => _hoursStart = v, () => _hoursStart);
+            wireTime(_hoursEndBox,   v => _hoursEnd = v,   () => _hoursEnd);
+            wireTime(_hoursFlatBox,  v => _hoursFlat = v,  () => _hoursFlat);
 
             // Row 0: BUY MKT / SELL MKT — the primary order entry, at the very top (like NT8's Chart Trader).
             AddRow(0, TwoColRow(_buyBtn, _sellBtn, 8, 4));
@@ -274,10 +323,25 @@ namespace TradingRadar.NT
                 grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                 grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
                 grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
                 Grid.SetColumn(_accountCombo, 0); Grid.SetRow(_accountCombo, 0); grid.Children.Add(_accountCombo);
                 Grid.SetColumn(qtyGroup, 1);      Grid.SetRow(qtyGroup, 0);      grid.Children.Add(qtyGroup);
                 Grid.SetColumn(atmRow, 0);        Grid.SetRow(atmRow, 1);        grid.Children.Add(atmRow);
                 Grid.SetColumn(autoGroup, 1);     Grid.SetRow(autoGroup, 1);     grid.Children.Add(autoGroup);
+
+                // Trading-hours row — directly under the ATM/AUTO row, spanning both columns so the
+                // compact controls never widen the qty column. One line: HOURS 09:30–15:55 · flat 16:00.
+                var hoursRow = new WrapPanel { Margin = new Thickness(0, 5, 0, 0), VerticalAlignment = VerticalAlignment.Center };
+                hoursRow.Children.Add(_hoursChk);
+                hoursRow.Children.Add(_hoursStartBox);
+                hoursRow.Children.Add(MakeHoursLabel("–"));
+                hoursRow.Children.Add(_hoursEndBox);
+                var flatLbl = MakeHoursLabel("· flat");
+                flatLbl.Margin = new Thickness(6, 0, 0, 0);
+                hoursRow.Children.Add(flatLbl);
+                hoursRow.Children.Add(_hoursFlatBox);
+                Grid.SetColumn(hoursRow, 0); Grid.SetRow(hoursRow, 2); Grid.SetColumnSpan(hoursRow, 2);
+                grid.Children.Add(hoursRow);
 
                 var armWrap = new WrapPanel { Margin = new Thickness(8, 4, 8, 4),
                     Children = { _armChk, _warnText } };
@@ -416,7 +480,30 @@ namespace TradingRadar.NT
             if (tick > 0) _tick = tick;
             _now = now;
             MaybeAutoCancel();
+            MaybeHoursFlatten();
             RefreshPositionUi();
+        }
+
+        // Trading-hours forced flatten (2026-07-03): at/after the configured flat time (16:00 default),
+        // any open position or working limit is flattened through the SAME native cancel-all + close
+        // path as the human Flat button (ClosePosition(true) — ValidateForSubmit gates inside it, so an
+        // off-Sim account fails closed). Once per replay day, marked attempted-first: a throwing Flatten
+        // never becomes a retry loop. Runs on the UI thread (SetContext's paint tick), same as every
+        // other order action in this control. Applies whenever the schedule is enabled — a position
+        // left by a disarmed AUTO (e.g. daily cap hit at 15:50) must still be flat by 16:00.
+        private void MaybeHoursFlatten()
+        {
+            if (_hoursChk.IsChecked != true || _now == DateTime.MinValue) return;
+            if (_now.TimeOfDay < _hoursFlat || _now.Date == _hoursFlattenDay) return;
+            _hoursFlattenDay = _now.Date;
+            if (IsFlat(CurrentPosition()) && _activeLimit == null) return;   // nothing open — day marked, no action
+            DiagAuto("hours_flatten", null, 0, _lastPrice, string.Format(
+                System.Globalization.CultureInfo.InvariantCulture,
+                "HOURS — forced flatten at {0:00}:{1:00} (open position/working order past session end).",
+                _hoursFlat.Hours, _hoursFlat.Minutes));
+            ClosePosition(cancelOrdersFirst: true);   // also force-disarms AUTO inside (kill-switch semantics)
+            // Re-state the disarm reason as the schedule (ClosePosition's internal disarm says "Flat manual").
+            ForceDisarmAuto(string.Format("auto-flat {0:00}:{1:00}", _hoursFlat.Hours, _hoursFlat.Minutes));
         }
 
         // Placeholder join-tolerance for the break pre-stage price, in ticks — MEASURED later from Rec
@@ -491,6 +578,22 @@ namespace TradingRadar.NT
                 DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — account no longer Sim at fire time."); // fail-closed, mirrors CanTrade's per-submit re-check
                 ForceDisarmAuto("cuenta no-Sim");
                 return;
+            }
+            // guard 1c (2026-07-03): trading-hours window — with the schedule enabled, AUTO only fires
+            // inside [start, end]. Judged on the fire's own replay timestamp (the same clock the 16:00
+            // forced flatten uses), so Playback speed and wall clock are irrelevant. Skip-only: the
+            // pre-stage stays lit for a deliberate manual click outside hours.
+            if (_hoursChk.IsChecked == true)
+            {
+                TimeSpan tod = f.Time.TimeOfDay;
+                if (tod < _hoursStart || tod > _hoursEnd)
+                {
+                    DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, string.Format(
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        "AUTO skip — outside trading hours ({0:00}:{1:00}-{2:00}:{3:00}).",
+                        _hoursStart.Hours, _hoursStart.Minutes, _hoursEnd.Hours, _hoursEnd.Minutes));
+                    return;
+                }
             }
             if (!ValidateForSubmit()) return;                            // no instrument/account, order in flight, not Sim/armed (Diag'd inside — shared with the manual path, not routed to the AUTO CSV)
             if (_activeLimit != null || !IsFlat(CurrentPosition()))         // guard 2: busy
@@ -745,6 +848,7 @@ namespace TradingRadar.NT
         {
             if (!IsPlaybackAccount(_account)) return;
             _pendingReplace = null;
+            _hoursFlattenDay = DateTime.MinValue;   // a rewind replays the same date — the 16:00 flatten must be able to fire again
             ClearPendingSetup();      // a pre-stage keyed off the pre-reset book/wall is stale after a rewind
             // Rewind + replay reproduces the SAME FireEvent.Time — reset the dedupe guard so the
             // legitimately re-fired setup isn't silently swallowed by OnSetupFire's dedupe check.
