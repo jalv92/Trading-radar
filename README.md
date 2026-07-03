@@ -12,9 +12,9 @@ Unlike a plain DOM or heatmap, it **tracks each large order wall as an object wi
 Visual identity: **"Aurora"** — deep-ink background, emerald (bid/support) / coral (ask/resistance), amber inside-market line. Explicitly *not* a Bookmap clone.
 
 <p align="center">
-  <img src="docs/images/liquidity-radar-controller-waiting.png" alt="Liquidity Radar running in NinjaTrader 8 Market Replay on ES — anchored sonar ladder with a 49-lot WALL badge, the Consumption-Break Controller cockpit in WAITING, tape-speed and z-score gauges, and the Chart Trader ticket with the AUTO toggle next to the ATM selector" width="820">
+  <img src="docs/images/liquidity-radar-ui.gif" alt="The full Liquidity Radar window live on ES Market Replay: the anchored ladder updating, the Controller cycling WAITING to ARMED, the animated neon-smoke branding card, and the Chart Trader ticket with the AUTO toggle and the HOURS schedule row" width="720">
 </p>
-<p align="center"><em>Live on ES 09-26 (Market Replay): the anchored ladder (left), the Controller cockpit in <strong>WAITING</strong> with the wall-consumption, tape-velocity, z-score and CHOP reads (top-right), and the Chart Trader ticket with the <strong>AUTO</strong> toggle beside the ATM selector (bottom-right).</em></p>
+<p align="center"><em>The full surface, live on ES (Market Replay): the anchored ladder, the Controller cycling <strong>WAITING → ARMED</strong>, and the Chart Trader ticket with <strong>AUTO</strong> armed and the <strong>HOURS</strong> schedule row (09:30–15:55, flat 16:00).</em></p>
 
 ---
 
@@ -25,7 +25,8 @@ Visual identity: **"Aurora"** — deep-ink background, emerald (bid/support) / c
 | **Engine** (`Engine/`) | ✅ Complete. Pure C#, deterministic, NinjaTrader-free. **101/101 unit tests, 0 warnings.** |
 | **NT8 add-on** (`NinjaTrader/`) | ✅ **Built, deployed, and running in Market Replay** (screenshots above). Ladder + Controller cockpit + Chart Trader all live. |
 | **Consumption-Break Controller** | ✅ Live (state machine + fire latch + pre-stage). ⚠️ **Thresholds are placeholder / being calibrated** from `Rec` captures on real ES days — eight review/calibration rounds so far (`docs/calibration-consumption-break-es-day1.md`). Treat fires as a *read*, not a tuned signal, until calibrated. |
-| **AUTO mode** | ✅ Live, **Sim/Playback only**, hard-gated (ATM required, 5 fires/day cap, 15 s auto-cancel, persistent decision log). |
+| **AUTO mode** | ✅ Live, **Sim/Playback only**, hard-gated (ATM required, 5 fires/day cap, 15 s auto-cancel, persistent decision log) + **HOURS schedule**: fires only 09:30–15:55, forced flatten at 16:00 (editable in the UI). |
+| **Phase 0 calibration plumbing** | ✅ Shipped per the [ML-calibration ADR](docs/decisions/2026-07-03-ml-calibration-strategy.md): realized-fill telemetry, adaptive `SignificanceBand = max(p85 of live depth, 60)` (spec §5), per-session summary + fires=0 alarm (`lr-sessions.csv`), and a CI test that keeps the AUTO hard gates out of any calibrator's reach. **10-distinct-day capture campaign in progress.** |
 | **Chart Trader → real money** | 🔒 **Sim / Playback only.** Order entry is hard-gated to Simulator/Playback accounts. A real account is blocked unless explicitly armed *and* it has not yet cleared its risk preconditions — **do not trade real money with it yet.** See [Safety](#safety--disclaimer). |
 
 Validation is by unit tests (engine) + `nt8c` compile checks + **Market Replay** behavioral passes — NinjaTrader does not replay Level-2 in the Strategy Analyzer, so there is no historical L2 backtest.
@@ -49,15 +50,21 @@ A price-anchored vertical ladder — the price axis is fixed and a sliding amber
 A **stateful setup detector**, not an oscillating meter. The original five-signal weighted-average cockpit flip-flopped long↔short every tick, so it was demoted (spec `2026-07-01`): the primary output is now a **Controller state** that fires **once** on a confirmed change-of-control and latches until reset. The setup mechanized is **Consumption-Break**: a resting wall in price's path gets **eaten toward zero with trades**, and the radar fires right before it snaps through.
 
 <p align="center">
-  <img src="docs/images/liquidity-radar-controller-armed.png" alt="Consumption-Break Controller ARMED on a 61-lot wall ('muro intacto — esperando erosión'), with the wall-consumption countdown, tape-speed and z-score gauges, an ATM template selected, the AUTO toggle, and a live LONG 1 position in the PnL bar" width="820">
+  <img src="docs/images/liquidity-radar-armed-hours.png" alt="Consumption-Break Controller ARMED on a 44-lot wall ('muro intacto — esperando erosión') with the wall-consumption countdown at 0%, tape-speed and z-score gauges, ATM ES_2C selected, AUTO armed, and the HOURS schedule row" width="820">
 </p>
-<p align="center"><em>The Controller <strong>ARMED</strong> on a 61-lot wall at 7610.00 ("muro intacto — esperando erosión"), waiting for trade-backed consumption. Below: ATM template <code>ES_1C</code> attached, the <strong>AUTO</strong> toggle, and a live <code>LONG 1 @ 7608.50</code> in the PnL bar.</em></p>
+<p align="center"><em>The Controller <strong>ARMED</strong> ("muro intacto — esperando erosión"), waiting for trade-backed consumption. Below: ATM template <code>ES_2C</code>, <strong>AUTO armed</strong>, and the <strong>HOURS</strong> row (fire window 09:30–15:55 · forced flat 16:00).</em></p>
 
 - **`CONTROLLER` state banner** — the state machine: `WAITING → ARMED → COUNTDOWN → FIRE → RESET`, with a global **CHOP** overlay that suppresses all fires. One candidate per side (dominant wall above = short-break candidate, below = long-break); a wall cannot un-consume, so the countdown is structurally incapable of flip-flopping. The banner explains itself in plain language ("sin muro dominante armado", "muro intacto — esperando erosión").
 - **`CONSUMO DEL MURO`** — the consumption countdown: how much of the armed wall's peak size has been eaten (`0% comido` → fire threshold), counting only the **trade-backed** fraction of the drop (cancels/pulls don't advance it; a reload resets it).
 - **`VELOCIDAD DEL TAPE`** — signed tape velocity (sell/s vs. buy/s bars), from a rolling prints-per-second window.
 - **`TAPE Z-SCORE`** — how unusual current tape speed is vs. its EWMA baseline; the fire gate requires acceleration, not just erosion.
-- **`CHOP` light** — display + global fire suppressor when the tape is alternating noise.
+- **`CHOP` light** — display + global fire suppressor when the tape is alternating noise:
+
+<p align="center">
+  <img src="docs/images/liquidity-radar-cockpit-chop.png" alt="The Controller in CHOP state — 'tape lento y alternando' — with the CHOP light on, tape z-score at -2.4, and all fires suppressed" width="820">
+</p>
+<p align="center"><em><strong>CHOP</strong> as a first-class state: slow, alternating tape (z −2.4) — the banner explains it and every fire is suppressed until the tape picks a side.</em></p>
+
 - **`SESGO DE LIBRO · contexto, no dispara`** — the old book-skew signals (imbalance / thin-inside / air-pocket) collapsed into one **vote-less context strip**. It informs, it never triggers.
 
 ### 3 · Chart Trader ticket (bottom-right)
@@ -163,7 +170,7 @@ MarketData.Update  ┤
 | **×** | The Auto factor — `MinSize ≈ × · median`. Higher = only bigger walls qualify. |
 | **K×** | Relative-size multiple over the cross-sectional median for wall detection. |
 | **Persist(ms)** | How long a level must hold before it earns the `WALL` badge (flicker guard). |
-| **Rec** | Writes a CSV capture (`…\Documents\NinjaTrader 8\LiquidityRadar\`) of node state transitions + per-snapshot pressure inputs, for offline signal calibration. |
+| **Rec** | Writes CSV captures (`…\Documents\NinjaTrader 8\LiquidityRadar\`): node state transitions + per-snapshot Controller inputs (incl. the `adaptiveSig` depth-percentile band). Unchecking Rec appends a per-session row (arms, fires) to `lr-sessions.csv` — 3 consecutive arm-but-no-fire sessions raise a report-only alarm. One Rec session per replay day is the capture-campaign protocol (ADR §5). |
 
 Defaults ship tuned for NQ; ES presets and per-instrument calibration are in progress (`docs/calibration-es-day1.md`).
 
