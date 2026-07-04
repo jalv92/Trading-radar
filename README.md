@@ -170,7 +170,7 @@ MarketData.Update  ┤
 | **×** | The Auto factor — `MinSize ≈ × · median`. Higher = only bigger walls qualify. |
 | **K×** | Relative-size multiple over the cross-sectional median for wall detection. |
 | **Persist(ms)** | How long a level must hold before it earns the `WALL` badge (flicker guard). |
-| **Rec** | Writes CSV captures (`…\Documents\NinjaTrader 8\LiquidityRadar\`): node state transitions + per-snapshot Controller inputs (incl. the `adaptiveSig` depth-percentile band). Unchecking Rec appends a per-session row (arms, fires) to `lr-sessions.csv` — 3 consecutive arm-but-no-fire sessions raise a report-only alarm. One Rec session per replay day is the capture-campaign protocol (ADR §5). |
+| **Rec** | Writes CSV captures (`…\Documents\NinjaTrader 8\LiquidityRadar\`): node state transitions + per-snapshot Controller inputs (incl. the `adaptiveSig` depth-percentile band). Unchecking Rec appends a per-session row (arms, fires) to `lr-sessions-<instrument>.csv` (per-instrument, so ES and NQ day-counts don't cross-contaminate) — 3 consecutive arm-but-no-fire sessions raise a report-only alarm. One Rec session per replay day is the capture-campaign protocol (ADR §5). |
 
 Defaults ship tuned for NQ; ES presets and per-instrument calibration are in progress (`docs/calibration-es-day1.md`).
 

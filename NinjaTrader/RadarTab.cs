@@ -55,7 +55,7 @@ namespace TradingRadar.NT
         private RadarVisual _visual;
         private CockpitVisual _cockpit;
         private RadarChartTrader _chartTrader;
-        private PressureModel _pressure = new PressureModel(new PressureConfig());
+        private PressureModel _pressure = new PressureModel(InstrumentPresets.For("ES").Pressure);
         private InstrumentSelector _selector;
 
         // Serializes the engine-state swap (instrument switch / replay reset, done from the UI or
@@ -114,14 +114,14 @@ namespace TradingRadar.NT
 
         public RadarTab()
         {
-            _cfg.MinAbsSize  = 20;                                   // auto-overrides immediately when _autoCalib is true
+            _cfg.MinAbsSize  = InstrumentPresets.For("ES").MinAbsSize;   // single source of truth; auto-overrides when _autoCalib is true, and the real per-instrument value lands on the first Instrument set
             _cfg.K_mult      = 1.5;
             _cfg.T_persist   = TimeSpan.FromMilliseconds(1000);
             _autoCalib       = true;
             _book    = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
             _tracker = new WallTracker(_cfg);
             _tape       = new TapeSpeed(0.1);
-            _controller = new ControllerStateMachine(new ControllerConfig(), _cfg.TickSize);
+            _controller = new ControllerStateMachine(InstrumentPresets.For("ES").Controller, _cfg.TickSize);
             _visual  = new RadarVisual();
             _cockpit = new CockpitVisual();
 
@@ -320,13 +320,21 @@ namespace TradingRadar.NT
                     _instrument = value;
                     if (_instrument != null)
                         _cfg.TickSize = _instrument.MasterInstrument.TickSize;
-                    // Rebuild engine for the new instrument's tick size. _tape/_controller carry EWMA
-                    // baseline + state-machine memory keyed to the OLD instrument/tick — must be rebuilt
-                    // alongside _book/_tracker, or a switch leaks a stale Armed/Countdown into the new one.
+                    // Per-instrument DETECTION-threshold preset (compiled switch only — see
+                    // Engine/InstrumentPresets.cs; ML-calibration ADR forbids a runtime config loader).
+                    // Falls back to ES for a null/unrecognized instrument.
+                    var preset = InstrumentPresets.For(_instrument != null ? _instrument.MasterInstrument.Name : "ES");
+                    _cfg.MinAbsSize = preset.MinAbsSize;   // auto-overrides immediately when _autoCalib is true
+                    // Rebuild engine for the new instrument's tick size. _tape/_controller/_pressure carry
+                    // EWMA baseline + state-machine memory keyed to the OLD instrument/tick — must be
+                    // rebuilt alongside _book/_tracker, or a switch leaks a stale Armed/Countdown into the
+                    // new one (and _pressure was never rebuilt on switch before this — its PressureConfig
+                    // could never vary per instrument).
                     _book       = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
                     _tracker    = new WallTracker(_cfg);
                     _tape       = new TapeSpeed(0.1);
-                    _controller = new ControllerStateMachine(new ControllerConfig(), _cfg.TickSize);
+                    _controller = new ControllerStateMachine(preset.Controller, _cfg.TickSize);
+                    _pressure   = new PressureModel(preset.Pressure);
                     _lastCtrl   = default(ControllerOutput);
                     _latest  = null;
                     _lastEngineRun = DateTime.MinValue;   // don't carry the old instrument's engine clock
@@ -338,6 +346,9 @@ namespace TradingRadar.NT
                 if (_chartTrader != null) _chartTrader.Instrument = value;
                 Subscribe();
                 RefreshHeader();
+                NinjaTrader.Code.Output.Process(
+                    "[Radar] preset: " + InstrumentPresets.For(value != null ? value.MasterInstrument.Name : "ES").Label,
+                    NinjaTrader.NinjaScript.PrintTo.OutputTab1);
             }
         }
 
@@ -890,7 +901,12 @@ namespace TradingRadar.NT
             // A rewind must not leave stale EWMA/state-machine memory: a Countdown armed against the
             // pre-rewind tape would otherwise survive into replayed history it never actually saw.
             _tape       = new TapeSpeed(0.1);
-            _controller = new ControllerStateMachine(new ControllerConfig(), _cfg.TickSize);
+            // Same instrument as before the reset — recompute its preset rather than assuming ES, so a
+            // replay reset on NQ doesn't silently drop back to ES's ControllerConfig. _pressure is left
+            // alone: PressureConfig doesn't change on a same-instrument reset (only _controller carries
+            // reset-sensitive per-run state).
+            var resetPreset = InstrumentPresets.For(_instrument != null ? _instrument.MasterInstrument.Name : "ES");
+            _controller = new ControllerStateMachine(resetPreset.Controller, _cfg.TickSize);
             _lastCtrl   = default(ControllerOutput);
             _lastDiag   = DateTime.MinValue;
             _lastMidLog = DateTime.MinValue;
@@ -917,7 +933,10 @@ namespace TradingRadar.NT
                 string dir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
                     "NinjaTrader 8", "LiquidityRadar");
                 System.IO.Directory.CreateDirectory(dir);
-                string path = System.IO.Path.Combine(dir, "lr-sessions.csv");
+                // Per-instrument file: two concurrent windows (e.g. ES + NQ) must not share one
+                // distinct-day count / fires=0 alarm streak — each instrument gets its own funnel.
+                string instName = _instrument != null ? _instrument.MasterInstrument.Name : "X";
+                string path = System.IO.Path.Combine(dir, "lr-sessions-" + instName + ".csv");
                 bool fresh = !System.IO.File.Exists(path);
                 // Snapshot + reset under the same lock the instrument thread increments with, so an
                 // in-flight engine run can't have its count clobbered by this read-then-reset.
@@ -946,7 +965,7 @@ namespace TradingRadar.NT
                     w.WriteLine(string.Format(System.Globalization.CultureInfo.InvariantCulture,
                         "{0},{1},{2},{3},{4}",
                         DateTime.Now.ToString("o"),
-                        _instrument != null ? _instrument.MasterInstrument.Name : "X",
+                        instName,
                         arms, fires, alert));   // the snapshot locals — _recArms/_recFires were zeroed at line ~924
                 }
                 if (alert.Length > 0)
