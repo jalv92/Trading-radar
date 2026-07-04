@@ -55,6 +55,19 @@ public class BookMirrorTests
         Assert.Single(b.Levels(Side.Bid));
     }
 
+    // MBP-10 cap: a post-reconnect re-announce Add burst must not stack levels past 10/side
+    // (the root cause of the observed bids=20/asks=20 zombie-book symptom).
+    [Fact]
+    public void Add_beyond_MaxLevels_evicts_the_farthest_level()
+    {
+        var b = NewBook();
+        for (int i = 0; i < 10; i++)
+            b.ApplyDepth(Dep(Side.Bid, DepthOp.Add, i, 21000.00 - i * 0.25, 10, i));
+        for (int i = 0; i < 10; i++)
+            b.ApplyDepth(Dep(Side.Bid, DepthOp.Add, i, 21001.00 - i * 0.25, 20, 10 + i));
+        Assert.Equal(10, b.Levels(Side.Bid).Count);
+    }
+
     [Fact]
     public void Reset_event_clears_both_sides()
     {

@@ -54,7 +54,14 @@ namespace TradingRadar.NT
 
         private void OnMenuItemClick(object sender, RoutedEventArgs e)
         {
-            Globals.RandomDispatcher.InvokeAsync(new System.Action(() => new RadarWindow().Show()));
+            Globals.RandomDispatcher.InvokeAsync(new System.Action(() =>
+            {
+                try { new RadarWindow().Show(); }
+                catch (System.Exception ex)
+                {
+                    NinjaTrader.Code.Output.Process("[Radar] window open failed: " + ex, NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+                }
+            }));
         }
     }
 }

@@ -291,13 +291,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ─────────────────────────────────────────────────────────────────────
         protected override void OnMarketDepth(MarketDepthEventArgs e)
         {
-            if (e.Price <= 0) return;
+            // IsReset carries no meaningful price — it must be handled BEFORE the Price<=0 guard,
+            // or the reconnect book-wipe is dead code and the mirror keeps stale levels (same bug
+            // fixed in RadarTab.OnMarketDepth 2026-07-04).
             if (e.IsReset)
             {
                 lock (_eLk)
                     _book.ResetFromSnapshot(new List<DepthLevel>(), new List<DepthLevel>());
                 return;
             }
+            if (e.Price <= 0) return;
             DepthOp op = e.Operation == Operation.Add    ? DepthOp.Add
                        : e.Operation == Operation.Update ? DepthOp.Update
                                                          : DepthOp.Remove;

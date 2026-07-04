@@ -432,6 +432,7 @@ namespace TradingRadar.NT
         // ---- instrument-thread handlers: map -> engine -> swap frame ----
         private void OnMarketDepth(object sender, MarketDepthEventArgs e)
         {
+            if (e.IsReset) { lock (_engineLock) { if (e.Instrument == _instrument) _book.ApplyDepth(new DepthEvent { IsReset = true }); } return; }
             if (e.Price <= 0) return;
             DepthOp op = e.Operation == Operation.Add    ? DepthOp.Add
                        : e.Operation == Operation.Update ? DepthOp.Update
@@ -998,13 +999,15 @@ namespace TradingRadar.NT
         // ---- NTTabPage members ----
         public override void Cleanup()
         {
+            Unsubscribe();
+            _instrument = null; // leaked/late handlers hit the e.Instrument != _instrument guard and drop everything
             _capture = false;
             if (_capWriter != null) { _capWriter.Flush(); _capWriter.Dispose(); _capWriter = null; }
             if (_sigWriter != null) { _sigWriter.Flush(); _sigWriter.Dispose(); _sigWriter = null; }
             _selector.InstrumentChanged -= OnSelectorChanged;
             if (_paintTimer != null) { _paintTimer.Stop(); _paintTimer = null; }
             if (_chartTrader != null) _chartTrader.Cleanup();
-            Unsubscribe();
+            base.Cleanup();
         }
 
         protected override string GetHeaderPart(string variable)

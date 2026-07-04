@@ -9,6 +9,8 @@ namespace TradingRadar.Engine
     {
         private struct Trade { public double Price; public long Volume; public DateTime Time; public Side Aggressor; }
 
+        private const int MaxLevels = 10; // ponytail: MBP-10 cap; make configurable via RadarConfig if a deeper feed ever matters
+
         private readonly double _tick;
         private readonly TimeSpan _tradeRetention;
         // Bids kept descending by price, asks ascending — same order NT delivers by Position.
@@ -37,6 +39,7 @@ namespace TradingRadar.Engine
                     {
                         int pos = e.Position < 0 ? 0 : (e.Position > list.Count ? list.Count : e.Position);
                         list.Insert(pos, new DepthLevel { Price = e.Price, Volume = e.Volume });
+                        if (list.Count > MaxLevels) list.RemoveAt(list.Count - 1);
                         break;
                     }
                 case DepthOp.Update:

@@ -23,7 +23,7 @@ namespace TradingRadar.NT
         private static readonly SolidColorBrush Panel    = Brush(0x12, 0x18, 0x26);
         private static readonly SolidColorBrush Muted    = Brush(0x9a, 0xa4, 0xb2);
         private static readonly SolidColorBrush TextCol  = Brush(0xcf, 0xd6, 0xe2);
-        private static readonly SolidColorBrush BorderBr = new SolidColorBrush(Color.FromArgb(30, 0xff, 0xff, 0xff));
+        private static readonly SolidColorBrush BorderBr = Frozen(Color.FromArgb(30, 0xff, 0xff, 0xff));
 
         // Neon Aurora tokens — translucent tint fill + glowing colored border + glowing colored text
         // (matches docs/mockups/radar-cockpit-demo.html .bigbtn.buy/.sell). NOT solid fills.
@@ -46,8 +46,8 @@ namespace TradingRadar.NT
         private static readonly Brush PanelLine = Frozen(Color.FromArgb(28,  0xff, 0xff, 0xff));
         private static readonly Brush PnlBarBg  = Frozen(Color.FromArgb(6,   0xff, 0xff, 0xff));
 
-        private static SolidColorBrush Brush(byte r, byte g, byte b) => new SolidColorBrush(Color.FromRgb(r, g, b));
-        private static Brush Frozen(Color c) { var b = new SolidColorBrush(c); b.Freeze(); return b; }
+        private static SolidColorBrush Brush(byte r, byte g, byte b) { var br = new SolidColorBrush(Color.FromRgb(r, g, b)); br.Freeze(); return br; }
+        private static SolidColorBrush Frozen(Color c) { var b = new SolidColorBrush(c); b.Freeze(); return b; }
 
         private Instrument _instrument;
         private Account _account;
