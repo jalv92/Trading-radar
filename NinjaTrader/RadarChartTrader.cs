@@ -91,6 +91,24 @@ namespace TradingRadar.NT
         // OnSetupFire can be called twice with the IDENTICAL FireEvent. FireEvent.Time is unique per fire.
         private DateTime _lastFireTime = DateTime.MinValue;
 
+        // Exit-leg instrumentation (2026-07-03, multi-day verdict item 1): one open AUTO trade at a
+        // time, matching TryAutoFire's own "busy" guard (a new AUTO entry never fires while a position
+        // is open). Created the moment the AUTO entry order fills (OnOrderUpdate), consumed/accumulated
+        // by opposite-side executions observed in OnExecutionUpdate (ATM stop/target legs included —
+        // those orders are never in _ownOrders, so this is the one place that can see them), cleared
+        // once ExitQty catches up to EntryQty.
+        private sealed class AutoTrade
+        {
+            public long EntryOrderId;
+            public bool IsLong;
+            public double EntryPrice;
+            public int EntryQty;
+            public DateTime EntryTime;   // replay-aware _now at entry fill
+            public int ExitQty;
+            public double ExitNotional;  // sum(price*qty) across exit fills — running weighted-avg exit price
+        }
+        private AutoTrade _openAutoTrade;
+
         // AUTO mode (2026-07-01, Sim/Playback only) — auto-submits the pre-stage above through the SAME
         // SubmitLimit -> SubmitRaw path a manual click uses. See TryAutoFire/TryArmAuto below.
         // volatile: written only from the UI thread (checkbox/TryArmAuto/SetAutoArmed), but read via
@@ -105,6 +123,22 @@ namespace TradingRadar.NT
         private int _autoFireCount;
         private Order _autoOrder;                // the one working limit this control auto-submitted (null = none)
         private DateTime _autoSubmittedAt;        // replay time of that auto-submit, for the auto-cancel timeout
+
+        // ---- always-armed AUTO (2026-07-03, verdict doc item 6) ----
+        // _autoIntent is the USER's persisted decision to run AUTO — distinct from the live _autoArmed
+        // flag, which a fail-closed guard can drop at any moment (non-Sim, ATM->None, daily cap, 16:00
+        // flatten). Only a genuine human uncheck of the AUTO box clears intent (see SetAutoArmed); every
+        // other disarm leaves it standing so MaybeAutoRearm can re-arm the instant preconditions repair.
+        private bool _autoIntent;
+        private string _lastPickedAtmName;        // last ATM template the user genuinely selected (DropDownClosed) — persisted; survives an in-session ATM reset
+        private string _pendingAtmRestoreName;     // set by RestoreAutoState; resolved against _atmSelector.Items on the SetContext tick once the control repopulates
+        private string _pendingRestoreAccountName; // set by RestoreAutoState; resolved by PopulateAccounts once Account.All contains it
+        // Blocker finding: _autoFireDay/_autoFireCount are in-memory only, but _autoIntent is persisted —
+        // a mid-day workspace reopen re-armed with a FRESH daily cap, letting AUTO fire past the real
+        // per-day limit. Persisted alongside the rest of RadarAuto; consumed the first time TryAutoFire
+        // evaluates a fire this session, ONLY if the persisted day still matches the fire's replay date.
+        private DateTime _pendingRestoreFireDay = DateTime.MinValue;
+        private int _pendingRestoreFireCount;
         // Persistent AUTO decision trail (round-3 diagnosis: 3 engine fires, zero positions, no way to
         // tell why beyond NT8's Output window). Lazily opened on first AUTO log event — see LogAuto below.
         private System.IO.StreamWriter _autoLogWriter;
@@ -207,7 +241,7 @@ namespace TradingRadar.NT
             _dnBtn.Click      += (o, e) => MoveOrder(-1);
             _revBtn.Click     += (o, e) => Reverse();
             _closeBtn.Click   += (o, e) => ClosePosition(false);
-            _flatBtn.Click    += (o, e) => ClosePosition(true);
+            _flatBtn.Click    += (o, e) => ClosePosition(true, isManualKill: true);
             _setupText.MouseLeftButtonDown += (o, e) => ClearPendingSetup();   // manual clear affordance
 
             _accountCombo.DisplayMemberPath = "Name";
@@ -307,7 +341,13 @@ namespace TradingRadar.NT
                 _atmSelector.DropDownClosed += (o, e) =>
                 {
                     _atmUserPicked = _atmSelector.SelectedAtmStrategy != null;
-                    if (!_atmUserPicked) ForceDisarmAuto("ATM en None");   // guard 2 of the AUTO arm precondition broke
+                    if (_atmUserPicked)
+                    {
+                        _lastPickedAtmName = _atmSelector.SelectedAtmStrategy.Name;
+                        MaybeAutoRearm("atm re-pick");   // a broken ATM precondition just repaired — see method banner
+                    }
+                    else
+                        ForceDisarmAuto("ATM en None");   // guard 2 of the AUTO arm precondition broke
                 };
                 // Same right margin as the account combo so both combos share the same right edge.
                 var atmRow = new DockPanel { Margin = new Thickness(0, 0, 10, 0) };
@@ -462,6 +502,7 @@ namespace TradingRadar.NT
                 _pendingReplace = null;
                 _workingOrders.Clear();
                 _ownOrders.Clear();
+                AbandonOpenAutoTrade("instrument switch");   // review finding: was never cleared, corrupting exit telemetry across a switch
                 ClearPendingSetup();                // a pre-stage for the old instrument no longer applies
                 _atmSelector.Instrument = value;
                 _atmSelector.SelectedItem = null;   // force "None" — don't trust the control's own default
@@ -489,6 +530,7 @@ namespace TradingRadar.NT
             _now = now;
             MaybeAutoCancel();
             MaybeHoursFlatten();
+            MaybeResolveAtmRestore();
             RefreshPositionUi();
         }
 
@@ -611,7 +653,15 @@ namespace TradingRadar.NT
             }
 
             DateTime day = f.Time.Date;                                  // REPLAY time — a new replay day resets the count
-            if (day != _autoFireDay) { _autoFireDay = day; _autoFireCount = 0; }
+            if (day != _autoFireDay)
+            {
+                _autoFireDay = day;
+                // Blocker fix: if a persisted daily-cap count survived a workspace restore and is for
+                // THIS SAME replay day, seed from it instead of zeroing — a mid-day reopen must not grant
+                // a fresh cap. A persisted day that doesn't match (or none) is stale/inapplicable — 0.
+                _autoFireCount = (_pendingRestoreFireDay == day) ? _pendingRestoreFireCount : 0;
+                _pendingRestoreFireDay = DateTime.MinValue;   // consumed — a later new day must reset normally
+            }
             if (_autoFireCount >= AutoFireCapPerDay)                      // guard 3: daily cap (burns on every ATTEMPT below,
             {                                                             // including one whose submit throws — conservative, deliberate)
                 string capStatus = _autoFireCount + "/" + AutoFireCapPerDay;
@@ -673,11 +723,13 @@ namespace TradingRadar.NT
             return pos == null || pos.MarketPosition == MarketPosition.Flat || pos.Quantity == 0;
         }
 
-        private void TryArmAuto()
+        // armNote: non-null only from MaybeAutoRearm — appended to the "arm" CSV row so the decision
+        // trail distinguishes a human checkbox click from an automatic re-arm (verdict doc item 6).
+        private void TryArmAuto(string armNote = null)
         {
             if (!IsSimAccount(_account)) { SetAutoArmed(false, "cuenta no-Sim"); return; }
             if (!_atmUserPicked || _atmSelector.SelectedAtmStrategy == null) { SetAutoArmed(false, "selecciona ATM"); return; }
-            SetAutoArmed(true, null);
+            SetAutoArmed(true, null, armNote);
         }
 
         // Force-disarm from a broken precondition or the Flat kill-switch. No-op if already disarmed, so
@@ -688,16 +740,23 @@ namespace TradingRadar.NT
             SetAutoArmed(false, reason);
         }
 
-        private void SetAutoArmed(bool armed, string reason)
+        private void SetAutoArmed(bool armed, string reason, string armNote = null)
         {
             _autoArmed = armed;
+            // _autoIntent (2026-07-03, always-armed AUTO): the user's own persisted decision. Only a
+            // genuine human uncheck (reason == null — see the _autoChk.Unchecked handler above) turns
+            // it off; every forced disarm (reason != null: non-Sim, ATM->None, cap, 16:00 flatten)
+            // leaves it standing so MaybeAutoRearm can re-arm once the precondition it broke repairs.
+            if (armed) _autoIntent = true;
+            else if (reason == null) _autoIntent = false;
             _suppressAutoChkEvent = true;   // re-sync the checkbox without re-entering Checked/Unchecked
             _autoChk.IsChecked = armed;
             _suppressAutoChkEvent = false;
             if (armed)
-                DiagAuto("arm", null, 0, _lastPrice, string.Format("AUTO armed — account {0}, ATM {1}.",
+                DiagAuto("arm", null, 0, _lastPrice, string.Format("AUTO armed — account {0}, ATM {1}{2}.",
                     _account != null ? _account.Name : "?",
-                    _atmSelector.SelectedAtmStrategy != null ? _atmSelector.SelectedAtmStrategy.Name : "?"));
+                    _atmSelector.SelectedAtmStrategy != null ? _atmSelector.SelectedAtmStrategy.Name : "?",
+                    armNote != null ? " " + armNote : ""));
             else if (reason != null)
                 DiagAuto("disarm", null, 0, _lastPrice, "AUTO disarmed — " + reason + ".");
             SolidColorBrush accent = armed ? Amber : Muted;
@@ -705,6 +764,21 @@ namespace TradingRadar.NT
             // The checkbox already says "AUTO" — the status only adds the state, so it reads "AUTO armed".
             _autoStatusText.Text = armed ? "armed" : reason != null ? reason : string.Empty;
             _autoStatusText.Foreground = accent;
+        }
+
+        // Whenever a broken AUTO precondition (Sim account + ATM picked) repairs and the user's own
+        // persisted intent is still on, re-arm without waiting for another checkbox click — recovers
+        // the 52%-of-guard_skips "not armed at fire time" loss (verdict doc item 6). Pre-checks both
+        // preconditions itself so a partial repair (e.g. account fixed, ATM still missing) doesn't emit
+        // a redundant "disarmed — selecciona ATM" row through TryArmAuto. Never re-arms on the SAME
+        // replay day the 16:00 auto-flat already fired — that stays flattened until the next
+        // session/day (Restore, or a fresh day via the day-keyed guard below); see MaybeHoursFlatten.
+        private void MaybeAutoRearm(string context)
+        {
+            if (_autoArmed || !_autoIntent) return;
+            if (!IsSimAccount(_account) || !_atmUserPicked || _atmSelector.SelectedAtmStrategy == null) return;
+            if (_now != DateTime.MinValue && _now.Date == _hoursFlattenDay) return;
+            TryArmAuto("(auto-rearm on " + context + ")");
         }
 
         // Lights the pre-staged LMT button in the Aurora fire color (same glow the MKT buttons already
@@ -812,6 +886,7 @@ namespace TradingRadar.NT
                 _accountCombo.SelectionChanged += _accountSelectionHandler;
             }
             OnAccountSelected();
+            TryApplyPendingRestoreAccount();   // a Restore-persisted account may have just connected — see RestoreAutoState
         }
 
         private void OnAccountSelected()
@@ -828,6 +903,7 @@ namespace TradingRadar.NT
             _pendingReplace = null;
             _workingOrders.Clear();
             _ownOrders.Clear();
+            AbandonOpenAutoTrade("account switch");   // review finding: was never cleared, corrupting exit telemetry across a switch
             ClearPendingSetup();        // a pre-stage for the old account no longer applies
             _atmSelector.Account = _account;
             _atmSelector.SelectedItem = null;   // force "None" — don't trust the control's own default
@@ -836,6 +912,7 @@ namespace TradingRadar.NT
             SubscribeAccount();
             RefreshArmUi();
             RefreshPositionUi();
+            MaybeAutoRearm("account switch");   // usually a no-op here — ATM always resets alongside the account (below) — but cheap and correct if that ever changes
         }
 
         // Called on the UI thread (RadarTab's paint tick) after a Market Replay rewind/restart. The
@@ -862,6 +939,7 @@ namespace TradingRadar.NT
             // legitimately re-fired setup isn't silently swallowed by OnSetupFire's dedupe check.
             _lastFireTime = DateTime.MinValue;
             _workingOrders.Clear();   // any in-flight submit is void after a Playback reset — re-enable the buttons
+            AbandonOpenAutoTrade("replay reset");   // review finding: the position flattens on rewind — any open trade record is stale
             Order ord = _activeLimit;
             if (ord != null)
             {
@@ -950,6 +1028,15 @@ namespace TradingRadar.NT
                             "order #{0} {1} — filled {2}/{3} @ {4:0.00}{5}",
                             ord.Id, state, ord.Filled, ord.Quantity, ord.AverageFillPrice,
                             ReferenceEquals(_autoOrder, ord) ? " [auto]" : ""));
+                    // Exit-leg instrumentation (verdict doc item 1): the AUTO entry order just filled
+                    // (fully or partially-then-cancelled — either way a position opened) — open the one
+                    // live AUTO trade record. Captured here, BEFORE _autoOrder is nulled below.
+                    if (ReferenceEquals(_autoOrder, ord) && ord.Filled > 0)
+                        _openAutoTrade = new AutoTrade
+                        {
+                            EntryOrderId = ord.Id, IsLong = ord.OrderAction == OrderAction.Buy,
+                            EntryPrice = ord.AverageFillPrice, EntryQty = ord.Filled, EntryTime = _now
+                        };
                     _workingOrders.Remove(ord);   // HashSet.Remove is a no-op if already gone
                     _ownOrders.Remove(ord);
                     if (ReferenceEquals(_activeLimit, ord)) _activeLimit = null;
@@ -978,8 +1065,102 @@ namespace TradingRadar.NT
 
         private void OnExecutionUpdate(object sender, ExecutionEventArgs e)
         {
-            if (e.Execution == null || e.Execution.Instrument != _instrument) return;
-            Dispatcher.InvokeAsync((Action)RefreshPositionUi);
+            Execution exec = e.Execution;
+            if (exec == null || exec.Instrument != _instrument) return;
+            // Deliberately NOT gated on _ownOrders (F15's ownership filter, see OnOrderUpdate's comment
+            // at :62-64) — ATM stop/target legs are never in that set, and this is the one place that
+            // needs to see them anyway (exit-leg instrumentation, verdict doc item 1). Order management
+            // semantics are untouched: this handler only reads/logs, it never mutates _activeLimit/
+            // _workingOrders/_ownOrders. Marshaled to the UI thread, same pattern as the rest of this
+            // control's account-thread handlers.
+            Dispatcher.InvokeAsync((Action)(() =>
+            {
+                RefreshPositionUi();
+                HandlePossibleExitFill(exec);
+            }));
+        }
+
+        // Review finding (major): _openAutoTrade previously survived an instrument switch, account
+        // switch, or Playback rewind — any of which can strand it on a context this control no longer
+        // observes (its remaining exits land on the wrong instrument/account, or never fire an event at
+        // all on rewind). Rather than silently drop the record (losing the round-trip from the CSV
+        // entirely), close the books with a best-effort "trade_summary (abandoned)" row so the fill/fire
+        // count in the CSV stays honest, then clear it so a NEW auto trade doesn't inherit stale state.
+        private void AbandonOpenAutoTrade(string context)
+        {
+            AutoTrade trade = _openAutoTrade;
+            if (trade == null) return;
+            _openAutoTrade = null;
+            LogAuto("trade_summary", trade.IsLong ? "Buy" : "Sell", trade.EntryPrice, _lastPrice, string.Format(
+                System.Globalization.CultureInfo.InvariantCulture,
+                "entry #{0} @ {1:0.00}, abandoned ({2}), {3}/{4} exited.",
+                trade.EntryOrderId, trade.EntryPrice, context, trade.ExitQty, trade.EntryQty));
+        }
+
+        // Observes executions on the OWN instrument while an AUTO trade is open and logs any fill on the
+        // opposite side of the entry (ATM stop/target leg, manual Close/Rev, or a platform Flatten()/
+        // 16:00 auto-flat close) as an "exit" row, plus a "trade_summary" row once ExitQty catches up to
+        // EntryQty. Self-contained qty bookkeeping (not a live Position lookup) — simpler and avoids any
+        // assumption about Positions-vs-Execution event ordering; a Reverse() (close+flip in one fill)
+        // is a known ponytail approximation — the oversized closing+opening execution still closes out
+        // the old trade correctly, it just doesn't further track the newly-opened opposite position.
+        private void HandlePossibleExitFill(Execution exec)
+        {
+            AutoTrade trade = _openAutoTrade;
+            if (trade == null) return;
+            Order execOrder = exec.Order;
+            if (execOrder == null) return;
+            bool isExitSide = trade.IsLong ? execOrder.OrderAction == OrderAction.Sell : execOrder.OrderAction == OrderAction.Buy;
+            if (!isExitSide)
+            {
+                // Minor finding: nothing blocks a manual same-side scale-in while an AUTO trade + ATM
+                // brackets are open (ValidateForSubmit only checks _workingOrders, not open position).
+                // Fold its qty into EntryQty so `remaining` below doesn't hit 0 before the real position
+                // is actually flat. Guarded against the entry order's OWN execution (already captured
+                // into EntryQty/EntryPrice by OnOrderUpdate) so it isn't double-counted here. Qty-only:
+                // EntryPrice deliberately stays the original fill's price (ponytail — full weighted-avg
+                // re-pricing is a bigger change; upgrade if scale-ins turn out to be common in the CSV).
+                if (execOrder.Id != trade.EntryOrderId) trade.EntryQty += exec.Quantity;
+                return;
+            }
+
+            double tick = EffectiveTick();
+            string reason = ClassifyExitReason(execOrder);
+            double realizedTicksThisFill = (trade.IsLong ? exec.Price - trade.EntryPrice : trade.EntryPrice - exec.Price) / tick;
+            trade.ExitQty += exec.Quantity;
+            trade.ExitNotional += exec.Price * exec.Quantity;
+            int remaining = Math.Max(0, trade.EntryQty - trade.ExitQty);
+
+            LogAuto("exit", execOrder.OrderAction.ToString(), exec.Price, _lastPrice, string.Format(
+                System.Globalization.CultureInfo.InvariantCulture,
+                "entry #{0}, reason {1}, {2:0.#}t this fill, cum pos {3}.",
+                trade.EntryOrderId, reason, realizedTicksThisFill, remaining));
+
+            if (remaining <= 0)
+            {
+                double avgExit = trade.ExitNotional / trade.ExitQty;
+                double realizedTicksNet = (trade.IsLong ? avgExit - trade.EntryPrice : trade.EntryPrice - avgExit) / tick;
+                double durationSec = (_now - trade.EntryTime).TotalSeconds;
+                LogAuto("trade_summary", trade.IsLong ? "Buy" : "Sell", avgExit, _lastPrice, string.Format(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    "entry #{0} @ {1:0.00}, exit @ {2:0.00}, {3:0.#}t gross, {4:0.0}s, reason {5}.",
+                    trade.EntryOrderId, trade.EntryPrice, avgExit, realizedTicksNet, durationSec, reason));
+                _openAutoTrade = null;
+            }
+        }
+
+        // Best-effort exit-reason classifier — the official ATM predicates first (authoritative for
+        // stop/target legs), then this control's own order-name tags for its manual Close/Rev buttons.
+        // Account.Flatten() (16:00 auto-flat, or a future manual Flat->reason split) doesn't let us name
+        // the resulting order, so anything left over is bucketed "flatten" (ponytail: refine from the
+        // CSV if this ever shows up misclassifying a real case).
+        private static string ClassifyExitReason(Order execOrder)
+        {
+            if (NinjaTrader.NinjaScript.AtmStrategy.IsStopLoss(execOrder)) return "stop";
+            if (NinjaTrader.NinjaScript.AtmStrategy.IsProfitTarget(execOrder)) return "target";
+            if (string.Equals(execOrder.Name, "Rev", StringComparison.OrdinalIgnoreCase)) return "manual";
+            if (string.Equals(execOrder.Name, "Close", StringComparison.OrdinalIgnoreCase)) return "manual";
+            return "flatten";
         }
 
         private void OnPositionUpdate(object sender, PositionEventArgs e)
@@ -1290,12 +1471,18 @@ namespace TradingRadar.NT
             SubmitRaw(action, OrderType.Market, pos.Quantity * 2, 0, "Rev");
         }
 
-        private void ClosePosition(bool cancelOrdersFirst)
+        // isManualKill: true only from the Flat button's own click handler — the human kill-switch also
+        // clears the persisted _autoIntent so AUTO never silently re-arms afterward (major finding: it
+        // previously left intent standing, same as any other forced disarm, contradicting the "a manual
+        // Flat always disarms AUTO" contract). The scheduled 16:00 auto-flatten (MaybeHoursFlatten) calls
+        // this with the default false — that path is meant to repair and re-arm the next session.
+        private void ClosePosition(bool cancelOrdersFirst, bool isManualKill = false)
         {
             if (!ValidateForSubmit()) return;
             if (cancelOrdersFirst)
             {
                 ForceDisarmAuto("Flat manual");   // kill-switch semantics — a manual Flat always disarms AUTO
+                if (isManualKill) _autoIntent = false;   // human Flat also clears intent — never silently re-arms later
                 // Flat = platform-native cancel-all-orders + close-position for this instrument/account.
                 try { _account.Flatten(new[] { _instrument }); }
                 catch (Exception ex) { Diag("Flat failed: " + ex.Message); }
@@ -1353,8 +1540,11 @@ namespace TradingRadar.NT
                     {
                         // StartAtmStrategy submits the entry order itself — do not also call Account.Submit.
                         NinjaTrader.NinjaScript.AtmStrategy.StartAtmStrategy(atm, o);
+                        // Bracket distances at attach time (verdict doc item 1) — without this, no AUTO
+                        // fire can ever be graded by realized R. Encoded in the detail text so the CSV
+                        // schema stays 6 columns; kept parseable (BracketSummary's format).
                         if (isAuto) LogAuto("atm_attach", action.ToString(), limitPrice, _lastPrice,
-                            "ATM " + atm.Name + " attached to order #" + o.Id + ".");
+                            "ATM " + atm.Name + " attached to order #" + o.Id + " (" + BracketSummary(atm) + ").");
                     }
                     catch (Exception atmEx)
                     {
@@ -1386,6 +1576,141 @@ namespace TradingRadar.NT
             {
                 Diag("submit failed (" + tag + "): " + ex.Message);
                 if (isAuto) LogAuto("submit", action.ToString(), limitPrice, _lastPrice, "AUTO submit FAILED: " + ex.Message);
+            }
+        }
+
+        // ADR 2026-07-03 Phase 1 (exit-leg instrumentation): the ATM's bracket distances (ticks) at
+        // attach time — without this, no AUTO fire can ever be graded by realized R (verdict doc item
+        // 1). NinjaTrader.Cbi.Bracket.StopLoss/Target carry no unit in the API itself, but every ATM
+        // template NT8 ships stores these as TICK distances (confirmed via ilspycmd decompile of
+        // NinjaTrader.Core.dll — Bracket.{Quantity,StopLoss,StopStrategy,Target}; matches the ATM
+        // Strategy Designer's own "Stop Loss"/"Target" columns, which are ticks by convention).
+        private static string BracketSummary(NinjaTrader.NinjaScript.AtmStrategy atm)
+        {
+            Bracket[] brackets = atm.Brackets;
+            if (brackets == null || brackets.Length == 0) return "atm " + atm.Name + ", no brackets";
+            string[] parts = new string[brackets.Length];
+            for (int i = 0; i < brackets.Length; i++)
+                parts[i] = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "sl {0:0.#}t, tp {1:0.#}t, qty {2}", brackets[i].StopLoss, brackets[i].Target, brackets[i].Quantity);
+            return "atm " + atm.Name + ", " + string.Join("; ", parts);
+        }
+
+        // ---- persistence surface (2026-07-03, always-armed AUTO, verdict doc item 6) ----
+        // Read by RadarTab.Save() into its own RadarAuto XElement, alongside the pre-existing
+        // RadarInstrument element — same Save/Restore(XElement) pattern RadarTab already uses.
+        public bool AutoIntentArmed { get { return _autoIntent; } }
+        public string SelectedAccountName { get { return _account != null ? _account.Name : null; } }
+        public string SelectedAtmName { get { return _lastPickedAtmName; } }
+        public int Qty { get { return GetQty(); } }
+        public bool HoursEnabled { get { return _hoursChk.IsChecked == true; } }
+        public string HoursStartText { get { return _hoursStartBox.Text; } }
+        public string HoursEndText { get { return _hoursEndBox.Text; } }
+        public string HoursFlatText { get { return _hoursFlatBox.Text; } }
+        // Blocker fix: persisted alongside the rest of RadarAuto so a restore can seed the daily-cap
+        // count instead of resurrecting a fresh one — see _pendingRestoreFireDay/TryAutoFire.
+        public string AutoFireDayText
+        {
+            get
+            {
+                return _autoFireDay == DateTime.MinValue ? string.Empty
+                    : _autoFireDay.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+            }
+        }
+        public int AutoFireCount { get { return _autoFireCount; } }
+
+        // Called once by RadarTab.Restore(), AFTER Instrument has already been pushed to this control
+        // (the Instrument setter resets ATM pick + disarms — restoring account/ATM only makes sense
+        // after that settles). Qty/HOURS apply immediately; account/ATM resolve asynchronously (the
+        // platform's own account-connect and ATM-selector item-list population) — see
+        // TryApplyPendingRestoreAccount and MaybeResolveAtmRestore. Auto-rearm itself only fires once
+        // BOTH resolve, via MaybeAutoRearm, gated on the restored _autoIntent.
+        public void RestoreAutoState(bool intentArmed, string accountName, string atmName, int qty,
+            bool hoursEnabled, string hoursStart, string hoursEnd, string hoursFlat,
+            string fireDay, int fireCount)
+        {
+            _autoIntent = intentArmed;
+            if (qty > 0) _qtyBox.Text = qty.ToString();
+            _hoursChk.IsChecked = hoursEnabled;
+            ApplyRestoredTime(_hoursStartBox, hoursStart, v => _hoursStart = v);
+            ApplyRestoredTime(_hoursEndBox, hoursEnd, v => _hoursEnd = v);
+            ApplyRestoredTime(_hoursFlatBox, hoursFlat, v => _hoursFlat = v);
+            _pendingAtmRestoreName = string.IsNullOrEmpty(atmName) ? null : atmName;
+            DateTime parsedFireDay;
+            if (!string.IsNullOrEmpty(fireDay) && DateTime.TryParseExact(fireDay, "yyyy-MM-dd",
+                    System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out parsedFireDay))
+            {
+                _pendingRestoreFireDay = parsedFireDay;
+                _pendingRestoreFireCount = fireCount;
+            }
+            if (!string.IsNullOrEmpty(accountName)) SelectAccountByName(accountName);
+        }
+
+        // Values round-trip from HoursStartText/HoursEndText/HoursFlatText (always "H:mm"-formatted by
+        // the existing commit logic in the constructor), so this only needs to guard against a missing/
+        // corrupt saved workspace, not user typos.
+        private static void ApplyRestoredTime(TextBox box, string text, Action<TimeSpan> set)
+        {
+            DateTime parsed;
+            if (string.IsNullOrEmpty(text)) return;
+            if (DateTime.TryParseExact(text.Trim(), "H:mm", System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None, out parsed))
+            {
+                set(parsed.TimeOfDay);
+                box.Text = text;
+            }
+        }
+
+        private void SelectAccountByName(string name)
+        {
+            _pendingRestoreAccountName = name;
+            TryApplyPendingRestoreAccount();
+        }
+
+        // Consumed once the named account actually exists in Account.All — immediately if it's already
+        // connected (the common case: accounts connect before a saved workspace reopens its windows),
+        // else on the next PopulateAccounts() call, which already re-runs on every AccountStatusUpdate
+        // (the platform's own account-connect event) — no separate timer/poll needed.
+        private void TryApplyPendingRestoreAccount()
+        {
+            if (_pendingRestoreAccountName == null) return;
+            Account acct;
+            lock (Account.All) acct = Account.All.FirstOrDefault(a => a.Name == _pendingRestoreAccountName);
+            if (acct == null) return;
+            _pendingRestoreAccountName = null;
+            _accountCombo.SelectedItem = acct;   // fires _accountSelectionHandler -> OnAccountSelected()
+        }
+
+        // Checked every SetContext tick (cheap: one field null-check + an Items scan, only while a
+        // restore is pending) so it converges regardless of when the ATM selector's own async Account/
+        // Instrument-driven repopulate actually completes — AtmStrategySelector is a plain ComboBox
+        // (confirmed via ilspycmd decompile of NinjaTrader.Gui.dll) so its inherited Items collection is
+        // the one verifiable way to find the persisted template and select it ourselves; we don't rely
+        // on the control's own (undocumented, obfuscated) default-selection behavior. Setting
+        // _atmUserPicked here mirrors DropDownClosed on purpose — a restored template IS the user's own
+        // prior explicit intent, not a stale/auto-selected leak (F16's concern). If the persisted
+        // template no longer exists for this account, this simply never resolves (ponytail: no timeout —
+        // a permanently-pending Items scan is cheap; add a missing-template diagnostic if the CSV ever
+        // shows this stuck in practice).
+        private void MaybeResolveAtmRestore()
+        {
+            if (_pendingAtmRestoreName == null) return;
+            // Review finding (major): ATM templates aren't unique per account. Without this guard, a
+            // same-named template on whatever account happens to be selected while the persisted
+            // account is still connecting would match here FIRST, consuming _pendingAtmRestoreName
+            // against the WRONG account — and OnAccountSelected's later correct-account switch has
+            // nothing left to re-resolve against. Wait for the persisted account itself to resolve.
+            if (_pendingRestoreAccountName != null) return;
+            foreach (object item in _atmSelector.Items)
+            {
+                NinjaTrader.NinjaScript.AtmStrategy cand = item as NinjaTrader.NinjaScript.AtmStrategy;
+                if (cand == null || cand.Name != _pendingAtmRestoreName) continue;
+                _atmSelector.SelectedItem = item;
+                _pendingAtmRestoreName = null;
+                _atmUserPicked = true;
+                _lastPickedAtmName = cand.Name;
+                MaybeAutoRearm("restore");
+                return;
             }
         }
 

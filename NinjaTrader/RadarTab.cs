@@ -1019,6 +1019,39 @@ namespace TradingRadar.NT
                 Instrument inst = Instrument.GetInstrument(instEl.Value);
                 if (inst != null) { _selector.Instrument = inst; Instrument = inst; }
             }
+            // Always-armed AUTO (2026-07-03, verdict doc item 6): restore the user's own AUTO intent +
+            // account/ATM/HOURS/qty so a reopened workspace can re-arm itself instead of silently
+            // staying off until the next manual checkbox click (52% of measured guard_skips were
+            // exactly this gap). AFTER the instrument restore above, on purpose — see RestoreAutoState.
+            if (_chartTrader != null)
+            {
+                XElement autoEl = element.Element("RadarAuto");
+                if (autoEl != null)
+                {
+                    try
+                    {
+                        _chartTrader.RestoreAutoState(
+                            (bool?)autoEl.Attribute("armed") ?? false,
+                            (string)autoEl.Attribute("account"),
+                            (string)autoEl.Attribute("atm"),
+                            (int?)autoEl.Attribute("qty") ?? 1,
+                            (bool?)autoEl.Attribute("hours") ?? true,
+                            (string)autoEl.Attribute("hoursStart"),
+                            (string)autoEl.Attribute("hoursEnd"),
+                            (string)autoEl.Attribute("hoursFlat"),
+                            (string)autoEl.Attribute("fireDay"),
+                            (int?)autoEl.Attribute("fireCount") ?? 0);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Minor finding: a malformed/hand-edited RadarAuto attribute (bad bool/int cast)
+                        // must not abort the whole Restore() call — fall back to defaults, same as a
+                        // missing element entirely.
+                        NinjaTrader.Code.Output.Process("[Radar] RadarAuto restore failed: " + ex.Message,
+                            NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+                    }
+                }
+            }
         }
 
         protected override void Save(XElement element)
@@ -1026,6 +1059,18 @@ namespace TradingRadar.NT
             if (element == null) return;
             if (_instrument != null)
                 element.Add(new XElement("RadarInstrument", _instrument.FullName));
+            if (_chartTrader != null)
+                element.Add(new XElement("RadarAuto",
+                    new XAttribute("armed", _chartTrader.AutoIntentArmed),
+                    new XAttribute("account", _chartTrader.SelectedAccountName ?? string.Empty),
+                    new XAttribute("atm", _chartTrader.SelectedAtmName ?? string.Empty),
+                    new XAttribute("qty", _chartTrader.Qty),
+                    new XAttribute("hours", _chartTrader.HoursEnabled),
+                    new XAttribute("hoursStart", _chartTrader.HoursStartText),
+                    new XAttribute("hoursEnd", _chartTrader.HoursEndText),
+                    new XAttribute("hoursFlat", _chartTrader.HoursFlatText),
+                    new XAttribute("fireDay", _chartTrader.AutoFireDayText),
+                    new XAttribute("fireCount", _chartTrader.AutoFireCount)));
         }
     }
 }
