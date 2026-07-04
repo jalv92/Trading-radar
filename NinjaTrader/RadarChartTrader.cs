@@ -99,7 +99,10 @@ namespace TradingRadar.NT
         // once ExitQty catches up to EntryQty.
         private sealed class AutoTrade
         {
-            public long EntryOrderId;
+            public long EntryOrderId;    // logged diagnostic only — see EntryOrder below (FIX 5, 2026-07-03)
+            public Order EntryOrder;     // FIX 5: reference-compared for same-side-entry exclusion — NT8
+                                          // docs say OrderId is not guaranteed stable across an order's
+                                          // lifetime, so Id alone is not a safe identity check.
             public bool IsLong;
             public double EntryPrice;
             public int EntryQty;
@@ -108,6 +111,14 @@ namespace TradingRadar.NT
             public double ExitNotional;  // sum(price*qty) across exit fills — running weighted-avg exit price
         }
         private AutoTrade _openAutoTrade;
+        // Self-heal reconciliation (review finding, major, 2026-07-03): _openAutoTrade otherwise only
+        // clears via an exactly-accounted exit (HandlePossibleExitFill's remaining<=0) or an explicit
+        // Abandon call (instrument/account switch, replay reset, FIX 1's overwrite branch) — none of
+        // which fire if a genuine exit execution slips past accounting (FIX 3a's Order-less exit_untracked
+        // branch never advances ExitQty; FIX 4's residual non-"Entry" foreign-order gap). Guard 2's busy
+        // check then wedges AUTO permanently even though the real account is flat. _now the reconcile
+        // condition first held — MinValue when not currently held. See MaybeReconcileOpenAutoTrade.
+        private DateTime _openTradeStaleSince = DateTime.MinValue;
 
         // AUTO mode (2026-07-01, Sim/Playback only) — auto-submits the pre-stage above through the SAME
         // SubmitLimit -> SubmitRaw path a manual click uses. See TryAutoFire/TryArmAuto below.
@@ -551,8 +562,36 @@ namespace TradingRadar.NT
             _now = now;
             MaybeAutoCancel();
             MaybeHoursFlatten();
+            MaybeReconcileOpenAutoTrade();
             MaybeResolveAtmRestore();
             RefreshPositionUi();
+        }
+
+        // Review finding (major, 2026-07-03): self-heal a leaked _openAutoTrade against the REAL account
+        // position — see the field's own comment for the two documented gaps (exit_untracked, FIX 4's
+        // residual foreign-order case) that can leave it stuck with no other recovery path short of an
+        // instrument/account switch or a replay reset. Checked every SetContext tick, same pattern as
+        // MaybeAutoCancel/MaybeHoursFlatten, against the REPLAY-aware clock (_now) — never wall clock, for
+        // the same Playback-speed reason those two already document. Requires the condition to hold for a
+        // grace window, not a single tick: CurrentPosition() can read transiently flat for a beat around a
+        // fill/exit event-ordering boundary (see guard 2's own comment in TryAutoFire) — abandoning on the
+        // very first flat read would undo FIX 1's own careful bookkeeping for a perfectly healthy trade.
+        private void MaybeReconcileOpenAutoTrade()
+        {
+            if (_openAutoTrade == null || _now == DateTime.MinValue || _account == null)
+            {
+                _openTradeStaleSince = DateTime.MinValue;
+                return;
+            }
+            if (_activeLimit != null || !IsFlat(CurrentPosition()))
+            {
+                _openTradeStaleSince = DateTime.MinValue;   // trade is legitimately still open — not stale
+                return;
+            }
+            if (_openTradeStaleSince == DateTime.MinValue) { _openTradeStaleSince = _now; return; }
+            if ((_now - _openTradeStaleSince).TotalSeconds < OpenTradeStaleGraceSeconds) return;
+            AbandonOpenAutoTrade("stale — position flat, trade unresolved");
+            _openTradeStaleSince = DateTime.MinValue;
         }
 
         // Trading-hours forced flatten (2026-07-03): at/after the configured flat time (16:00 default),
@@ -584,6 +623,10 @@ namespace TradingRadar.NT
         // AUTO mode placeholders (2026-07-01) — pending the same Rec-CSV calibration pass (spec §9).
         private const int AutoStaleTicks = 2;       // MEASURED later — anti-stale tolerance at auto-fire time (F18)
         private const int AutoCancelSeconds = 15;   // MEASURED later — unfilled auto limit auto-cancels after this long
+        // MEASURED later — grace before MaybeReconcileOpenAutoTrade self-heals a stale _openAutoTrade.
+        // Must comfortably exceed the normal fill->HandlePossibleExitFill event-ordering "beat" (guard 2's
+        // own comment) so a legitimately-in-flight exit is never mistaken for a leaked record.
+        private const int OpenTradeStaleGraceSeconds = 5;
 
         // AUTO daily trade cap, read from the Cap/day box (default 10, was the AutoFireCapPerDay=5
         // const). Parsed at use on the UI thread — every caller (guard 3, submit log) runs on the
@@ -676,9 +719,19 @@ namespace TradingRadar.NT
                 }
             }
             if (!ValidateForSubmit()) return;                            // no instrument/account, order in flight, not Sim/armed (Diag'd inside — shared with the manual path, not routed to the AUTO CSV)
-            if (_activeLimit != null || !IsFlat(CurrentPosition()))         // guard 2: busy
+            // guard 2 (FIX 2, 2026-07-03): busy. Also gates on _openAutoTrade != null — "one AUTO trade
+            // at a time" enforced from THIS control's own bookkeeping, independent of CurrentPosition()
+            // (which can read flat for a beat around a fill/exit boundary, or diverge entirely from a
+            // reversal). This is what actually prevents the day-29 misattribution (a second AUTO entry
+            // firing while the previous trade's exits are still unresolved) — FIX 1/4 are defense-in-depth
+            // for the paths this guard doesn't cover (guard bypass, manual clicks).
+            Position posNow = CurrentPosition();
+            if (_activeLimit != null || !IsFlat(posNow) || _openAutoTrade != null)
             {
-                DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — busy (working limit or open position).");
+                string why = _activeLimit != null ? "working limit"
+                    : !IsFlat(posNow) ? "open position"
+                    : "unresolved auto trade";
+                DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — busy (" + why + ").");
                 return;
             }
 
@@ -1062,11 +1115,20 @@ namespace TradingRadar.NT
                     // (fully or partially-then-cancelled — either way a position opened) — open the one
                     // live AUTO trade record. Captured here, BEFORE _autoOrder is nulled below.
                     if (ReferenceEquals(_autoOrder, ord) && ord.Filled > 0)
+                    {
+                        // FIX 1 (day-29 forensic finding, 2026-07-03): a still-open trade here means the
+                        // PREVIOUS record was never resolved (exit telemetry missed it, or the busy guard
+                        // was bypassed) — overwriting it silently would drop its trade_summary row from
+                        // the CSV entirely. Every overwrite must leave an honest "abandoned" row, matching
+                        // the pattern already used at instrument/account switch and replay reset.
+                        if (_openAutoTrade != null)
+                            AbandonOpenAutoTrade("new auto entry filled");
                         _openAutoTrade = new AutoTrade
                         {
-                            EntryOrderId = ord.Id, IsLong = ord.OrderAction == OrderAction.Buy,
+                            EntryOrderId = ord.Id, EntryOrder = ord, IsLong = ord.OrderAction == OrderAction.Buy,
                             EntryPrice = ord.AverageFillPrice, EntryQty = ord.Filled, EntryTime = _now
                         };
+                    }
                     _workingOrders.Remove(ord);   // HashSet.Remove is a no-op if already gone
                     _ownOrders.Remove(ord);
                     if (ReferenceEquals(_activeLimit, ord)) _activeLimit = null;
@@ -1139,7 +1201,65 @@ namespace TradingRadar.NT
             AutoTrade trade = _openAutoTrade;
             if (trade == null) return;
             Order execOrder = exec.Order;
-            if (execOrder == null) return;
+            if (execOrder == null)
+            {
+                // FIX 3a (2026-07-03): was a silent return. Rare but real — NT8 docs: not all executions
+                // have an Order ref (ExitOnSessionClose, AtmStrategyCreate()). Breadcrumb only, so this
+                // doesn't vanish from the trail the way the round-3 diagnosis found the guard_skips did.
+                LogAuto("exit_untracked", exec.MarketPosition == MarketPosition.Long ? "Buy" : "Sell", exec.Price, _lastPrice,
+                    string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "entry #{0}, qty {1}, name '{2}' — execution without Order ref.",
+                        trade.EntryOrderId, exec.Quantity, exec.Name));
+                return;
+            }
+
+            // FIX 5: compare the Order object, not its Id — NT8 docs: OrderId is not guaranteed stable
+            // across an order's lifetime. EntryOrderId is kept purely as a logged diagnostic.
+            bool isOwnEntry = ReferenceEquals(execOrder, trade.EntryOrder);
+
+            // Review finding (minor): the ReferenceEquals identity check above cross-references an Order
+            // captured from Account.OrderUpdate against exec.Order from the separate Account.ExecutionUpdate
+            // stream — an untested-live assumption (see FIX 5's own comment/design notes). If it ever
+            // disagrees with the old Id-based check, that's exactly the silent-misattribution failure mode
+            // this whole investigation started from — flag it instead of trusting it blind.
+            if (!isOwnEntry && execOrder.Id == trade.EntryOrderId)
+                LogAuto("diag_mismatch", execOrder.OrderAction.ToString(), exec.Price, _lastPrice, string.Format(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    "entry #{0} — Id matches but ReferenceEquals(execOrder, EntryOrder) is false for order #{1} " +
+                    "(name '{2}'); the OrderUpdate/ExecutionUpdate same-instance assumption may not hold.",
+                    trade.EntryOrderId, execOrder.Id, execOrder.Name));
+
+            // FIX 4 (day-29 forensic finding): an order named "Entry" is ALWAYS an ATM-attached entry —
+            // SubmitRaw requires exactly that name for ATM attach, so this is either THIS trade's own
+            // entry (isOwnEntry — already folded into EntryQty/EntryPrice by OnOrderUpdate) or a FOREIGN
+            // one: this control's NEXT auto/manual entry firing while this trade is still open. Neither
+            // is a genuine exit leg. A foreign one must not be folded into EntryQty either — that would
+            // silently graft a different position's size onto this trade (the day-29 bug: a still-open
+            // SHORT record "closed" by the next long entry's own fill, because the opposite-side test
+            // alone can't tell an ATM leg from the next entry). Ignore it outright instead of guessing.
+            //
+            // Variant shipped: safe, name-based exclusion — not full ATM leg-set capture. Investigated
+            // NinjaTrader.Core.dll via ilspycmd: AtmStrategy exposes GetStopOrders(idx)/GetTargetOrders(idx)
+            // (Collection<Order>) and StartAtmStrategy(...) returns the live running AtmStrategy instance
+            // (distinct from the template), which could in principle be captured per-trade and matched
+            // against exactly. Not built: ClassifyExitReason's own comment documents that this SAME
+            // obfuscated internals family (IsStopLoss/IsProfitTarget) empirically returns false at runtime
+            // for the Order instances Account.ExecutionUpdate actually delivers — betting a correctness-
+            // critical check on a sibling API from that family, unverifiable without a live NT8 session,
+            // is a worse trade than this cheap, provably-effective name check. FIX 2's stronger busy guard
+            // is what actually prevents this scenario in normal operation; this is the residual
+            // defense-in-depth for guard-bypassing edge paths (e.g. a manual ATM entry clicked while an
+            // AUTO trade is still open) — a genuinely different non-"Entry"-named order on the opposite
+            // side while a trade is open is the residual gap this variant does not close.
+            if (!isOwnEntry && string.Equals(execOrder.Name, "Entry", StringComparison.OrdinalIgnoreCase))
+            {
+                LogAuto("entry_ignored", execOrder.OrderAction.ToString(), exec.Price, _lastPrice, string.Format(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    "entry #{0} — foreign 'Entry' order #{1} (qty {2}) not attributed to this trade.",
+                    trade.EntryOrderId, execOrder.Id, exec.Quantity));
+                return;
+            }
+
             bool isExitSide = trade.IsLong ? execOrder.OrderAction == OrderAction.Sell : execOrder.OrderAction == OrderAction.Buy;
             if (!isExitSide)
             {
@@ -1150,7 +1270,16 @@ namespace TradingRadar.NT
                 // into EntryQty/EntryPrice by OnOrderUpdate) so it isn't double-counted here. Qty-only:
                 // EntryPrice deliberately stays the original fill's price (ponytail — full weighted-avg
                 // re-pricing is a bigger change; upgrade if scale-ins turn out to be common in the CSV).
-                if (execOrder.Id != trade.EntryOrderId) trade.EntryQty += exec.Quantity;
+                if (!isOwnEntry)
+                {
+                    trade.EntryQty += exec.Quantity;
+                    // FIX 3b: was silent — breadcrumb so a scale-in is visible in the CSV instead of only
+                    // showing up as an unexplained EntryQty jump in the eventual trade_summary row.
+                    LogAuto("scale_in", execOrder.OrderAction.ToString(), exec.Price, _lastPrice, string.Format(
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        "entry #{0}, folded qty {1} from order '{2}' (#{3}), EntryQty now {4}.",
+                        trade.EntryOrderId, exec.Quantity, execOrder.Name, execOrder.Id, trade.EntryQty));
+                }
                 return;
             }
 
