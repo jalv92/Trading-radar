@@ -168,6 +168,9 @@ namespace TradingRadar.NT
         private readonly TextBox _qtyBox = new TextBox { Text = "1", Width = 40, TextAlignment = TextAlignment.Center,
             Background = Ink, Foreground = TextCol, BorderBrush = BorderBr,
             VerticalContentAlignment = VerticalAlignment.Center };
+        // Qty +/- steppers — promoted from BuildUi locals so ApplyAtmQtyLock can toggle them from any
+        // _atmUserPicked mutation site, not just the dropdown handler that used to own them (regression fix).
+        private Button _qtyMinus, _qtyPlus;
         // "SETUP LONG/SHORT listo" indicator for a pending Controller-fire pre-stage (Task 12). Doubles
         // as the manual-clear affordance — click it to drop the pre-stage without touching either button.
         private readonly TextBlock _setupText = new TextBlock { FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
@@ -340,6 +343,7 @@ namespace TradingRadar.NT
                 var plus  = MakeManageButton("+");  plus.Width  = 34; plus.Height  = 30; plus.FontSize  = 16; plus.Margin  = new Thickness(3, 0, 0, 0);
                 minus.Click += (o, e) => StepQty(-1);
                 plus.Click  += (o, e) => StepQty(1);
+                _qtyMinus = minus; _qtyPlus = plus;   // so ApplyAtmQtyLock can toggle them from any call site
                 _qtyBox.Width = 54; _qtyBox.Height = 30; _qtyBox.FontSize = 15;
                 var qtyGroup = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center,
                     Children = { qtyLbl, minus, _qtyBox, plus } };
@@ -364,7 +368,12 @@ namespace TradingRadar.NT
                         MaybeAutoRearm("atm re-pick");   // a broken ATM precondition just repaired — see method banner
                     }
                     else
+                    {
                         ForceDisarmAuto("ATM set to None");   // guard 2 of the AUTO arm precondition broke
+                    }
+                    // Qty box is manual-only — an attached ATM's own total governs sizing (SubmitRaw
+                    // overrides it anyway); single source of truth for every _atmUserPicked mutation site.
+                    ApplyAtmQtyLock();
                 };
                 // Same right margin as the account combo so both combos share the same right edge.
                 var atmRow = new DockPanel { Margin = new Thickness(0, 0, 10, 0) };
@@ -539,6 +548,7 @@ namespace TradingRadar.NT
                 _atmSelector.Instrument = value;
                 _atmSelector.SelectedItem = null;   // force "None" — don't trust the control's own default
                 _atmUserPicked = false;             // F16: switching instrument disarms ATM attach again
+                ApplyAtmQtyLock();                  // unlock the qty box now that no ATM is picked
                 ForceDisarmAuto("instrument changed");
                 // Roll the AUTO log so the next event opens a file named for the NEW instrument
                 // (review round-3 minor: the name is captured at first-open only).
@@ -991,6 +1001,7 @@ namespace TradingRadar.NT
             _atmSelector.Account = _account;
             _atmSelector.SelectedItem = null;   // force "None" — don't trust the control's own default
             _atmUserPicked = false;             // F16: switching account disarms ATM attach again
+            ApplyAtmQtyLock();                  // unlock the qty box now that no ATM is picked
             ForceDisarmAuto("account changed");
             SubscribeAccount();
             RefreshArmUi();
@@ -1681,6 +1692,15 @@ namespace TradingRadar.NT
             // F16: ATM only attaches once the user has actually picked one via the dropdown (DropDownClosed) —
             // a stale/auto-selected SelectedAtmStrategy from the control's own async repopulate never attaches.
             NinjaTrader.NinjaScript.AtmStrategy atm = (isEntry && _atmUserPicked) ? _atmSelector.SelectedAtmStrategy : null;
+            // An attached ATM's total bracket quantity governs the entry size — the Qty box is manual-only.
+            // Matches NT8's Chart Trader/SuperDOM: selecting an ATM makes the strategy's quantity drive the
+            // position (ES_2C = 2 contracts regardless of the spinbox). Without this, an entry qty below the
+            // ATM total arms only a subset of the brackets (observed 2026-07-04: ES_2C at qty 1 → 1-leg fill).
+            if (atm != null)
+            {
+                int atmQty = AtmTotalQty(atm);
+                if (atmQty >= 1) qty = atmQty;
+            }
             // F20 (defense in depth): TryAutoFire's guard 5 already checks the ATM at fire time, but this
             // is the actual submit instant — an AUTO entry must NEVER go out naked. Abort before CreateOrder
             // (no order at all), unlike the atm-attach-failure branch below, which only degrades a MANUAL
@@ -1766,6 +1786,37 @@ namespace TradingRadar.NT
                 parts[i] = string.Format(System.Globalization.CultureInfo.InvariantCulture,
                     "sl {0:0.#}t, tp {1:0.#}t, qty {2}", brackets[i].StopLoss, brackets[i].Target, brackets[i].Quantity);
             return "atm " + atm.Name + ", " + string.Join("; ", parts);
+        }
+
+        // Sum of the ATM template's bracket quantities = the position size the ATM manages (NT8 arms one
+        // bracket set per contract). ES_2C = two 1-lot brackets = 2. Returns 0 if the template has no
+        // brackets (caller keeps the passed qty). Bracket.Quantity confirmed against the live atm_attach
+        // log ("qty 1; qty 1" for ES_2C) and the existing BracketSummary reader.
+        private static int AtmTotalQty(NinjaTrader.NinjaScript.AtmStrategy atm)
+        {
+            Bracket[] brackets = atm.Brackets;
+            if (brackets == null) return 0;
+            int total = 0;
+            for (int i = 0; i < brackets.Length; i++) total += brackets[i].Quantity;
+            return total;
+        }
+
+        // Single source of truth for the qty-box lock: when a usable ATM is picked its total bracket
+        // quantity governs size (box shows it, read-only + steppers off); otherwise the box is the manual
+        // size (editable). Must be called from EVERY site that flips _atmUserPicked, or the box strands in
+        // a stale state (reviewer findings: instrument/account switch left it disabled at the old ATM
+        // total; session restore left it enabled showing a stale manual qty). A not-yet-populated ATM
+        // (AtmTotalQty==0) intentionally stays editable rather than locking a wrong number — SubmitRaw
+        // reads fresh brackets at submit time and still sizes correctly.
+        private void ApplyAtmQtyLock()
+        {
+            var atm = _atmUserPicked ? _atmSelector.SelectedAtmStrategy : null;
+            int total = atm != null ? AtmTotalQty(atm) : 0;
+            bool lockIt = total >= 1;
+            if (lockIt) _qtyBox.Text = total.ToString();
+            _qtyBox.IsEnabled = !lockIt;
+            if (_qtyMinus != null) _qtyMinus.IsEnabled = !lockIt;
+            if (_qtyPlus != null)  _qtyPlus.IsEnabled  = !lockIt;
         }
 
         // ---- persistence surface (2026-07-03, always-armed AUTO, verdict doc item 6) ----
@@ -1883,6 +1934,7 @@ namespace TradingRadar.NT
                 _pendingAtmRestoreName = null;
                 _atmUserPicked = true;
                 _lastPickedAtmName = cand.Name;
+                ApplyAtmQtyLock();   // lock+reflect the restored ATM's total (stays editable if brackets aren't populated yet)
                 MaybeAutoRearm("restore");
                 return;
             }

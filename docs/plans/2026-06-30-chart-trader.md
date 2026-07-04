@@ -237,6 +237,36 @@ Gates: `dotnet test` 89/89 (new engine regression test for the near-wall gate), 
 0/0. `ControllerConfig` thresholds unchanged — see the calibration doc for why (grid re-confirms
 round-2, n=3 too thin to move anything).
 
+### ATM governs entry size (2026-07-04) — bug fix + new risk items
+
+Bug (found in a Sim capture, `lr-auto-ES-20260704-100841.csv`): the entry qty came from the manual
+Qty spinbox regardless of the attached ATM. With `ES_2C` (a 2-contract template) but the box at 1,
+order #1407 submitted qty 1 → NT8 armed only ONE of the two brackets = a de-facto 1-contract ATM.
+Fix (`RadarChartTrader.cs`): when an ATM is attached, the entry qty = `AtmTotalQty(atm)` (sum of
+`Bracket.Quantity`) at the single `SubmitRaw` chokepoint — matches NT8's Chart Trader/SuperDOM, where
+the ATM template governs position size and the Qty box is manual-only. UI: `ApplyAtmQtyLock()` reflects
+the ATM total into the box + disables it (and the ▲▼ steppers) whenever an ATM is picked, re-enables on
+None — called from all 4 sites that flip `_atmUserPicked` (DropDownClosed, Instrument setter,
+OnAccountSelected, MaybeResolveAtmRestore) so the box can't strand in a stale enable/value state.
+Reviewed: code-reviewer + `trading-risk-manager` — **APPROVED for Sim/Playback, VETO for real-money
+reliance** until the items below. `dotnet test` 111/111, `nt8c` staged 0/0.
+
+New real-money preconditions (risk-manager, 2026-07-04):
+- **F2 is now more load-bearing** (was "max qty clamp"): an ATM's bracket sum can now silently exceed
+  whatever the operator typed. Clamp final qty to a configurable per-fire max AFTER the ATM override; if
+  the ATM total exceeds it, **refuse** the submit (never silently downsize below the bracket count — that
+  re-creates the 1-leg-fill bug). Bounds the per-day envelope together with the fire cap. Required before
+  real-money AUTO (the fire cap counts fires, not contracts — N-contract templates multiply turnover NxN).
+- **F25 (size-signalling invariant) — DONE for Sim:** every path that sets `_atmUserPicked=true` must
+  lock+reflect the qty box; every reset must unlock it. Enforced via the single `ApplyAtmQtyLock()` helper.
+- **F26 (BLOCKER, real) — ATM-attach-failure degrade must not plain-submit for `isAuto`.** The F17 catch
+  block (`_account.Submit` when still `Initialized`) runs for auto too — an AUTO entry whose
+  `StartAtmStrategy` throws pre-dispatch is submitted **naked at the ATM total qty**, defeating F20's
+  "never a naked auto entry". The F20 comment claiming the degrade "only affects a MANUAL entry" is
+  factually wrong about this branch. Pre-existing; this change enlarges its size. Sim-only for AUTO today.
+  Before real-money AUTO: for `isAuto`, the degrade must abort/cancel, never plain-submit, and never at the
+  ATM total.
+
 ### Sim test checklist for the ATM path (before trusting it)
 1. Open the tab, pick a Sim/Playback account + instrument → confirm the **ATM box shows nothing pre-selected** (blank), i.e. no auto-picked template.
 2. Select an ATM template, take a bracketed BUY/SELL MKT → let it fill → confirm the ATM's stop/target appear at the broker AND that the **ladder marker / ▲▼ do NOT latch onto the ATM's target** (F15 check — they should stay tied only to your own manual LMT, if any).
