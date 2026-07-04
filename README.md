@@ -17,7 +17,7 @@ Visual identity: **"Aurora"** — deep-ink background, emerald (bid/support) / c
 
 | Layer | State |
 |-------|-------|
-| **Engine** (`Engine/`) | ✅ Complete. Pure C#, deterministic, NinjaTrader-free. **101/101 unit tests, 0 warnings.** |
+| **Engine** (`Engine/`) | ✅ Complete. Pure C#, deterministic, NinjaTrader-free. **111/111 unit tests, 0 warnings.** |
 | **NT8 add-on** (`NinjaTrader/`) | ✅ **Built, deployed, and running in Market Replay** (screenshots above). Ladder + Controller cockpit + Chart Trader all live. |
 | **Consumption-Break Controller** | ✅ Live (state machine + fire latch + pre-stage). ⚠️ **Thresholds are placeholder / being calibrated** from `Rec` captures on real ES days — eight review/calibration rounds so far (`docs/calibration-consumption-break-es-day1.md`). Treat fires as a *read*, not a tuned signal, until calibrated. |
 | **AUTO mode** | ✅ Live, **Sim/Playback only**, hard-gated (ATM required, configurable daily trade cap (default 10, persisted), 15 s auto-cancel, persistent decision log) + **HOURS schedule**: fires only 09:30–15:55, forced flatten at 16:00 (editable in the UI). **Always-armed** (2026-07-03): arming intent + account/ATM/cap/hours persist in the workspace and re-arm automatically when every precondition re-verifies — the daily-cap counter persists too, and a manual Flat clears the intent. **Exit-leg telemetry**: the ATM bracket (SL/TP) is logged at attach, and every closing fill emits `exit` + `trade_summary` rows, so each AUTO trade is gradeable by realized R. |
@@ -74,7 +74,7 @@ An order-entry surface docked under the cockpit — the radar becomes a place to
 - **BUY / SELL MKT** — market orders.
 - **BUY / SELL LMT** — **wall-anchored** limits: a SELL LMT rests one tick in front of the largest wall above the market, a BUY LMT one tick in front of the largest wall below (anchored once on submit; falls back to a mid ± 1-tick proxy if there's no wall). The `▲ / ▼` buttons nudge a working limit one tick at a time via order modification (queue priority preserved, no cancel-and-resubmit).
 - **Rev / Close / Flat** — reverse, close, or flatten the position (Flat = native cancel-all + close).
-- **Account selector** (`Playback101`), **Qty** stepper, and an **ATM selector** (`ES_1C`) — pick an ATM template and MKT/LMT entries attach its bracket (SL/TP); leave it on *None* for a flat entry.
+- **Account selector** (`Playback101`), **Qty** stepper, and an **ATM selector** (`ES_2C`) — pick an ATM template and MKT/LMT entries attach its bracket (SL/TP). **When an ATM is selected, its template governs the position size** (the sum of its bracket quantities — an `ES_2C` enters 2 contracts), exactly as NinjaTrader's own Chart Trader does; the **Qty** stepper then locks to that count and is used only to size a flat, no-ATM entry. Leave the selector on *None* for a flat entry sized by the Qty box.
 - **Pre-stage on fire** — when the Controller fires, the ticket pre-stages a **break-direction limit** and lights up **"SETUP LONG/SHORT ready"**; you click BUY/SELL LMT to submit it (click the indicator to discard). The human clicks — unless AUTO is armed:
 - **`AUTO` toggle** (below the HOURS row; the **Cap/day** box beside the ATM selector sets the daily trade cap, default 10) — auto-submits the pre-staged break limit **through the same submit path a manual click uses**. Arming is hard-gated: **Sim/Playback account + an ATM template selected**, and it force-disarms (with the reason shown next to the checkbox) on instrument change, account change, ATM back to *None*, or the **daily trade cap**. Your arming intent, account, ATM template, qty, cap, and HOURS settings **persist in the workspace**, and AUTO **re-arms automatically** once every precondition re-verifies after a restore or a for-cause disarm — fail-closed: the daily-cap counter persists across a same-day reopen, the 16:00 flatten stays disarmed for the rest of that day, and a manual **Flat** clears the intent entirely (only a human re-check of the box brings it back). An unfilled auto limit **auto-cancels after 15 s**, and every AUTO decision is appended to a persistent CSV log (`…\Documents\NinjaTrader 8\LiquidityRadar\`) for audit — including, per trade, the **ATM bracket at attach** (`sl/tp` ticks) and **`exit` / `trade_summary` rows** (exit reason, realized ticks, duration) so every AUTO trade is gradeable by realized R.
 - **`HOURS` schedule** (under the AUTO row, on by default) — AUTO fires only between **09:30–15:55** (replay/exchange clock), and at **16:00** any open position or working order is **force-flattened** through the same native cancel-all + close path as the Flat button (which also disarms AUTO). All three times are editable in the row; the flatten runs once per replay day and applies even if AUTO was already disarmed (e.g. by the daily cap).
@@ -181,7 +181,7 @@ Defaults ship tuned for NQ; ES presets and per-instrument calibration are in pro
 Requires the .NET SDK (8 or 10). The engine builds and tests **without NinjaTrader**:
 
 ```bash
-dotnet test          # 101/101 passing, 0 warnings
+dotnet test          # 111/111 passing, 0 warnings
 dotnet build         # netstandard2.0 engine + net8.0 test project
 ```
 
@@ -215,7 +215,7 @@ nt8c build --custom-dir build/.stage/Custom      # expect 0 errors
 
 ## Roadmap
 
-- [x] Engine — book mirror, wall detection, three-outcome classification, confidence/memory, aggressor delta + erosion — 110/110 unit tests.
+- [x] Engine — book mirror, wall detection, three-outcome classification, confidence/memory, aggressor delta + erosion — 111/111 unit tests.
 - [x] NT8 add-on — anchored ladder, cockpit render, Chart Trader (MKT + wall-anchored LMT + ATM), Market Replay reset handling.
 - [x] **Consumption-Break Controller** — tape speed + consumption countdown + state machine + latched fire, rendered in the cockpit.
 - [x] **Pre-stage + AUTO mode** — break-direction limit pre-staged on fire; optional hard-gated auto-submit (Sim/Playback) with daily cap, auto-cancel, and a persistent decision log.
