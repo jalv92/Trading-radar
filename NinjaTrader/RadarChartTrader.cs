@@ -1260,7 +1260,11 @@ namespace TradingRadar.NT
                 return;
             }
 
-            bool isExitSide = trade.IsLong ? execOrder.OrderAction == OrderAction.Sell : execOrder.OrderAction == OrderAction.Buy;
+            // NT8 delivers the ATM legs that close a SHORT as OrderAction.BuyToCover, not Buy —
+            // observed run 2026-06-16: both Stop legs of short #1408 folded as scale_in (EntryQty 2->4)
+            // and the trade died "abandoned (stale)" with no realized ticks. Long legs arrive as Sell.
+            bool execIsBuy = execOrder.OrderAction == OrderAction.Buy || execOrder.OrderAction == OrderAction.BuyToCover;
+            bool isExitSide = trade.IsLong ? !execIsBuy : execIsBuy;
             if (!isExitSide)
             {
                 // Minor finding: nothing blocks a manual same-side scale-in while an AUTO trade + ATM

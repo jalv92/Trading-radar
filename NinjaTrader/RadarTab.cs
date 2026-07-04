@@ -946,7 +946,7 @@ namespace TradingRadar.NT
                         "{0},{1},{2},{3},{4}",
                         DateTime.Now.ToString("o"),
                         _instrument != null ? _instrument.MasterInstrument.Name : "X",
-                        _recArms, _recFires, alert));
+                        arms, fires, alert));   // the snapshot locals — _recArms/_recFires were zeroed at line ~924
                 }
                 if (alert.Length > 0)
                     NinjaTrader.Code.Output.Process("[Radar] " + alert, NinjaTrader.NinjaScript.PrintTo.OutputTab1);
