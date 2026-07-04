@@ -1131,10 +1131,12 @@ namespace TradingRadar.NT
             trade.ExitNotional += exec.Price * exec.Quantity;
             int remaining = Math.Max(0, trade.EntryQty - trade.ExitQty);
 
+            // Raw order name included so any future reason misclassification is self-diagnosing
+            // from the CSV alone (the day-1 "flatten" mislabel needed a code dive to explain).
             LogAuto("exit", execOrder.OrderAction.ToString(), exec.Price, _lastPrice, string.Format(
                 System.Globalization.CultureInfo.InvariantCulture,
-                "entry #{0}, reason {1}, {2:0.#}t this fill, cum pos {3}.",
-                trade.EntryOrderId, reason, realizedTicksThisFill, remaining));
+                "entry #{0}, reason {1}, {2:0.#}t this fill, cum pos {3}, order '{4}'.",
+                trade.EntryOrderId, reason, realizedTicksThisFill, remaining, execOrder.Name));
 
             if (remaining <= 0)
             {
@@ -1160,6 +1162,13 @@ namespace TradingRadar.NT
             if (NinjaTrader.NinjaScript.AtmStrategy.IsProfitTarget(execOrder)) return "target";
             if (string.Equals(execOrder.Name, "Rev", StringComparison.OrdinalIgnoreCase)) return "manual";
             if (string.Equals(execOrder.Name, "Close", StringComparison.OrdinalIgnoreCase)) return "manual";
+            // Day-1 CSV (2026-07-03 21:54): both ATM target fills at the exact TP prices classified
+            // "flatten" — the official predicates above return false for the Order instances
+            // Account.ExecutionUpdate delivers (obfuscated internals, likely instance-identity based).
+            // Fall back to NT8's ATM/strategy leg naming: "Stop1"/"Target1", "Stop loss"/"Profit target".
+            string name = execOrder.Name ?? string.Empty;
+            if (name.IndexOf("target", StringComparison.OrdinalIgnoreCase) >= 0) return "target";
+            if (name.IndexOf("stop", StringComparison.OrdinalIgnoreCase) >= 0) return "stop";
             return "flatten";
         }
 
