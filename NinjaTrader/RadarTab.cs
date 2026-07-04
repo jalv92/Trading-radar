@@ -220,7 +220,9 @@ namespace TradingRadar.NT
             _chartTrader = new RadarChartTrader();
             Grid rightCol = new Grid();
             rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1.0, GridUnitType.Star) });
-            rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(340) });
+            // Auto, not a fixed height: the ticket's rows are all Auto-sized, so this row measures to
+            // content — a fixed 340 clipped the position/PnL bar when the AUTO row grew the ticket.
+            rightCol.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             Grid.SetRow(_cockpit, 0);     rightCol.Children.Add(_cockpit);
             // Channel branding (2026-07-03): logo + wordmark in the cockpit's slack space, as a
             // bottom-aligned OVERLAY in the same star row — it never adds height or moves a control.
@@ -1040,7 +1042,8 @@ namespace TradingRadar.NT
                             (string)autoEl.Attribute("hoursEnd"),
                             (string)autoEl.Attribute("hoursFlat"),
                             (string)autoEl.Attribute("fireDay"),
-                            (int?)autoEl.Attribute("fireCount") ?? 0);
+                            (int?)autoEl.Attribute("fireCount") ?? 0,
+                            (int?)autoEl.Attribute("cap") ?? 0);
                     }
                     catch (Exception ex)
                     {
@@ -1070,7 +1073,8 @@ namespace TradingRadar.NT
                     new XAttribute("hoursEnd", _chartTrader.HoursEndText),
                     new XAttribute("hoursFlat", _chartTrader.HoursFlatText),
                     new XAttribute("fireDay", _chartTrader.AutoFireDayText),
-                    new XAttribute("fireCount", _chartTrader.AutoFireCount)));
+                    new XAttribute("fireCount", _chartTrader.AutoFireCount),
+                    new XAttribute("cap", _chartTrader.AutoCap)));
         }
     }
 }
