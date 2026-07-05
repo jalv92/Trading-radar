@@ -7,6 +7,15 @@ namespace TradingRadar.Engine
     public enum NodeState { Live, Wall, Absorbed, Pulled, Consumed, Remembered }
     public enum Outcome { Absorbed, Pulled, Consumed }
 
+    // React setup contract (spec §2/§13; defined once here per plan §0-R1 — never redefine in another
+    // file, that is a CS0101 duplicate-type bug). Break = 0 so every existing Break fire — built by
+    // object-initializer WITHOUT setting Kind — self-tags Break with zero logic change.
+    public enum SetupKind { Break, Reactive }
+
+    // Which reactive branch resolved: Reject = wall held/absorbed -> fade, Break = wall consumed ->
+    // follow. None is value 0, the value every Break-setup fire carries.
+    public enum ReactKind { None, Reject, Break }
+
     // One depth-stream operation, mapped from NT's MarketDepthEventArgs by the NT layer.
     public struct DepthEvent
     {

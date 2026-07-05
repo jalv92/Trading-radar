@@ -8,6 +8,10 @@ namespace TradingRadar.Engine
     {
         public Side Side; public double WallPrice; public double EntryHint;
         public double Fraction; public long DeltaAtFire; public double ZAtFire; public DateTime Time;
+        // Additive discriminators (spec §2/§13, plan §0-R2). default(FireEvent) and the StepCountdown
+        // object-initializer (which sets neither) leave these at Kind=Break(0)/React=None(0) — Break
+        // logic is untouched.
+        public SetupKind Kind; public ReactKind React;
     }
 
     public struct ControllerInputs
@@ -21,6 +25,21 @@ namespace TradingRadar.Engine
         // RAISE the bar above the compiled floor, and being a percentile of observed sizes it is
         // bounded above by the max observed depth, so "never arm" is structurally unreachable.
         public long AdaptiveSignificance;
+        // Spec §5/§7 (Reactive setup, plan §0-R3/R4). Additive: the frozen Break ControllerStateMachine
+        // .Update never reads these, and every existing ControllerInputs object-initializer omits them,
+        // so Break behaviour is byte-for-byte unchanged.
+        //
+        // Signed tape acceleration = d(netRate)/dt (§5): +ve = buyers accelerating (arms a wall above),
+        // -ve = sellers accelerating (arms a wall below). Fed by TapeAcceleration.cs via the NT layer.
+        public double TapeAccel;
+        // Per-side live episode outcome (§7) reusing Outcome from Primitives.cs, PER SIDE with its own
+        // valid flag (plan §0-R3: a single "dominant" outcome is ambiguous when walls sit on both
+        // sides — ReactiveController latches ONE side and must read THAT side's resolution).
+        // WARNING (clusters C/D): default(Outcome) == Outcome.Absorbed, so each outcome is meaningless
+        // until its Valid flag is true — gate every read on it, or a warmup frame reads a phantom
+        // Absorbed and false-fires a fade (a real trade).
+        public Outcome WallAboveOutcome; public bool WallAboveOutcomeValid;
+        public Outcome WallBelowOutcome; public bool WallBelowOutcomeValid;
     }
 
     public struct ControllerOutput
