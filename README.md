@@ -164,23 +164,32 @@ MarketData.Update  ┤
 - A **Level-2 depth feed** — Continuum/CQG, Rithmic, or Tradovate. (Most retail *end-of-day* feeds do not carry L2.)
 - For validation: **Market Replay** data downloaded *with depth* (Tools → Historical Data → Market Replay, "Get Data" with the depth option).
 
-**Steps**
+### Option A — Import the packaged Add-On (easiest)
 
-1. **Copy the sources** into NinjaTrader's Custom folder — the engine compiles *as source* into NinjaTrader's `Custom` assembly (it is not referenced as an external DLL):
-   ```
-   Engine\*.cs   ┐
+Download **[`dist/LiquidityRadar.zip`](dist/LiquidityRadar.zip)** — the whole add-on as a source-only NinjaScript archive (~115 KB, no compiled DLL) — then, in NinjaTrader:
+
+<p align="center">
+  <img src="docs/images/import-ninjascript-addon.png" alt="NinjaTrader 8 Control Center with the Tools menu open, Import highlighted, and 'NinjaScript Add-On...' highlighted in the submenu" width="720">
+</p>
+
+1. **Control Center → Tools → Import → NinjaScript Add-On…**
+2. Select the downloaded `LiquidityRadar.zip` and click **Open** — NinjaTrader extracts the sources into your `Custom` folder and compiles them.
+3. **Restart NinjaTrader** (the Control-Center menu entry registers on startup).
+4. **Open it:** **Control Center → New → "Liquidity Radar"**, pick an instrument (e.g. ES or NQ front month), and connect a feed with depth (or a Market Replay connection).
+
+> Because the archive is **source, not a compiled DLL**, NinjaTrader recompiles it on your machine — the most compatible option across NT8 builds. If your NinjaTrader ever refuses a third-party archive, use Option B (it installs the exact same files).
+
+### Option B — From source (contributors / manual)
+
+Copy the `.cs` files into NinjaTrader's Custom folder — the engine compiles *as source* into NinjaTrader's `Custom` assembly (it is not referenced as an external DLL):
+
+```
+Engine\*.cs      ┐
                  ├──►  %USERPROFILE%\Documents\NinjaTrader 8\bin\Custom\AddOns\LiquidityRadar\
-   NinjaTrader\*.cs ┘
-   ```
-   (Copy the `.cs` files themselves into `AddOns\LiquidityRadar\`; the `NinjaTrader\strategy\` sub-folder is a separate optional strategy — leave it out unless you want it.)
+NinjaTrader\*.cs ┘
+```
 
-2. **Compile:** open NinjaTrader → **NinjaScript Editor → Compile (F5)**. It should build with no errors.
-
-3. **Restart NinjaTrader** — the Control-Center menu entry is registered on startup, so it only appears after the first restart following a successful compile.
-
-4. **Open it:** **Control Center → New → "Liquidity Radar"**. The floating window opens.
-
-5. **Pick an instrument** (e.g. ES or NQ front month) in the selector, and connect a data feed with depth (or a Market Replay connection).
+(Copy the `.cs` files themselves into `AddOns\LiquidityRadar\`; the `NinjaTrader\strategy\` sub-folder is a separate optional strategy — leave it out unless you want it.) Then open **NinjaScript Editor → Compile (F5)** (it should build with no errors), **restart NinjaTrader**, and open it as in Option A steps 3–4.
 
 > **Reopen after recompiling.** NinjaTrader does not refresh an *already-open* add-on window when you recompile — close and reopen the Liquidity Radar window after any F5.
 
