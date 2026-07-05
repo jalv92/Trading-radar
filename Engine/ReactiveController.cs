@@ -77,7 +77,10 @@ namespace TradingRadar.Engine
 
             ControllerOutput o = default(ControllerOutput);
             o.Fired = fired;
-            o.Fire = fired ? fire : _lastFire;
+            // Match Break's guard: only report Fire while latched Fired (the fire tick itself already
+            // transitioned _state to Fired above) — Waiting/Watching/Cooldown must not leak a stale
+            // previous-cycle FireEvent.
+            o.Fire = _state == ReactState.Fired ? _lastFire : default(FireEvent);
             return o;
         }
 
@@ -133,20 +136,25 @@ namespace TradingRadar.Engine
                         EnterFired(inp.Now);
                         return true;
                     }
-                    // Consumed but not trade-backed (cancellation, not real follow): do not follow —
-                    // keep watching until the wait-and-see timeout.
-                    return false;
+                    // Consumed but not trade-backed (cancellation, not real follow): do not follow.
+                    // Fix pass: fall through to the ABANDON checks below instead of returning here — a
+                    // real upstream case (sweep prints a tick off the wall, or aged out of the trade
+                    // ring) can hold "valid Consumed, never trade-backed" for many frames; returning
+                    // unconditionally made MaxWatchSeconds unreachable and stuck Watching forever.
                 }
-                if (outcome == Outcome.Absorbed)
+                else if (outcome == Outcome.Absorbed)
                 {
                     // REJECT / fade: wall held/refilled, quote did not cross.
                     fire = MakeFire(FadeSide(_wallSide), ReactKind.Reject, 0.0, inp);
                     EnterFired(inp.Now);
                     return true;
                 }
-                // Outcome.Pulled (spoof: cancelled, no cross) -> abstain, no trade (spec §3/§6).
-                EnterCooldown(inp.Now);
-                return false;
+                else
+                {
+                    // Outcome.Pulled (spoof: cancelled, no cross) -> abstain, no trade (spec §3/§6).
+                    EnterCooldown(inp.Now);
+                    return false;
+                }
             }
 
             // ABANDON — no resolution this tick (spec §6, any of):

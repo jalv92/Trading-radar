@@ -194,6 +194,33 @@ public class ReactiveControllerTests
         Assert.Equal(ReactState.Watching, m.State);   // not fired, not abandoned
     }
 
+    // Fix-pass regression: a valid Consumed outcome that never clears MinTradeBackedRatio (real case:
+    // sweep prints land a tick off the wall, or age out of the trade ring) must NOT stick in Watching
+    // forever — the non-firing Consumed branch has to fall through to the abandon checks or
+    // MaxWatchSeconds never runs. Held across many frames past the timeout -> abandons to Cooldown,
+    // never fires.
+    [Fact]
+    public void Consumed_without_trade_backing_still_times_out_and_does_not_stick()
+    {
+        var m = Machine();
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 1, accel: 2.0)); // arm, peak 120, watchStart T(1)
+        Assert.Equal(ReactState.Watching, m.State);
+
+        ControllerOutput o = default(ControllerOutput);
+        for (int s = 2; s <= 15; s++)
+        {
+            o = m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 40, delta: 50, mid: 100.00, sec: s, accel: 2.0,
+                            aboveOut: Outcome.Consumed, aboveValid: true, book: EmptyBook())); // Fraction 0.667 passes, TradeBackedFraction 0 fails
+            Assert.False(o.Fired);
+            Assert.Equal(ReactState.Watching, m.State);   // must NOT stick — still ticking toward the timeout, not stuck forever
+        }
+
+        o = m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 40, delta: 50, mid: 100.00, sec: 16, accel: 2.0,
+                        aboveOut: Outcome.Consumed, aboveValid: true, book: EmptyBook())); // elapsed 15s >= MaxWatchSeconds(15) -> abandon
+        Assert.False(o.Fired);
+        Assert.Equal(ReactState.Cooldown, m.State);
+    }
+
     // ---- ABANDON (timeout / vanish / hop / away-drift / pulled) ----
 
     // Wait-and-see timeout: no resolution within MaxWatchSeconds -> Cooldown, then re-arms after it elapses.
