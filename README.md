@@ -1,9 +1,9 @@
 # Liquidity Radar
 
 <p align="center">
-  <img src="docs/images/liquidity-radar-ui.gif" alt="The full Liquidity Radar window live on ES Market Replay: the anchored ladder updating, the Controller cycling WAITING to ARMED, the animated neon-smoke branding card, and the Chart Trader ticket with the AUTO toggle and the HOURS schedule row" width="720">
+  <img src="docs/images/liquidity-radar-ui.gif" alt="The Liquidity Radar window live on ES Market Replay: the anchored ladder updating, the Controller cycling WAITING to ARMED, the tape-speed and z-score gauges reacting, the neon-smoke branding card, and the Chart Trader ticket with the Strategy selector, the Money Management daily-limit row, AUTO, and the HOURS schedule" width="560">
 </p>
-<p align="center"><em>The full surface, live on ES (Market Replay): the anchored ladder, the Controller cycling <strong>WAITING → ARMED</strong>, and the Chart Trader ticket with <strong>AUTO</strong> armed and the <strong>HOURS</strong> schedule row (09:30–15:55, flat 16:00).</em></p>
+<p align="center"><em>The Liquidity Radar window, live on ES (Market Replay): the anchored ladder, the Controller cycling <strong>WAITING → ARMED</strong>, the tape gauges reacting — and the Chart Trader ticket with the <strong>Strategy</strong> selector, the <strong>Money Management</strong> daily loss/profit limits, <strong>AUTO</strong>, and the <strong>HOURS</strong> schedule row (09:30–15:55, flat 16:00).</em></p>
 
 A standalone **NinjaTrader 8** add-on that reads Level-2 market depth and renders a vertical **"sonar ladder"** of resting liquidity, a **Consumption-Break Controller cockpit** — a stateful setup detector built on wall consumption and tape speed — and an integrated **order-entry ticket** with an optional **AUTO fire mode** — all in one floating window, independent of any chart.
 
@@ -11,16 +11,23 @@ Unlike a plain DOM or heatmap, it **tracks each large order wall as an object wi
 
 Visual identity: **"Aurora"** — deep-ink background, emerald (bid/support) / coral (ask/resistance), amber inside-market line. Explicitly *not* a Bookmap clone.
 
+<p align="center">
+  <img src="docs/images/liquidity-radar-overview.png" alt="The Liquidity Radar docked beside a NinjaTrader chart on ES Market Replay: the Control Center shows a booked +$3,086.92 session, the chart runs Playback at 50x, and the radar (WAITING, tape speed -20/+66, z 1.4) sits to the right with its full Cockpit and Chart Trader ticket" width="960">
+</p>
+<p align="center"><em>The radar in context — a floating window beside a NinjaTrader chart on ES Market Replay (Control Center showing a booked <strong>+$3,086.92</strong> session). It reads the same L2 feed as the chart but needs no chart of its own.</em></p>
+
 ---
 
 ## Status
 
 | Layer | State |
 |-------|-------|
-| **Engine** (`Engine/`) | ✅ Complete. Pure C#, deterministic, NinjaTrader-free. **111/111 unit tests, 0 warnings.** |
-| **NT8 add-on** (`NinjaTrader/`) | ✅ **Built, deployed, and running in Market Replay** (screenshots above). Ladder + Controller cockpit + Chart Trader all live. |
+| **Engine** (`Engine/`) | ✅ Complete. Pure C#, deterministic, NinjaTrader-free. **148/148 unit tests, 0 warnings.** |
+| **NT8 add-on** (`NinjaTrader/`) | ✅ **Built, deployed, and running in Market Replay** (screenshots below). Ladder + Controller cockpit + Chart Trader all live. |
+| **Setups (Strategy selector)** | ✅ Two selectable setups on the ticket. **Break** = Consumption-Break (below). **React** = a reactive wall setup: the tape accelerates into a dominant wall and it either **rejects** (fade) or **breaks** (follow), fired auto-aggressively. Both are Sim/Playback-gated; **React is experimental / uncalibrated** (its follow branch grades promising on one graded day, its fade branch rarely arms — treat as a read). |
 | **Consumption-Break Controller** | ✅ Live (state machine + fire latch + pre-stage). ⚠️ **Thresholds are placeholder / being calibrated** from `Rec` captures on real ES days — eight review/calibration rounds so far (`docs/calibration-consumption-break-es-day1.md`). Treat fires as a *read*, not a tuned signal, until calibrated. |
-| **AUTO mode** | ✅ Live, **Sim/Playback only**, hard-gated (ATM required, configurable daily trade cap (default 10, persisted), 15 s auto-cancel, persistent decision log) + **HOURS schedule**: fires only 09:30–15:55, forced flatten at 16:00 (editable in the UI). **Always-armed** (2026-07-03): arming intent + account/ATM/cap/hours persist in the workspace and re-arm automatically when every precondition re-verifies — the daily-cap counter persists too, and a manual Flat clears the intent. **Exit-leg telemetry**: the ATM bracket (SL/TP) is logged at attach, and every closing fill emits `exit` + `trade_summary` rows, so each AUTO trade is gradeable by realized R. |
+| **AUTO mode** | ✅ Live, **Sim/Playback only**, hard-gated (ATM required, configurable daily trade cap (default 10, persisted), **5-min auto-limit lifetime** that re-anchors onto a fresh fire, persistent decision log) + **HOURS schedule**: fires only 09:30–15:55, forced flatten at 16:00 (editable in the UI). **Always-armed**: arming intent + account/ATM/cap/hours persist in the workspace and re-arm automatically when every precondition re-verifies — the daily-cap counter persists too, and a manual Flat clears the intent. **Exit-leg telemetry**: the ATM bracket (SL/TP) is logged at attach, and every closing fill emits `exit` + `trade_summary` rows, so each AUTO trade is gradeable by realized R. |
+| **Money Management (daily P&L kill-switch)** | ✅ Live, Sim/Playback. A master checkbox on the ticket enforces a **daily loss** and **daily profit** limit in USD (defaults **$2,000 / $3,100**), read off the day's net P&L (account realized since day-start + open unrealized — the figure NinjaTrader shows). When either is crossed it **disarms AUTO and flattens** (orphan-free, ATM legs and naked positions alike) and locks out for the rest of the replay day. Independent of the trade cap — **whichever limit trips first stops.** |
 | **Phase 0 calibration plumbing** | ✅ Shipped per the [ML-calibration ADR](docs/decisions/2026-07-03-ml-calibration-strategy.md): realized-fill telemetry, adaptive `SignificanceBand = max(p85 of live depth, 60)` (spec §5), per-session summary + fires=0 alarm (`lr-sessions.csv`), and a CI test that keeps the AUTO hard gates out of any calibrator's reach. **10-distinct-day capture campaign in progress.** A [multi-day analysis of the corpus so far](docs/2026-07-03-multiday-analysis-adaptation-verdict.md) (8 days, 60 fills) concluded threshold adaptation is **premature** — instrument first, adapt later; the [offline realized-R read](docs/measurement-realized-r-offline.md) grades the existing fires near breakeven net of costs (NO-GO for promotion; primary-build cut PF 1.31 net @1.5t, n=44, knife-edge). |
 | **Chart Trader → real money** | 🔒 **Sim / Playback only.** Order entry is hard-gated to Simulator/Playback accounts. A real account is blocked unless explicitly armed *and* it has not yet cleared its risk preconditions — **do not trade real money with it yet.** See [Safety](#safety--disclaimer). |
 
@@ -32,53 +39,72 @@ Validation is by unit tests (engine) + `nt8c` compile checks + **Market Replay**
 
 ### 1 · Sonar ladder (left)
 
-A price-anchored vertical ladder — the price axis is fixed and a sliding amber marker tracks the inside market (the boxed `7458.13` in the overview), so bars don't jump every frame the way a mid-centered view does; the column re-anchors only at the edge (DOM-standard behavior).
+A price-anchored vertical ladder — the price axis is fixed and a sliding amber marker tracks the inside market (the boxed `7546.38` in the overview above), so bars don't jump every frame the way a mid-centered view does; the column re-anchors only at the edge (DOM-standard behavior).
 
 - **Bar length + glow = resting size**; the number on each row is the contract count.
 - **Color = side/state:** coral for ask/resistance (above the market), emerald for bid/support (below). Desaturated maroon = a level that was **pulled** or has gone stale.
-- **`WALL` badge** marks a level that passed all four wall criteria (relative size vs. the median baseline, an absolute floor, persistence, and a flicker guard). In the overview it's the 22-lot ask sitting at 7459.50.
+- **`WALL` badge** marks a level that passed all four wall criteria (relative size vs. the median baseline, an absolute floor, persistence, and a flicker guard) — the dominant qualifying wall is the one the Controller arms on (e.g. the 108-lot bid at 7549.50 in the ARMED shot below).
 - **Order marker:** a dashed line + gutter tag (`◀ SELL 1`) drawn at your live resting limit order's price — side and quantity — so you can see your order *on the liquidity map*. It moves with the order and disappears when it fills or cancels.
-- **Ghost memory band:** walls that scroll beyond the live 10 levels are drawn dimmed with an age tag (`↓ 7451.75  41  ·33s` at the bottom of the cockpit screenshot below = a remembered 41-lot wall, last seen 33 s ago), so the price axis is never blank where the book can't reach.
+- **Ghost memory band:** walls that scroll beyond the live 10 levels are drawn dimmed with an age tag (`↓ 7542.00  154  ·25s` at the bottom of the overview ladder = a remembered 154-lot wall, last seen 25 s ago), so the price axis is never blank where the book can't reach.
 
 ### 2 · Consumption-Break Controller cockpit (top-right)
 
 A **stateful setup detector**, not an oscillating meter. The original five-signal weighted-average cockpit flip-flopped long↔short every tick, so it was demoted (spec `2026-07-01`): the primary output is now a **Controller state** that fires **once** on a confirmed change-of-control and latches until reset. The setup mechanized is **Consumption-Break**: a resting wall in price's path gets **eaten toward zero with trades**, and the radar fires right before it snaps through.
 
 <p align="center">
-  <img src="docs/images/liquidity-radar-armed-hours.png" alt="Consumption-Break Controller ARMED on a 44-lot wall ('muro intacto — esperando erosión') with the wall-consumption countdown at 0%, tape-speed and z-score gauges, ATM ES_2C selected, AUTO armed, and the HOURS schedule row" width="820">
+  <img src="docs/images/liquidity-radar-armed.png" alt="The Liquidity Radar Consumption-Break Controller ARMED ('wall intact — waiting for erosion') with the wall-consumption countdown at 0% eaten, the tape-speed / z-score / accel gauges, a 108-lot bid wall on the ladder, ATM ES_3C selected, Qty 3, Strategy Break, the Money Management row (Loss $2000 / Profit $3100), and the HOURS schedule" width="560">
 </p>
-<p align="center"><em>The Controller <strong>ARMED</strong> ("muro intacto — esperando erosión"), waiting for trade-backed consumption. Below: ATM template <code>ES_2C</code>, <strong>AUTO armed</strong>, and the <strong>HOURS</strong> row (fire window 09:30–15:55 · forced flat 16:00).</em></p>
+<p align="center"><em>The Controller <strong>ARMED</strong> ("wall intact — waiting for erosion"), waiting for trade-backed consumption. Below the cockpit: <strong>Strategy</strong> = <code>Break</code>, ATM template <code>ES_3C</code>, the <strong>Money Management</strong> daily-limit row (Loss $2,000 / Profit $3,100), and the <strong>HOURS</strong> row (fire window 09:30–15:55 · forced flat 16:00).</em></p>
 
-- **`CONTROLLER` state banner** — the state machine: `WAITING → ARMED → COUNTDOWN → FIRE → RESET`, with a global **CHOP** overlay that suppresses all fires. One candidate per side (dominant wall above = short-break candidate, below = long-break); a wall cannot un-consume, so the countdown is structurally incapable of flip-flopping. The banner explains itself in plain language ("sin muro dominante armado", "muro intacto — esperando erosión").
-- **`CONSUMO DEL MURO`** — the consumption countdown: how much of the armed wall's peak size has been eaten (`0% comido` → fire threshold), counting only the **trade-backed** fraction of the drop (cancels/pulls don't advance it; a reload resets it).
-- **`VELOCIDAD DEL TAPE`** — signed tape velocity (sell/s vs. buy/s bars), from a rolling prints-per-second window.
+- **`CONTROLLER` state banner** — the state machine: `WAITING → ARMED → COUNTDOWN → FIRE → RESET`, with a global **CHOP** overlay that suppresses all fires. One candidate per side (dominant wall above = short-break candidate, below = long-break); a wall cannot un-consume, so the countdown is structurally incapable of flip-flopping. The banner explains itself in plain language ("no dominant wall armed", "wall intact — waiting for erosion").
+- **`WALL CONSUMPTION`** — the consumption countdown: how much of the armed wall's peak size has been eaten (`0% eaten` → fire threshold), counting only the **trade-backed** fraction of the drop (cancels/pulls don't advance it; a reload resets it).
+- **`TAPE SPEED`** — signed tape velocity (sell/s vs. buy/s bars), from a rolling prints-per-second window.
 - **`TAPE Z-SCORE`** — how unusual current tape speed is vs. its EWMA baseline; the fire gate requires acceleration, not just erosion.
-- **`CHOP` light** — display + global fire suppressor when the tape is alternating noise:
-
-<p align="center">
-  <img src="docs/images/liquidity-radar-cockpit-chop.png" alt="The Controller in CHOP state — 'tape lento y alternando' — with the CHOP light on, tape z-score at -2.4, and all fires suppressed" width="820">
-</p>
-<p align="center"><em><strong>CHOP</strong> as a first-class state: slow, alternating tape (z −2.4) — the banner explains it and every fire is suppressed until the tape picks a side.</em></p>
-
-- **`SESGO DE LIBRO · contexto, no dispara`** — the old book-skew signals (imbalance / thin-inside / air-pocket) collapsed into one **vote-less context strip**. It informs, it never triggers.
+- **`TAPE ACCEL`** — signed tape *acceleration* (the rate of change of tape speed). It is what the **React** setup arms on — a burst of aggression driving into a wall — and a context gauge for Break.
+- **`CHOP` light** — a first-class state, not just a readout: when the tape is slow and alternating (noise), CHOP lights up and **suppresses every fire** until the tape picks a side.
+- **`BOOK SKEW · context only, never fires`** — the old book-skew signals (imbalance / thin-inside / air-pocket) collapsed into one **vote-less context strip**. It informs, it never triggers.
 
 ### 3 · Chart Trader ticket (bottom-right)
 
 An order-entry surface docked under the cockpit — the radar becomes a place to *act*, not just watch. **Sim/Playback-gated** (see Safety).
 
 <p align="center">
-  <img src="docs/images/liquidity-radar-auto-fire.gif" alt="A full AUTO trade on ES Market Replay: the Consumption-Break Controller goes WAITING → COUNTDOWN (83% of the wall consumed by trades) → FIRE; AUTO submits the pre-staged limit, fills LONG 1 @ 7608.00 with the ATM bracket attached, and the ATM target closes the trade at +281.25 $ (+22.5 ticks)" width="720">
+  <img src="docs/images/liquidity-radar-position-taken.gif" alt="An AUTO entry on ES Market Replay with the radar docked beside the chart: AUTO submits the pre-staged limit and it fills LONG 3 @ 7514.58 with the ES_3C ATM bracket attached — the ticket readout flips from FLAT to LONG 3 and the staggered ATM target lines appear on the chart" width="720">
 </p>
-<p align="center"><em>A full AUTO trade: the Controller counts down a wall being <strong>eaten by trades</strong>, fires, <strong>AUTO</strong> submits the pre-staged limit — <code>LONG 1 @ 7608.00</code> with the ATM bracket attached — and the target closes it at <strong>+281.25 $ (+22.5 t)</strong>.</em></p>
+<p align="center"><em>An <strong>AUTO</strong> entry, radar beside the chart: the Controller arms, <strong>AUTO</strong> submits the pre-staged limit, and it fills <code>LONG 3 @ 7514.58</code> with the <code>ES_3C</code> ATM bracket attached — the ticket flips <strong>FLAT → LONG 3</strong> and the staggered ATM targets appear on the chart.</em></p>
 
 - **BUY / SELL MKT** — market orders.
 - **BUY / SELL LMT** — **wall-anchored** limits: a SELL LMT rests one tick in front of the largest wall above the market, a BUY LMT one tick in front of the largest wall below (anchored once on submit; falls back to a mid ± 1-tick proxy if there's no wall). The `▲ / ▼` buttons nudge a working limit one tick at a time via order modification (queue priority preserved, no cancel-and-resubmit).
 - **Rev / Close / Flat** — reverse, close, or flatten the position (Flat = native cancel-all + close).
-- **Account selector** (`Playback101`), **Qty** stepper, and an **ATM selector** (`ES_2C`) — pick an ATM template and MKT/LMT entries attach its bracket (SL/TP). **When an ATM is selected, its template governs the position size** (the sum of its bracket quantities — an `ES_2C` enters 2 contracts), exactly as NinjaTrader's own Chart Trader does; the **Qty** stepper then locks to that count and is used only to size a flat, no-ATM entry. Leave the selector on *None* for a flat entry sized by the Qty box.
+- **Account selector** (`Playback101`), **Qty** stepper, and an **ATM selector** (`ES_3C`) — pick an ATM template and MKT/LMT entries attach its bracket (SL/TP). **When an ATM is selected, its template governs the position size** (the sum of its bracket quantities — an `ES_3C` enters 3 contracts), exactly as NinjaTrader's own Chart Trader does; the **Qty** stepper then locks to that count and is used only to size a flat, no-ATM entry. Leave the selector on *None* for a flat entry sized by the Qty box. **The exact `ES_3C` bracket is documented [below](#the-atm-template-es_3c).**
+- **Strategy selector** — picks which setup drives the fire and the pre-stage: **`Break`** (Consumption-Break, the calibrating one) or **`React`** (the reactive wall setup — tape accelerates into a dominant wall and it rejects or breaks). Switching swaps the active engine live under the engine lock; the frozen Break stays untouched while React runs.
 - **Pre-stage on fire** — when the Controller fires, the ticket pre-stages a **break-direction limit** and lights up **"SETUP LONG/SHORT ready"**; you click BUY/SELL LMT to submit it (click the indicator to discard). The human clicks — unless AUTO is armed:
-- **`AUTO` toggle** (below the HOURS row; the **Cap/day** box beside the ATM selector sets the daily trade cap, default 10) — auto-submits the pre-staged break limit **through the same submit path a manual click uses**. Arming is hard-gated: **Sim/Playback account + an ATM template selected**, and it force-disarms (with the reason shown next to the checkbox) on instrument change, account change, ATM back to *None*, or the **daily trade cap**. Your arming intent, account, ATM template, qty, cap, and HOURS settings **persist in the workspace**, and AUTO **re-arms automatically** once every precondition re-verifies after a restore or a for-cause disarm — fail-closed: the daily-cap counter persists across a same-day reopen, the 16:00 flatten stays disarmed for the rest of that day, and a manual **Flat** clears the intent entirely (only a human re-check of the box brings it back). An unfilled auto limit **auto-cancels after 15 s**, and every AUTO decision is appended to a persistent CSV log (`…\Documents\NinjaTrader 8\LiquidityRadar\`) for audit — including, per trade, the **ATM bracket at attach** (`sl/tp` ticks) and **`exit` / `trade_summary` rows** (exit reason, realized ticks, duration) so every AUTO trade is gradeable by realized R.
-- **`HOURS` schedule** (under the AUTO row, on by default) — AUTO fires only between **09:30–15:55** (replay/exchange clock), and at **16:00** any open position or working order is **force-flattened** through the same native cancel-all + close path as the Flat button (which also disarms AUTO). All three times are editable in the row; the flatten runs once per replay day and applies even if AUTO was already disarmed (e.g. by the daily cap).
+- **`AUTO` toggle** (the bottom toggle, below the Money Management row; the **Cap/day** box beside the ATM selector sets the daily trade cap, default 10) — auto-submits the pre-staged break limit **through the same submit path a manual click uses**. Arming is hard-gated: **Sim/Playback account + an ATM template selected**, and it force-disarms (with the reason shown next to the checkbox) on instrument change, account change, ATM back to *None*, or the **daily trade cap**. Your arming intent, account, ATM template, qty, cap, and HOURS settings **persist in the workspace**, and AUTO **re-arms automatically** once every precondition re-verifies after a restore or a for-cause disarm — fail-closed: the daily-cap counter persists across a same-day reopen, the 16:00 flatten stays disarmed for the rest of that day, and a manual **Flat** clears the intent entirely (only a human re-check of the box brings it back). An unfilled auto limit **ages out after 5 minutes** of replay/market time (re-anchoring onto a newer fire within that window rather than stacking), and every AUTO decision is appended to a persistent CSV log (`…\Documents\NinjaTrader 8\LiquidityRadar\`) for audit — including, per trade, the **ATM bracket at attach** (`sl/tp` ticks) and **`exit` / `trade_summary` rows** (exit reason, realized ticks, duration) so every AUTO trade is gradeable by realized R.
+- **`HOURS` schedule** (on by default) — AUTO fires only between **09:30–15:55** (replay/exchange clock), and at **16:00** any open position or working order is **force-flattened** through the same native cancel-all + close path as the Flat button (which also disarms AUTO). All three times are editable in the row; the flatten runs once per replay day and applies even if AUTO was already disarmed (e.g. by the daily cap).
+- **`Money Management` daily kill-switch** (the row under HOURS, on by default) — a master checkbox plus a **daily `Loss $`** and **daily `Profit $`** limit (defaults **2,000 / 3,100**). It watches the day's **net P&L** — account realized since the day's open plus the open position's unrealized, the same figure NinjaTrader shows — and the instant either limit is crossed it **disarms AUTO and flattens the account** through the same orphan-free native path as Flat (cancelling the ATM stop/target legs and closing the position, whether the trade is ATM-bracketed or naked), then locks out for the rest of the replay day. It runs **independently of the daily trade cap — whichever limit trips first stops trading.** Blank a box to disable that side; the lockout and the day's P&L baseline reset on a new replay day or a Playback rewind. *(Sim/Playback-scoped like everything else here; hardening for a real prop-firm rule — session-boundary day, net-of-commission, account-wide scope — is a pre-real-money item.)*
 - **Position + PnL bar** — live unrealized P&L in dollars and ticks (`FLAT` when flat).
+
+---
+
+## The ATM template (ES_3C)
+
+The entries in the screenshots and GIFs attach **`ES_3C`**, a **NinjaTrader ATM strategy** — configured in NT8's own ATM Strategy dialog, *not* in this add-on. The radar simply attaches whatever template you pick and sizes the position from its total quantity, so you can use any ATM you like; `ES_3C` is documented here in case it's a useful starting point. It's a **3-lot scale-out runner**.
+
+<p align="center">
+  <img src="docs/images/atm-es3c-parameters.png" alt="The ES_3C ATM Strategy Parameters dialog: order quantity 3, TIF GTC, parameters in ticks; three targets of 1 contract each with a 24-tick stop loss and profit targets of 48, 72, and 144 ticks, all using the BK_ES stop strategy" width="720">
+</p>
+<p align="center"><em><code>ES_3C</code> — 3 contracts, each a 1-lot bracket with a <strong>24-tick stop</strong> and staggered targets at <strong>48 / 72 / 144 ticks</strong>, all on the <code>BK_ES</code> stop strategy.</em></p>
+
+- **3 contracts, one entry, three exits.** All three lots go on together; the first takes profit at **+48 t** (2R on the 24-tick stop), the second at **+72 t** (3R), the third runs to **+144 t** (6R) — a "bank some, hold a runner" shape.
+- **24-tick initial stop on every lot.** The full position risks 3 × 24 t until the breakeven trigger fires.
+- **`BK_ES` stop strategy = auto-breakeven.** Once a lot is **+24 t** in profit its stop jumps to **entry + 1 tick**; from there the runner is effectively risk-free. Auto-trail is off and the simulated stop is disabled.
+
+<p align="center">
+  <img src="docs/images/atm-es3c-bk-stop.png" alt="The BK_ES stop strategy parameters: Auto Breakeven with a 24-tick profit trigger and plus 1 tick, Auto Trail set to None, and the simulated stop disabled" width="560">
+</p>
+<p align="center"><em><code>BK_ES</code> — auto-breakeven at <strong>+24 t → entry + 1</strong>, no auto-trail.</em></p>
+
+> This template lives in NinjaTrader, not in the repo. To reproduce it: **Chart Trader / SuperDOM → ATM Strategy → new template**, set the three targets and the `BK_ES` breakeven stop as above, save it as `ES_3C`, then pick it in the radar's ATM selector. Because the radar sizes off the template's total quantity, selecting `ES_3C` makes every entry a 3-lot.
 
 ---
 
@@ -181,7 +207,7 @@ Defaults ship tuned for NQ; ES presets and per-instrument calibration are in pro
 Requires the .NET SDK (8 or 10). The engine builds and tests **without NinjaTrader**:
 
 ```bash
-dotnet test          # 111/111 passing, 0 warnings
+dotnet test          # 148/148 passing, 0 warnings
 dotnet build         # netstandard2.0 engine + net8.0 test project
 ```
 
@@ -202,6 +228,7 @@ nt8c build --custom-dir build/.stage/Custom      # expect 0 errors
 - [`docs/specs/2026-06-28-liquidity-radar-engine-contract.md`](docs/specs/2026-06-28-liquidity-radar-engine-contract.md) — frozen engine interface contract.
 - [`docs/specs/2026-06-29-radar-cockpit-design.md`](docs/specs/2026-06-29-radar-cockpit-design.md) — the (superseded) directional-pressure cockpit + Chart Trader design.
 - [`docs/specs/2026-07-01-consumption-break-setup-design.md`](docs/specs/2026-07-01-consumption-break-setup-design.md) — the Consumption-Break setup + Controller spine (supersedes the cockpit's per-tick verdict).
+- [`docs/specs/2026-07-04-reactive-wall-setup-design.md`](docs/specs/2026-07-04-reactive-wall-setup-design.md) — the **React** setup: the reactive wall reject/break state machine selectable alongside Break.
 - [`docs/plans/`](docs/plans) — the six build plans (engine, NT UI, pressure engine, anchored ladder, cockpit render, Chart Trader).
 - [`docs/measurement-cockpit-signals.md`](docs/measurement-cockpit-signals.md) — how the cockpit weights are (to be) measured from captured data.
 - [`docs/calibration-es-day1.md`](docs/calibration-es-day1.md) / [`docs/calibration-consumption-break-es-day1.md`](docs/calibration-consumption-break-es-day1.md) — day-1 ES calibration reports (root causes, config tables, acceptance criteria for the next capture).
@@ -215,11 +242,13 @@ nt8c build --custom-dir build/.stage/Custom      # expect 0 errors
 
 ## Roadmap
 
-- [x] Engine — book mirror, wall detection, three-outcome classification, confidence/memory, aggressor delta + erosion — 111/111 unit tests.
+- [x] Engine — book mirror, wall detection, three-outcome classification, confidence/memory, aggressor delta + erosion — 148/148 unit tests.
 - [x] NT8 add-on — anchored ladder, cockpit render, Chart Trader (MKT + wall-anchored LMT + ATM), Market Replay reset handling.
 - [x] **Consumption-Break Controller** — tape speed + consumption countdown + state machine + latched fire, rendered in the cockpit.
 - [x] **Pre-stage + AUTO mode** — break-direction limit pre-staged on fire; optional hard-gated auto-submit (Sim/Playback) with daily cap, auto-cancel, and a persistent decision log.
 - [x] **Instrumentation for realized-R** (2026-07-03) — exit-leg telemetry (ATM bracket at attach, `exit`/`trade_summary` rows), always-armed AUTO persistence (recovers the "not armed at fire time" signal loss — 52% of all skips), and the offline bracket grader (`tools/measure/realized_r_bracket.py`).
+- [x] **React setup + Strategy selector** — a second, reactive wall setup (tape accelerates into a dominant wall → reject/fade or break/follow), selectable live on the ticket alongside the frozen Break; auto-aggressive, Sim/Playback-gated (experimental / uncalibrated).
+- [x] **Money Management daily kill-switch** — daily USD loss/profit limits (default $2,000 / $3,100) that disarm AUTO and flatten orphan-free the instant the day's net P&L crosses either, independent of the trade cap.
 - [ ] **Calibrate the Controller thresholds** from captured `Rec` data — now gated on realized-R episodes, per the [multi-day verdict](docs/2026-07-03-multiday-analysis-adaptation-verdict.md): finish the 10-distinct-day campaign with exit legs, then grade gates by outcome (no more hand-tuning rounds).
 - [ ] **Chart Trader → real money:** clear the risk preconditions (server-side stop, qty clamp, confirm-on-live, connection/quote-freshness gate, prop-firm rules) before removing the Sim/Playback gate.
 - [ ] Deferred (post-v1): time × price heatmap, alerts, cross-restart memory persistence, multi-instrument.
@@ -230,6 +259,7 @@ nt8c build --custom-dir build/.stage/Custom      # expect 0 errors
 
 - **The Chart Trader is Sim/Playback-only.** Order submission is fail-closed: an account is treated as *real* (and blocked) unless its provider is explicitly Simulator or Playback. A real account additionally requires a per-account **ARM LIVE** toggle — and even then, the documented risk preconditions are **not yet met**, so it must not be used to trade real money.
 - **AUTO mode never touches a real account.** It can only arm on a Sim/Playback account with an ATM selected, force-disarms whenever any precondition breaks, caps itself at a configurable number of fires/day (default 10; the counter survives a same-day reopen), auto-cancels unfilled limits, and logs every decision to a CSV for audit. Arming intent persists across sessions, but re-arming re-verifies every precondition fail-closed, and a manual Flat kills the intent until a human re-arms.
+- **The Money Management daily kill-switch is a Sim/Playback backstop, not a certified prop-firm rule.** It flattens orphan-free when the day's net P&L crosses the loss/profit limit, but its "day" is the feed's calendar day (not the session boundary), its P&L is gross of commissions, and its scope is the single traded instrument — hardening those is a pre-real-money item. Do not rely on it as a hard prop-firm daily-loss guarantee yet.
 - This is a market-microstructure **awareness** tool first. Depth feeds are probabilistic about *why* size changes — spoof/iceberg/erosion detection is **inference, not proof**.
 - The Controller's thresholds are **uncalibrated placeholders** today (being measured from `Rec` captures); the setup is a **momentum scalp that will take false breaks** — do not treat a fire as a validated signal until calibration lands.
 - **Not financial advice.** Trading futures involves substantial risk of loss. You are responsible for anything this tool submits on your behalf.
