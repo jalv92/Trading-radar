@@ -267,6 +267,56 @@ New real-money preconditions (risk-manager, 2026-07-04):
   Before real-money AUTO: for `isAuto`, the degrade must abort/cancel, never plain-submit, and never at the
   ATM total.
 
+### Break-limit lifetime + re-mount (2026-07-05) — bug fix + new real-account preconditions
+
+`AutoCancelSeconds` raised 15 → 300 (an unfilled auto-limit now lives ~5 min of replay/market time — at
+15s, a 4x–24x Playback speed cancelled break-setup limits before they could fill, in a fraction of a
+wall-clock second). Added re-mount: a genuinely new setup fire while our own unfilled auto-limit is still
+resting cancels it and resubmits at the new break level/side (cancel-first replace, reusing the existing
+opposite-side-flip sequencing) instead of being skipped by guard 2's busy check; the window restarts; it
+does not burn a `Cap/day` slot (only real submissions-that-can-fill toward a position count, as before). An
+actual open position still hits the busy guard unchanged. Reviewed: `trading-code-reviewer` (found one real
+Sim-reproducible bug, fixed below) + `trading-risk-manager` (**APPROVED for Sim/Playback**; four new
+real-account preconditions below). `dotnet test` 146/146, `nt8c` staged build 0 errors/0 warnings.
+
+**Bug fixed (code review) — partial-fill-during-cancel stacked a position + a fresh auto-limit.** NT8
+terminates a limit that partially fills and then cancels as `Cancelled` **with** `Filled > 0` — the two are
+not mutually exclusive. The `_pendingReplace` resolution in `OnOrderUpdate` opens `_openAutoTrade` whenever
+`ord.Filled > 0`, but was dropping the deferred replacement only on `state != Cancelled` — so a
+partial-then-cancel hit BOTH branches: the partial position opened (bracketed, correct) AND the
+replacement fired (the deferred `SubmitRaw` re-runs neither `ValidateForSubmit` nor guard 2, so nothing
+downstream caught it) → a stacked partial position plus a new resting auto-limit on top, exactly what
+guard 2 exists to prevent. Fixed by gating the resubmit on `state == OrderState.Cancelled &&
+!(p.IsAuto && ord.Filled > 0)`, scoped to `p.IsAuto` only (a manual opposite-side flip still replaces on
+any `Cancelled`, partial fill included — a human is watching that path). Net: a partial-then-cancel is now
+one honest bracketed partial position, no stacked limit; `_pendingReplace` is still cleared either way, and
+the now-open partial position is caught by the existing busy guard on the next fire.
+
+New real-account preconditions (risk-manager, 2026-07-05 — these gate the still-VETOed real-account port,
+not Sim/Playback):
+- **F27 (NEW, BLOCKER for real)** — bounded auto-limit lifetime + a max re-anchors (or max total
+  pending-intent lifetime) per intent. Nothing today stops a single break intent from re-mounting
+  indefinitely and chasing the level unattended for a whole session. `AutoCancelSeconds` must be both
+  calibrated (spec §9 Rec-CSV pass) AND capped before real — either a hard ceiling on re-mount count per
+  intent, or a hard ceiling on the intent's total pending lifetime across all its re-mounts.
+- **F18 — annotated.** The stale-fill window this pre-stage price can sit unfilled-but-latched against is
+  now 20× larger (15s → 300s), so the click-time/rest-time non-marketable re-clamp against REAL best
+  bid/ask that F18 calls for is significantly more load-bearing for AUTO than when F18 was first opened —
+  a 300s-stale reversal has much more room to make the latched price marketable than a 15s one did.
+- **F21 — annotated (sharp one).** `MaybeAutoCancel` ages the limit against `_now`, the REPLAY-aware clock
+  — which STOPS ADVANCING on a data disconnect. On real, a 300s timer that never fires because the feed
+  stalled leaves a live resting limit for the ENTIRE disconnect, unattended. Before real, `AutoCancelSeconds`
+  needs a wall-clock or `Connection.Status`-driven failsafe layered on top of the `_now` check, not `_now`
+  alone — F21's existing "gate the auto-fire on `Connection.Status == Connected`" fix must also cover the
+  cancel-timeout path, not just the fire path.
+- **F23/F9 — annotated.** Re-mount makes the in-memory `_autoFireCount` an even looser proxy for actual
+  filled-trade count than it already was (F23) — one "fire" can now spawn a chain of cancel+resubmit
+  re-anchors that never touch the account beyond resting/cancelling limits, while a prop `max-trades/day`
+  rule (F9) must count actual EXECUTIONS, not fire/submit attempts. The real fix for both — re-deriving the
+  count from the account's execution history rather than this in-memory counter — handles re-mount
+  correctly for free (a re-anchor that never fills contributes zero executions); a submit-attempt counter
+  does not.
+
 ### Sim test checklist for the ATM path (before trusting it)
 1. Open the tab, pick a Sim/Playback account + instrument → confirm the **ATM box shows nothing pre-selected** (blank), i.e. no auto-picked template.
 2. Select an ATM template, take a bracketed BUY/SELL MKT → let it fill → confirm the ATM's stop/target appear at the broker AND that the **ladder marker / ▲▼ do NOT latch onto the ATM's target** (F15 check — they should stay tied only to your own manual LMT, if any).

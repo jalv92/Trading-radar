@@ -1291,11 +1291,23 @@ namespace TradingRadar.NT
                     {
                         PendingReplace p = _pendingReplace;
                         _pendingReplace = null;
-                        if (state == OrderState.Cancelled)
+                        // Partial-fill-during-cancel race (code review, 2026-07-05): NT8 terminates a
+                        // partially-filled-then-cancelled order as Cancelled WITH Filled>0 — the two are not
+                        // mutually exclusive. For an AUTO re-mount that means the fill block above just opened
+                        // a real (bracketed) partial position; firing the replacement here would stack a fresh
+                        // resting limit on top of it — precisely what guard 2 exists to prevent, and this
+                        // deferred SubmitRaw re-runs neither ValidateForSubmit nor guard 2 to catch it. Scoped
+                        // to p.IsAuto only — a manual opposite-side flip still replaces on any Cancelled,
+                        // partial fill included, since a human is watching it.
+                        bool autoPartialFill = p.IsAuto && ord.Filled > 0;
+                        if (state == OrderState.Cancelled && !autoPartialFill)
                             // isAuto:true only for an AUTO re-mount — re-seeds _autoOrder/_autoSubmittedAt so the
                             // 5-min window restarts and MaybeAutoCancel/telemetry track the replacement. A manual
                             // opposite-side flip carries IsAuto=false, so its re-submit stays a plain entry.
                             SubmitRaw(p.Action, OrderType.Limit, p.Qty, p.Price, p.Tag, isEntry: true, isAuto: p.IsAuto);
+                        else if (autoPartialFill)
+                            Diag("pending replace dropped — old auto order partially filled (" + ord.Filled + "/" + ord.Quantity +
+                                ") during cancel; keeping the open partial position, no stacked limit.");
                         else
                             Diag("pending replace dropped — old order reached " + state + " instead of Cancelled.");
                     }
