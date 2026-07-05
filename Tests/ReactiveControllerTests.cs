@@ -326,4 +326,54 @@ public class ReactiveControllerTests
         m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 14, accel: 2.0));  // re-arm
         Assert.Equal(ReactState.Watching, m.State);
     }
+
+    // ---- ABANDON REASON (instrumentation) ----
+
+    // Each abandon branch in StepWatching must stamp the matching LastAbandon (read-only diagnostic;
+    // setting it never changes control flow). Drive the machine through all five paths in one run,
+    // re-arming after each 10s cooldown, asserting the reason at each Cooldown. Timeout(15) < cooldown(10)
+    // spacing keeps the arm frames clean.
+    [Fact]
+    public void Each_abandon_path_stamps_the_matching_reason()
+    {
+        var m = Machine();
+        Assert.Equal(AbandonReason.None, m.LastAbandon);   // never abandoned yet
+
+        // Timeout: arm at T(1), no resolution past MaxWatchSeconds(15) -> Timeout, cooldown until T(27).
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 1, accel: 2.0));
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 17, accel: 2.0));
+        Assert.Equal(ReactState.Cooldown, m.State);
+        Assert.Equal(AbandonReason.Timeout, m.LastAbandon);
+
+        // AwayDrift: re-arm at T(30), then price 7 ticks off the wall -> AwayDrift, cooldown until T(41).
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 28, accel: 2.0)); // cooldown elapsed -> Waiting
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 30, accel: 2.0)); // re-arm
+        Assert.Equal(ReactState.Watching, m.State);
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 98.50, sec: 31, accel: 2.0));  // 7 ticks away
+        Assert.Equal(ReactState.Cooldown, m.State);
+        Assert.Equal(AbandonReason.AwayDrift, m.LastAbandon);
+
+        // WallVanished: re-arm at T(43), then current size 0 -> WallVanished, cooldown until T(54).
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 42, accel: 2.0)); // -> Waiting
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 43, accel: 2.0)); // re-arm
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 0, delta: 50, mid: 100.00, sec: 44, accel: 2.0));
+        Assert.Equal(ReactState.Cooldown, m.State);
+        Assert.Equal(AbandonReason.WallVanished, m.LastAbandon);
+
+        // IdentityHop: re-arm at T(56) latching 100.25, then dominant wall hops to 100.50 -> IdentityHop.
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 55, accel: 2.0)); // -> Waiting
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 56, accel: 2.0)); // re-arm, latch 100.25
+        m.Update(In(wallAbovePrice: 100.50, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 57, accel: 2.0)); // hop
+        Assert.Equal(ReactState.Cooldown, m.State);
+        Assert.Equal(AbandonReason.IdentityHop, m.LastAbandon);
+
+        // Pulled: re-arm at T(69), then a valid Pulled outcome -> Pulled (spoof, abstain).
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 68, accel: 2.0)); // -> Waiting
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 69, accel: 2.0)); // re-arm
+        var o = m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 70, accel: 2.0,
+                            aboveOut: Outcome.Pulled, aboveValid: true));
+        Assert.False(o.Fired);
+        Assert.Equal(ReactState.Cooldown, m.State);
+        Assert.Equal(AbandonReason.Pulled, m.LastAbandon);
+    }
 }

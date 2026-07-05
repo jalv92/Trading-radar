@@ -93,6 +93,24 @@ namespace TradingRadar.NT
         // (~30Hz) can read the same _latest Frame more than once before the engine swaps it in, so
         // OnSetupFire can be called twice with the IDENTICAL FireEvent. FireEvent.Time is unique per fire.
         private DateTime _lastFireTime = DateTime.MinValue;
+        // Setup that produced the current auto flow — for auto-log tagging ONLY (prestage/submit/fill),
+        // never a decision. Captured from the FireEvent in OnSetupFire; the submit (SubmitRaw) and fill
+        // (OnOrderUpdate) logs run outside that stack, so they read these instead of the event. Best-
+        // effort by design: guard 2 (busy) keeps one auto trade in flight, so these stay this order's own.
+        private SetupKind _lastFireKind;
+        private ReactKind _lastFireReact;
+
+        // Auto-log setup prefix so React activity is distinguishable in the lr-auto CSV. Folded into the
+        // detail string to keep the fixed time,event,side,price,mid,detail schema (no new column that
+        // would break existing parsers). Break fires carry Kind=Break/React=None -> "[Break] ".
+        private static string SetupTag(SetupKind kind, ReactKind react)
+        {
+            if (kind == SetupKind.Reactive)
+                return react == ReactKind.Reject ? "[React:Reject] "
+                     : react == ReactKind.Break  ? "[React:Break] "
+                     : "[React] ";
+            return "[Break] ";
+        }
 
         // Exit-leg instrumentation (2026-07-03, multi-day verdict item 1): one open AUTO trade at a
         // time, matching TryAutoFire's own "busy" guard (a new AUTO entry never fires while a position
@@ -703,6 +721,7 @@ namespace TradingRadar.NT
         {
             if (f.Time == _lastFireTime) return;
             _lastFireTime = f.Time;
+            _lastFireKind = f.Kind; _lastFireReact = f.React;   // auto-log setup tag (prestage/submit/fill)
 
             FireRouting route = ReactiveExecution.Route(f);   // §3 side + §8 MKT-vs-LMT + auto-aggressive
             double tick = EffectiveTick();
@@ -714,7 +733,7 @@ namespace TradingRadar.NT
                 ClearPendingSetup();
                 LogAuto("prestage", route.IsBuy ? "Buy" : "Sell", _lastPrice, _lastPrice,
                     string.Format(System.Globalization.CultureInfo.InvariantCulture,
-                        "REACT reject — marketable fade, wall {0:0.00}.", f.WallPrice));
+                        "{0}REACT reject — marketable fade, wall {1:0.00}.", SetupTag(f.Kind, f.React), f.WallPrice));
             }
             else
             {
@@ -735,7 +754,7 @@ namespace TradingRadar.NT
                 // engine fire even reached this layer. CSV-only: no Output spam for a routine, frequent event.
                 LogAuto("prestage", route.IsBuy ? "Buy" : "Sell", _pendingSetup.Price, _lastPrice,
                     string.Format(System.Globalization.CultureInfo.InvariantCulture,
-                        "wall {0:0.00}, fraction {1:0.00}.", f.WallPrice, f.Fraction));
+                        "{0}wall {1:0.00}, fraction {2:0.00}.", SetupTag(f.Kind, f.React), f.WallPrice, f.Fraction));
             }
             TryAutoFire(f, route, tick);   // AUTO path — guards 1-5, auto-aggressive honored inside
         }
@@ -1258,11 +1277,13 @@ namespace TradingRadar.NT
                     // AUTO) — the future calibration label needs AverageFillPrice + filled qty, which
                     // the order_update rows above (limit price only) cannot provide. Logged BEFORE the
                     // bookkeeping below nulls _autoOrder, so the [auto] tag stays accurate.
+                    bool isAutoFill = ReferenceEquals(_autoOrder, ord);   // captured before the bookkeeping below nulls _autoOrder
                     LogAuto("fill", ord.OrderAction.ToString(), ord.AverageFillPrice, _lastPrice,
                         string.Format(System.Globalization.CultureInfo.InvariantCulture,
-                            "order #{0} {1} — filled {2}/{3} @ {4:0.00}{5}",
+                            "{0}order #{1} {2} — filled {3}/{4} @ {5:0.00}{6}",
+                            isAutoFill ? SetupTag(_lastFireKind, _lastFireReact) : "",   // setup tag only for auto fills — a manual fill has no fire behind it
                             ord.Id, state, ord.Filled, ord.Quantity, ord.AverageFillPrice,
-                            ReferenceEquals(_autoOrder, ord) ? " [auto]" : ""));
+                            isAutoFill ? " [auto]" : ""));
                     // Exit-leg instrumentation (verdict doc item 1): the AUTO entry order just filled
                     // (fully or partially-then-cancelled — either way a position opened) — open the one
                     // live AUTO trade record. Captured here, BEFORE _autoOrder is nulled below.
@@ -1881,10 +1902,18 @@ namespace TradingRadar.NT
                 if (isAuto) { _autoOrder = o; _autoSubmittedAt = _now; }
                 // "submit" carries the order id — this is the one place it exists (round-3 schema).
                 if (isAuto)
+                {
+                    // A React Reject fires SubmitRaw(..., OrderType.Market, ..., 0, ...): logging "LMT @ 0.00"
+                    // for it was nonsensical — branch the venue text on the actual order type (MKT uses
+                    // _lastPrice for context, LMT keeps the resting limit price).
+                    string venue = type == OrderType.Market
+                        ? string.Format(System.Globalization.CultureInfo.InvariantCulture, "MKT @ mkt {0:0.00}", _lastPrice)
+                        : string.Format(System.Globalization.CultureInfo.InvariantCulture, "LMT @ {0:0.00}", limitPrice);
                     DiagAuto("submit", action.ToString(), limitPrice, _lastPrice,
                         string.Format(System.Globalization.CultureInfo.InvariantCulture,
-                            "AUTO submit — {0} LMT @ {1:0.00}, order #{2}, qty {3} ({4}/{5} today).",
-                            action, limitPrice, o.Id, qty, _autoFireCount, GetAutoCap()));
+                            "{0}AUTO submit — {1} {2}, order #{3}, qty {4} ({5}/{6} today).",
+                            SetupTag(_lastFireKind, _lastFireReact), action, venue, o.Id, qty, _autoFireCount, GetAutoCap()));
+                }
                 if (atm != null)
                 {
                     try
@@ -1926,7 +1955,7 @@ namespace TradingRadar.NT
             catch (Exception ex)
             {
                 Diag("submit failed (" + tag + "): " + ex.Message);
-                if (isAuto) LogAuto("submit", action.ToString(), limitPrice, _lastPrice, "AUTO submit FAILED: " + ex.Message);
+                if (isAuto) LogAuto("submit", action.ToString(), limitPrice, _lastPrice, SetupTag(_lastFireKind, _lastFireReact) + "AUTO submit FAILED: " + ex.Message);
             }
         }
 

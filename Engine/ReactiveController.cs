@@ -6,6 +6,12 @@ namespace TradingRadar.Engine
     // Fired/Cooldown (resolve or abandon) -> Waiting.
     public enum ReactState { Waiting, Watching, Fired, Cooldown }
 
+    // Why the last Watching->Cooldown abandon happened — read-only diagnostics (instrumentation, not
+    // control): the funnel needs to SEE why each watch ended (0 fires with ~227 arms was invisible).
+    // None = never abandoned this controller. Set at each abandon branch in StepWatching; never resets
+    // on arm/fire, so it always names the MOST RECENT abandon.
+    public enum AbandonReason { None, Timeout, AwayDrift, WallVanished, IdentityHop, Pulled }
+
     // React setup tunables — ALL placeholders, MEASURED later once >= 10 distinct days + >= 15-20 real
     // fires with logged realized-fill exits exist (spec §11/§12; decisions/2026-07-03-ml-calibration).
     // SEPARATE fields from ControllerConfig by design (spec §2/§4/§11 "reuse"): React must recalibrate
@@ -46,6 +52,16 @@ namespace TradingRadar.Engine
         public ReactState State { get { return _state; } }
         // The latched wall's own side (for the cockpit banner) — meaningful while Watching/Fired.
         public Side WallSide { get { return _wallSide; } }
+
+        // Read-only diagnostics (instrumentation only — none of these are read by control logic).
+        // Why the last watch ended; None until the first abandon. Set at each abandon branch below.
+        public AbandonReason LastAbandon { get; private set; }
+        // The latched wall's price/side while Watching/Fired; 0/default otherwise (Waiting/Cooldown have
+        // no live latch). Surfaced to the sig CSV so the funnel shows what wall each watch was tracking.
+        public double LatchedWallPrice
+        { get { return (_state == ReactState.Watching || _state == ReactState.Fired) ? _wallPrice : 0.0; } }
+        public Side LatchedSide
+        { get { return (_state == ReactState.Watching || _state == ReactState.Fired) ? _wallSide : default(Side); } }
 
         // Same shape as ControllerStateMachine.Update: returns ControllerOutput carrying Fired/Fire so
         // the NT layer routes both setups through one path. Reactive fires tag Kind=Reactive + React +
@@ -127,8 +143,8 @@ namespace TradingRadar.Engine
             // already-terminal wall becomes dominant on the same side, its outcome/valid belongs to
             // THAT wall — reading it here would fire anchored at the stale latched _wallPrice, on the
             // wrong wall (spec §6: identity-hop must always abandon, never fire).
-            if (cur <= 0) { EnterCooldown(inp.Now); return false; }                                   // latched wall vanished
-            if (Math.Abs(wallPriceNow - _wallPrice) >= _tick) { EnterCooldown(inp.Now); return false; } // dominant-wall identity hops
+            if (cur <= 0) { LastAbandon = AbandonReason.WallVanished; EnterCooldown(inp.Now); return false; }                                   // latched wall vanished
+            if (Math.Abs(wallPriceNow - _wallPrice) >= _tick) { LastAbandon = AbandonReason.IdentityHop; EnterCooldown(inp.Now); return false; } // dominant-wall identity hops
 
             // RESOLVE — read ONLY the latched side's outcome, and ONLY when its Valid flag is set
             // (plan §0-R3: default(Outcome)==Absorbed would phantom-fire a fade on a warmup frame).
@@ -163,6 +179,7 @@ namespace TradingRadar.Engine
                 else
                 {
                     // Outcome.Pulled (spoof: cancelled, no cross) -> abstain, no trade (spec §3/§6).
+                    LastAbandon = AbandonReason.Pulled;
                     EnterCooldown(inp.Now);
                     return false;
                 }
@@ -170,8 +187,8 @@ namespace TradingRadar.Engine
 
             // ABANDON — no resolution this tick (spec §6, remaining cases; identity/vanish already
             // checked above so they can never be shadowed by a fire on a stale wall):
-            if (Math.Abs(inp.Mid - _wallPrice) >= _cfg.AwayTicks * _tick) { EnterCooldown(inp.Now); return false; } // price left (accel fizzled)
-            if ((inp.Now - _watchStart).TotalSeconds >= _cfg.MaxWatchSeconds) { EnterCooldown(inp.Now); return false; } // wait-and-see timeout
+            if (Math.Abs(inp.Mid - _wallPrice) >= _cfg.AwayTicks * _tick) { LastAbandon = AbandonReason.AwayDrift; EnterCooldown(inp.Now); return false; } // price left (accel fizzled)
+            if ((inp.Now - _watchStart).TotalSeconds >= _cfg.MaxWatchSeconds) { LastAbandon = AbandonReason.Timeout; EnterCooldown(inp.Now); return false; } // wait-and-see timeout
 
             return false; // keep watching
         }

@@ -114,6 +114,16 @@ namespace TradingRadar.NT
         // _engineLock (review 2026-07-03: an unlocked read-then-reset could clobber an in-flight
         // increment and silently under-count the very funnel the fires=0 alarm watches).
         private int _recArms, _recFires;
+        // React funnel counters (mirror the Break arms/fires; lr-sessions.csv). arms = Waiting->Watching,
+        // fires = React cout.Fired, abandons = Watching->Cooldown. Only advance while React is the active
+        // setup. Same _engineLock discipline as the Break counters above.
+        private int _recReactArms, _recReactFires, _recReactAbandons;
+        // Continuous engine state (NOT reset on Rec toggle — like _lastCtrl): previous run's React state +
+        // abandon reason, so the sig writer can force a row on any React transition and the counters above
+        // can detect the arm/abandon edges. Reset only where _reactive itself is rebuilt (setup swap /
+        // instrument switch / replay reset).
+        private ReactState _lastReactState = ReactState.Waiting;
+        private AbandonReason _lastReactAbandon = AbandonReason.None;
         private System.IO.StreamWriter _capWriter;
         private System.IO.StreamWriter _sigWriter;
         private readonly Dictionary<long, NodeState> _prevStates = new Dictionary<long, NodeState>();
@@ -211,14 +221,17 @@ namespace TradingRadar.NT
                     "ctrlWallAbovePx,ctrlWallAboveSz,ctrlWallBelowPx,ctrlWallBelowSz,tapeAlternations," +
                     "ctrlLongHold,ctrlShortHold,ctrlLongDistTicks,ctrlShortDistTicks,ctrlLongCooldownUntil,ctrlShortCooldownUntil,autoArmed," +
                     "ctrlLongPeak,ctrlLongMin,ctrlShortPeak,ctrlShortMin," +
-                    "src,seq,adaptiveSig");
+                    "src,seq,adaptiveSig," +
+                    // React telemetry — APPEND ONLY (a Break parser reads columns 0..42 by index, so
+                    // appending here can never shift them). Empty/0 while Break is the active setup.
+                    "setup,tapeAccel,reactState,reactWallPx,reactWallSide,reactAbandon,waOut,waValid,wbOut,wbValid");
                 _sigWriter.Flush();
                 _capture = true;
                 // Round-7: forces a sig row the instant either side's HoldCount moves (see the
                 // holdChanged trigger below) — reset on every Rec toggle-on, same as _prevStates.
                 _lastLoggedHoldL = -1;
                 _lastLoggedHoldS = -1;
-                lock (_engineLock) { _recArms = 0; _recFires = 0; }
+                lock (_engineLock) { _recArms = 0; _recFires = 0; _recReactArms = 0; _recReactFires = 0; _recReactAbandons = 0; }
             };
             recChk.Unchecked += (o, e) =>
             {
@@ -334,6 +347,7 @@ namespace TradingRadar.NT
                 if (kind == SetupKind.Reactive) _reactive   = new ReactiveController(new ReactiveConfig(), _cfg.TickSize);
                 else                            _controller = new ControllerStateMachine(preset.Controller, _cfg.TickSize);
                 _lastCtrl = default(ControllerOutput);
+                _lastReactState = _reactive.State; _lastReactAbandon = _reactive.LastAbandon;   // resync to the (maybe rebuilt) React controller
             }
         }
 
@@ -402,6 +416,7 @@ namespace TradingRadar.NT
                     _reactive   = new ReactiveController(new ReactiveConfig(), _cfg.TickSize); // rebuild both; _activeSetup (the selection) is deliberately untouched — that IS the re-apply
                     _pressure   = new PressureModel(preset.Pressure);
                     _lastCtrl   = default(ControllerOutput);
+                    _lastReactState = _reactive.State; _lastReactAbandon = _reactive.LastAbandon;   // resync to the rebuilt React controller
                     _latest  = null;
                     _lastEngineRun = DateTime.MinValue;   // don't carry the old instrument's engine clock
                     _medianEwma    = 0;                   // (a stale high-water would spuriously reset/throttle)
@@ -707,6 +722,12 @@ namespace TradingRadar.NT
             // silently skipping over the exact ticks HoldCount moves on. Force a row the instant
             // either side's HoldCount changes, same "snapshot before overwrite" pattern as ctrlStateChanged.
             bool holdChanged = cout.LongHoldCount != _lastLoggedHoldL || cout.ShortHoldCount != _lastLoggedHoldS;
+            // React funnel visibility: force a sig row on ANY React state OR abandon-reason transition, so a
+            // whole arm->watch->abandon cycle can't hide between two 2s heartbeats (the single most
+            // diagnostic requirement — the project learned this the hard way for Break's HoldCount). Compare
+            // BEFORE _lastReactState/_lastReactAbandon are updated below, same snapshot-before-overwrite
+            // pattern as ctrlStateChanged/holdChanged.
+            bool reactStateChanged = _reactive.State != _lastReactState || _reactive.LastAbandon != _lastReactAbandon;
             // ADR 2026-07-03: per-Rec-session funnel counters (arms + fires) for lr-sessions.csv —
             // snapshot the Waiting->Armed edges BEFORE _lastCtrl is overwritten below.
             if (_capture)
@@ -714,8 +735,20 @@ namespace TradingRadar.NT
                 if (cout.Long == SideState.Armed && _lastCtrl.Long == SideState.Waiting) _recArms++;
                 if (cout.Short == SideState.Armed && _lastCtrl.Short == SideState.Waiting) _recArms++;
                 if (cout.Fired) _recFires++;
+                // React funnel counters — only while React is the active setup (_reactive isn't stepped
+                // when Break is active, so its state is frozen and these edges can never spuriously fire).
+                // arm = Waiting->Watching, abandon = Watching->Cooldown (every such edge in StepWatching is
+                // an abandon), fire = React cout.Fired. Uses _lastReactState (previous run) before it's
+                // overwritten below, same as the Break counters read _lastCtrl.
+                if (_activeSetup == SetupKind.Reactive)
+                {
+                    if (_reactive.State == ReactState.Watching && _lastReactState == ReactState.Waiting) _recReactArms++;
+                    if (_reactive.State == ReactState.Cooldown && _lastReactState == ReactState.Watching) _recReactAbandons++;
+                    if (cout.Fired) _recReactFires++;
+                }
             }
             _lastCtrl = cout;   // read by the identity-contract lookup above on the NEXT engine run
+            _lastReactState = _reactive.State; _lastReactAbandon = _reactive.LastAbandon;   // React equivalents of _lastCtrl
             // Task 11: vote-less book-skew context for the Cockpit's demoted reference strip (spec §7) —
             // reuses the same pin assembled above; never a vote, never a trigger. `pin` itself is kept
             // only for this — PressureModel.Evaluate(pin) is no longer called per-run (nothing reads the
@@ -788,7 +821,7 @@ namespace TradingRadar.NT
                     // arm->drop->veto cycle can complete and vanish between two heartbeat rows; these event
                     // triggers guarantee every transition lands a row without touching the heartbeat's own
                     // cadence.
-                    if (_capture && _sigWriter != null && (heartbeat || ctrlStateChanged || holdChanged))
+                    if (_capture && _sigWriter != null && (heartbeat || ctrlStateChanged || holdChanged || reactStateChanged))
                     {
                         var bids = _book.Levels(Side.Bid); var asks = _book.Levels(Side.Ask);
                         long bidMass = 0, askMass = 0;
@@ -819,7 +852,11 @@ namespace TradingRadar.NT
                             "{24:0.00},{25},{26:0.00},{27},{28}," +
                             "{29},{30},{31:0.00},{32:0.00},{33},{34},{35}," +
                             "{36},{37},{38},{39}," +
-                            "{40},{41},{42}",
+                            "{40},{41},{42}," +
+                            // React telemetry (append-only) — empty/0 while Break is active. reactState is
+                            // gated to React-active (Break would otherwise always read "Waiting"); the rest
+                            // read 0/default naturally because _reactive is dormant while Break is active.
+                            "{43},{44:0.0000},{45},{46:0.00},{47},{48},{49},{50},{51},{52}",
                             now.ToString("o"), mid, bidMass, askMass, bestBid, bestAsk, delta15, wf, wabove, wpx,
                             wallAbovePx, wallAboveSz, wallBelowPx, wallBelowSz,
                             cout.LongFraction, cout.LongTradeBacked, cout.ShortFraction, cout.ShortTradeBacked,
@@ -831,7 +868,11 @@ namespace TradingRadar.NT
                             cout.ShortCooldownUntil == DateTime.MinValue ? "" : cout.ShortCooldownUntil.ToString("o"),
                             _chartTrader.IsAutoArmed,
                             cout.LongPeak, cout.LongMin, cout.ShortPeak, cout.ShortMin,
-                            src, seq, cin.AdaptiveSignificance));
+                            src, seq, cin.AdaptiveSignificance,
+                            _activeSetup, cin.TapeAccel,
+                            _activeSetup == SetupKind.Reactive ? _reactive.State.ToString() : "",
+                            _reactive.LatchedWallPrice, _reactive.LatchedSide, _reactive.LastAbandon,
+                            waOut, waValid, wbOut, wbValid));
                         _sigWriter.Flush();
                         _lastLoggedHoldL = cout.LongHoldCount;
                         _lastLoggedHoldS = cout.ShortHoldCount;
@@ -998,6 +1039,7 @@ namespace TradingRadar.NT
             _controller = new ControllerStateMachine(resetPreset.Controller, _cfg.TickSize);
             _reactive   = new ReactiveController(new ReactiveConfig(), _cfg.TickSize);   // rebuild both; _activeSetup preserved (re-apply)
             _lastCtrl   = default(ControllerOutput);
+            _lastReactState = _reactive.State; _lastReactAbandon = _reactive.LastAbandon;   // resync to the rebuilt React controller
             _lastDiag   = DateTime.MinValue;
             _lastMidLog = DateTime.MinValue;
             _medianEwma = 0;
@@ -1030,8 +1072,14 @@ namespace TradingRadar.NT
                 bool fresh = !System.IO.File.Exists(path);
                 // Snapshot + reset under the same lock the instrument thread increments with, so an
                 // in-flight engine run can't have its count clobbered by this read-then-reset.
-                int arms, fires;
-                lock (_engineLock) { arms = _recArms; fires = _recFires; _recArms = 0; _recFires = 0; }
+                int arms, fires, rArms, rFires, rAbandons;
+                lock (_engineLock)
+                {
+                    arms = _recArms; fires = _recFires;
+                    rArms = _recReactArms; rFires = _recReactFires; rAbandons = _recReactAbandons;
+                    _recArms = 0; _recFires = 0;
+                    _recReactArms = 0; _recReactFires = 0; _recReactAbandons = 0;
+                }
                 // This session counts as "quiet" only if it armed but never fired; then extend the
                 // streak backwards over the previous rows until a firing (or arm-less) session breaks it.
                 int zeroStreak = (fires == 0 && arms > 0) ? 1 : 0;
@@ -1051,16 +1099,20 @@ namespace TradingRadar.NT
                     : "";
                 using (var w = new System.IO.StreamWriter(path, true))
                 {
-                    if (fresh) w.WriteLine("time,instrument,arms,fires,alert");
+                    // React funnel columns APPENDED after `alert` (append-only: the streak parser above
+                    // only reads p[2]/p[3] = arms/fires, so a Break-only parser is unaffected).
+                    if (fresh) w.WriteLine("time,instrument,arms,fires,alert,reactArms,reactFires,reactAbandons");
                     w.WriteLine(string.Format(System.Globalization.CultureInfo.InvariantCulture,
-                        "{0},{1},{2},{3},{4}",
+                        "{0},{1},{2},{3},{4},{5},{6},{7}",
                         DateTime.Now.ToString("o"),
                         instName,
-                        arms, fires, alert));   // the snapshot locals — _recArms/_recFires were zeroed at line ~924
+                        arms, fires, alert,
+                        rArms, rFires, rAbandons));   // the snapshot locals — all counters were zeroed under the lock above
                 }
                 if (alert.Length > 0)
                     NinjaTrader.Code.Output.Process("[Radar] " + alert, NinjaTrader.NinjaScript.PrintTo.OutputTab1);
                 _recArms = 0; _recFires = 0;
+                _recReactArms = 0; _recReactFires = 0; _recReactAbandons = 0;
             }
             catch { }   // diagnostics must never take down the tab
         }
