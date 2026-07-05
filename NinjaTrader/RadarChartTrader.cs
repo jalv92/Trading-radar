@@ -75,6 +75,9 @@ namespace TradingRadar.NT
             public double Price;
             public string Tag;
             public Order WaitingOn;
+            public bool IsAuto;   // true only for an AUTO re-mount (RemountAutoLimit) — threads isAuto into the
+                                   // deferred SubmitRaw so the replacement re-seeds _autoOrder/_autoSubmittedAt.
+                                   // A manual opposite-side flip leaves this false (plain re-submit, as before).
         }
         private PendingReplace _pendingReplace;
 
@@ -658,7 +661,12 @@ namespace TradingRadar.NT
 
         // AUTO mode placeholders (2026-07-01) — pending the same Rec-CSV calibration pass (spec §9).
         private const int AutoStaleTicks = 2;       // MEASURED later — anti-stale tolerance at auto-fire time (F18)
-        private const int AutoCancelSeconds = 15;   // MEASURED later — unfilled auto limit auto-cancels after this long
+        // Unfilled-auto-limit lifetime: how long a resting auto-submitted limit lives before MaybeAutoCancel
+        // ages it out. User-set to 5 min (2026-07-05) — the old 15 was a fraction of a second of wall-clock
+        // at 4x-24x Playback, killing break-setup limits before they could fill. Still MEASURED-later (spec
+        // §9), like the other AUTO thresholds. Judged on the REPLAY-aware clock _now (see MaybeAutoCancel),
+        // never wall clock. Re-anchored (window restarts) if a new setup fires while this one is still resting.
+        private const int AutoCancelSeconds = 300;   // 5 min of replay/market time (user-set; MEASURED later)
         // MEASURED later — grace before MaybeReconcileOpenAutoTrade self-heals a stale _openAutoTrade.
         // Must comfortably exceed the normal fill->HandlePossibleExitFill event-ordering "beat" (guard 2's
         // own comment) so a legitimately-in-flight exit is never mistaken for a leaked record.
@@ -780,8 +788,19 @@ namespace TradingRadar.NT
             // reversal). This is what actually prevents the day-29 misattribution (a second AUTO entry
             // firing while the previous trade's exits are still unresolved) — FIX 1/4 are defense-in-depth
             // for the paths this guard doesn't cover (guard bypass, manual clicks).
+            // Re-mount (2026-07-05): a genuinely new setup fire (already past OnSetupFire's dedupe) while our
+            // OWN unfilled auto-limit is still RESTING is a re-anchor of the same pending intent, not a new
+            // trade. Detect it here so guard 2's busy-skip lets it through; it's committed further below (after
+            // the stale/ATM gates still run) via RemountAutoLimit. Only for an LMT->LMT re-anchor: a marketable
+            // (React reject → MKT) new fire keeps the busy-skip (the file's replace path is LMT-only, reused as-
+            // is). IsStillWorking rules out a post-rewind phantom; IsFlat + _openAutoTrade==null rule out a fill.
             Position posNow = CurrentPosition();
-            if (_activeLimit != null || !IsFlat(posNow) || _openAutoTrade != null)
+            bool remount = !route.Marketable
+                && _autoOrder != null && ReferenceEquals(_activeLimit, _autoOrder)
+                && IsStillWorking(_autoOrder) && IsFlat(posNow) && _openAutoTrade == null;
+            // guard 2 (FIX 2, 2026-07-03): busy — one AUTO thing at a time. A re-mount is exempt (it REPLACES
+            // the live auto-limit rather than stacking on it); a real open position / unresolved fill is not.
+            if (!remount && (_activeLimit != null || !IsFlat(posNow) || _openAutoTrade != null))
             {
                 string why = _activeLimit != null ? "working limit"
                     : !IsFlat(posNow) ? "open position"
@@ -790,22 +809,28 @@ namespace TradingRadar.NT
                 return;
             }
 
-            DateTime day = f.Time.Date;                                  // REPLAY time — a new replay day resets the count
-            if (day != _autoFireDay)
+            // Daily cap (guard 3): counts only real submissions-that-can-fill toward a position. A re-mount
+            // re-anchors an order whose count the ORIGINAL submit already burned, so it skips the seed/check
+            // AND the increment below — re-anchoring a pending intent must never cost a fresh Cap/day slot.
+            if (!remount)
             {
-                _autoFireDay = day;
-                // Blocker fix: if a persisted daily-cap count survived a workspace restore and is for
-                // THIS SAME replay day, seed from it instead of zeroing — a mid-day reopen must not grant
-                // a fresh cap. A persisted day that doesn't match (or none) is stale/inapplicable — 0.
-                _autoFireCount = (_pendingRestoreFireDay == day) ? _pendingRestoreFireCount : 0;
-                _pendingRestoreFireDay = DateTime.MinValue;   // consumed — a later new day must reset normally
-            }
-            if (_autoFireCount >= GetAutoCap())                           // guard 3: daily cap (burns on every ATTEMPT below,
-            {                                                             // including one whose submit throws — conservative, deliberate)
-                string capStatus = _autoFireCount + "/" + GetAutoCap();
-                DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — daily cap " + capStatus + " reached.");
-                ForceDisarmAuto("cap " + capStatus);   // route through the one disarm gate
-                return;
+                DateTime day = f.Time.Date;                              // REPLAY time — a new replay day resets the count
+                if (day != _autoFireDay)
+                {
+                    _autoFireDay = day;
+                    // Blocker fix: if a persisted daily-cap count survived a workspace restore and is for
+                    // THIS SAME replay day, seed from it instead of zeroing — a mid-day reopen must not grant
+                    // a fresh cap. A persisted day that doesn't match (or none) is stale/inapplicable — 0.
+                    _autoFireCount = (_pendingRestoreFireDay == day) ? _pendingRestoreFireCount : 0;
+                    _pendingRestoreFireDay = DateTime.MinValue;   // consumed — a later new day must reset normally
+                }
+                if (_autoFireCount >= GetAutoCap())                      // guard 3: daily cap (burns on every ATTEMPT below,
+                {                                                        // including one whose submit throws — conservative, deliberate)
+                    string capStatus = _autoFireCount + "/" + GetAutoCap();
+                    DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — daily cap " + capStatus + " reached.");
+                    ForceDisarmAuto("cap " + capStatus);   // route through the one disarm gate
+                    return;
+                }
             }
 
             // guard 4: degenerate-quote guard, not F18's click-time re-clamp — at synchronous auto-submit
@@ -847,6 +872,14 @@ namespace TradingRadar.NT
                 return;
             }
 
+            // All the same fire-time gates (Sim, hours, stale, ATM) have now run for a re-mount too. Commit it
+            // as a re-anchor of the existing pending intent — cancel-first replace, no new trade, no cap burn.
+            if (remount)
+            {
+                RemountAutoLimit(route);
+                return;
+            }
+
             _autoFireCount++;                                            // all clear — fire
             if (route.Marketable)
                 // Reactive REJECT — marketable chase. isEntry:true attaches the picked ATM bracket (same
@@ -871,6 +904,50 @@ namespace TradingRadar.NT
                 string.Format(System.Globalization.CultureInfo.InvariantCulture,
                     "AUTO cancel — unfilled auto limit aged out after {0:0.0}s (limit {1}s).", elapsedSec, AutoCancelSeconds));
             CancelActiveLimitIfWorking("auto-cancel");   // same cancel path Rev/Close/opposite-side use
+        }
+
+        // Re-anchor our own still-resting auto-limit onto a newer break setup that fired within its lifetime
+        // window. Uses the EXACT cancel-first replace sequencing the opposite-side flip uses (SubmitLimit's
+        // _activeLimit-not-null branch): stash the new order in _pendingReplace, add the old to _workingOrders
+        // to block any second submit while the cancel is in flight, cancel the old, and let OnOrderUpdate fire
+        // the replacement ONLY once the cancel is CONFIRMED (state == Cancelled). The old is therefore never
+        // orphaned and the two are never both live for an instant. IsAuto:true re-seeds _autoOrder/
+        // _autoSubmittedAt at resubmit (SubmitRaw), restarting the 5-min window; SubmitRaw's own naked-auto
+        // abort re-checks the ATM at that later instant. A re-mount is NOT a new executed trade — the caller
+        // does NOT increment _autoFireCount, so no Cap/day slot is spent. If the old order FILLS during the
+        // cancel race, OnOrderUpdate opens the real _openAutoTrade and drops the pending replace (state !=
+        // Cancelled) — so a raced fill becomes one honest trade, never a stacked second order.
+        // _pendingSetup is guaranteed non-null here: remount is gated on !route.Marketable, whose OnSetupFire
+        // branch always sets it, and guard 4 above already dereferenced _pendingSetup.Price.
+        private void RemountAutoLimit(FireRouting route)
+        {
+            Order old = _autoOrder;
+            OrderAction action = route.IsBuy ? OrderAction.Buy : OrderAction.Sell;
+            double price = _pendingSetup.Price;
+            string tag = route.IsBuy ? "BuyLmt" : "SellLmt";
+            int qty = GetQty();
+            _workingOrders.Add(old);   // block a second submit while the cancel is in flight (same as the flip)
+            _pendingReplace = new PendingReplace { Action = action, Qty = qty, Price = price, Tag = tag, WaitingOn = old, IsAuto = true };
+            LogAuto("remount", route.IsBuy ? "Buy" : "Sell", price, _lastPrice, string.Format(
+                System.Globalization.CultureInfo.InvariantCulture,
+                "AUTO re-mount — cancel unfilled auto limit #{0} @ {1:0.00}, re-anchor @ {2:0.00} (5-min window restarts; no cap burn).",
+                old.Id, old.LimitPrice, price));
+            try
+            {
+                _account.Cancel(new[] { old });
+                RefreshArmUi();
+            }
+            catch (Exception ex)
+            {
+                // Same fail-safe as the opposite-side flip: leave the old order standing (it's presumably
+                // still resting) and DROP the pending replace so nothing double-fires. The old auto-limit
+                // keeps its ORIGINAL window and ages out via MaybeAutoCancel if it never fills.
+                Diag("auto re-mount: cancel-before-replace failed: " + ex.Message);
+                LogAuto("remount", route.IsBuy ? "Buy" : "Sell", price, _lastPrice, "AUTO re-mount cancel FAILED — old limit kept: " + ex.Message);
+                _workingOrders.Remove(old);
+                _pendingReplace = null;
+                RefreshArmUi();
+            }
         }
 
         // One definition of "flat", 4 users: guard 2 below, RefreshPositionUi, Reverse, ClosePosition —
@@ -1215,7 +1292,10 @@ namespace TradingRadar.NT
                         PendingReplace p = _pendingReplace;
                         _pendingReplace = null;
                         if (state == OrderState.Cancelled)
-                            SubmitRaw(p.Action, OrderType.Limit, p.Qty, p.Price, p.Tag, isEntry: true);
+                            // isAuto:true only for an AUTO re-mount — re-seeds _autoOrder/_autoSubmittedAt so the
+                            // 5-min window restarts and MaybeAutoCancel/telemetry track the replacement. A manual
+                            // opposite-side flip carries IsAuto=false, so its re-submit stays a plain entry.
+                            SubmitRaw(p.Action, OrderType.Limit, p.Qty, p.Price, p.Tag, isEntry: true, isAuto: p.IsAuto);
                         else
                             Diag("pending replace dropped — old order reached " + state + " instead of Cancelled.");
                     }
@@ -1522,7 +1602,10 @@ namespace TradingRadar.NT
             return string.IsNullOrEmpty(s) ? string.Empty : "\"" + s.Replace("\"", "\"\"") + "\"";
         }
 
-        // event in {arm, disarm, prestage, guard_skip, submit, atm_attach, order_update, auto_cancel}.
+        // event in {arm, disarm, prestage, guard_skip, submit, atm_attach, order_update, auto_cancel, fill,
+        // trade_summary, remount}. (remount = an unfilled auto-limit re-anchored to a newer setup — the row
+        // pairs with the old limit's order_update -> Cancelled and the replacement's submit, so the trail
+        // shows an honest cancel+resubmit, not a silent swap.)
         // Time is the replay-aware market clock (_now, pushed by SetContext) where available — the same
         // instant OnSetupFire/TryAutoFire's caller already used — with a wall-clock fallback (noted in the
         // detail column) for the few AUTO-path call sites that can run off-tick (checkbox clicks, account/
