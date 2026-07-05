@@ -483,3 +483,7 @@ $RECYCLE.BIN/
 
 # nt8c staging mirror (local build scratch)
 build/.stage/
+
+# Raw screen recordings + stray screenshots (source for docs GIFs; too large for GitHub — keep local only)
+docs/*.mp4
+docs/Captura_de_pantalla_*.png
