@@ -155,6 +155,7 @@ namespace TradingRadar.Engine
                     LastKnownSize = n.LastKnownSize,
                     PeakSize = n.PeakSize,
                     State = n.InWindow ? n.State : NodeState.Remembered,
+                    RawState = n.State,   // additive: UNMASKED true state, so React can see the latched wall's real resolution through a blink (masked State above unchanged for Break/cockpit)
                     Confidence = DecayedConfidence(n, now),
                     InWindow = n.InWindow,
                     AgeSeconds = (now - n.LastSeen).TotalSeconds

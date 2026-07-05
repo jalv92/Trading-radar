@@ -93,6 +93,23 @@ public class LiquidityMemoryTests
     }
 
     [Fact]
+    public void RawState_carries_true_state_while_State_masks_blind_node_to_Remembered()
+    {
+        // The React latched-feed fix: a blind node's masked State goes to Remembered (Break/cockpit path,
+        // unchanged), but RawState must still carry the wall's TRUE resolution so React — reading by
+        // identity through the blink — can see it. Reproduces the day-17 bug where the latched wall's real
+        // Absorbed/Consumed resolution was hidden behind the InWindow mask (wbValid never True all day).
+        var m = new LiquidityMemory(new RadarConfig());
+        m.Promote(Side.Ask, 21000.50, 200, 20, T0);                                     // State=Wall, InWindow=true
+        m.ApplyOutcome(new EpisodeResult { Side = Side.Ask, Price = 21000.50, Outcome = Outcome.Absorbed, ResolvedAt = T0 }, T0); // true State -> Absorbed
+        m.MarkBlind(Side.Ask, 21000.50);                                                // InWindow=false
+        var n = NodeAt(m.Snapshot(21000.25, 21000.50, T0.AddSeconds(1)), 21000.50);
+        Assert.False(n.InWindow);
+        Assert.Equal(NodeState.Remembered, n.State);   // masked (unchanged): Break/cockpit see Remembered when blind
+        Assert.Equal(NodeState.Absorbed, n.RawState);  // additive: React sees the latched wall's real resolution through the blink
+    }
+
+    [Fact]
     public void Snapshot_excludes_nodes_outside_the_memory_band()
     {
         var cfg = new RadarConfig { MemoryBandTicks = 25, TickSize = 0.25 }; // band = 6.25 price units

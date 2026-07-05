@@ -507,6 +507,21 @@ namespace TradingRadar.NT
             return 0;
         }
 
+        // State twin of SizeAtPrice: the UNMASKED true state at a price by identity, through the SAME
+        // bounded blind-trust (InWindow || young), else Remembered. Backs React's latched-wall feed so it
+        // sees ITS wall's real resolution through a blink, not the InWindow-masked dominant state. Uses
+        // RawState (not State) so the dominant path's Break/cockpit masking is untouched. Mirrors
+        // WallTracker.TrustedSize's condition (Remembered is this method's "0", like TrustedSize returns 0).
+        private NodeState StateAtPrice(IReadOnlyList<RadarNode> nodes, Side side, double price)
+        {
+            if (price <= 0) return NodeState.Remembered;
+            for (int i = 0; i < nodes.Count; i++)
+                if (nodes[i].Side == side && Math.Abs(nodes[i].Price - price) < _cfg.TickSize / 2.0)
+                    return (nodes[i].InWindow || nodes[i].AgeSeconds < BlindTrustSeconds)
+                           ? nodes[i].RawState : NodeState.Remembered;
+            return NodeState.Remembered;
+        }
+
         // Shared by the Long/Ask and Short/Bid identity-contract feeds below — mirrors
         // ControllerStateMachine's own Side-parameterized StepLong/StepShort pairing instead of
         // duplicating the branch per side.
@@ -662,6 +677,32 @@ namespace TradingRadar.NT
             double ctrlWallAbovePx, ctrlWallBelowPx; long ctrlWallAboveSz, ctrlWallBelowSz;
             ResolveWallFeed(_lastCtrl.Long, _lastCtrl.LongWallPrice, Side.Ask, wallAbovePx, wallAboveSz, snapNodes, out ctrlWallAbovePx, out ctrlWallAboveSz);
             ResolveWallFeed(_lastCtrl.Short, _lastCtrl.ShortWallPrice, Side.Bid, wallBelowPx, wallBelowSz, snapNodes, out ctrlWallBelowPx, out ctrlWallBelowSz);
+
+            // REACT LATCHED-WALL IDENTITY FEED (mirrors ResolveWallFeed for Break, but keyed off the React
+            // controller's own latch instead of _lastCtrl). While React is Watching, _reactive.State /
+            // LatchedWallPrice / LatchedSide hold the PREVIOUS frame's values (Update runs below), so this
+            // is the exact _lastCtrl analogue: on the arming frame State is still Waiting → override skipped
+            // → arms on the dominant wall (correct); from the next frame State==Watching → the latched side's
+            // feed is pinned to ITS wall by price identity — size AND raw (unmasked) state — so a blink at
+            // the latched price no longer reads as IdentityHop/WallVanished, and the wall's REAL resolution
+            // (Absorbed/Consumed/Pulled) reaches MapOutcome below instead of the InWindow-masked Remembered.
+            // Latched side only; the non-latched side keeps its dominant feed untouched.
+            if (_activeSetup == SetupKind.Reactive && _reactive.State == ReactState.Watching)
+            {
+                double lp = _reactive.LatchedWallPrice;
+                if (_reactive.LatchedSide == Side.Ask)
+                {
+                    ctrlWallAbovePx = lp;
+                    ctrlWallAboveSz = SizeAtPrice(snapNodes, Side.Ask, lp);
+                    wallAboveState  = StateAtPrice(snapNodes, Side.Ask, lp);
+                }
+                else
+                {
+                    ctrlWallBelowPx = lp;
+                    ctrlWallBelowSz = SizeAtPrice(snapNodes, Side.Bid, lp);
+                    wallBelowState  = StateAtPrice(snapNodes, Side.Bid, lp);
+                }
+            }
 
             // Tape speed: sample the 1s print rate into the EWMA baseline (also feeds the Rec CSV below).
             var win1s = _book.WindowSince(now.AddSeconds(-1));

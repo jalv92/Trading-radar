@@ -51,6 +51,7 @@ namespace TradingRadar.Engine
         public long LastKnownSize;
         public long PeakSize;
         public NodeState State;
+        public NodeState RawState;  // UNMASKED true state; State is InWindow-masked to Remembered when blind. React reads this by identity through blinks (Break/cockpit keep reading masked State).
         public double Confidence;  // 0..1
         public bool InWindow;      // within the live 10 levels
         public double AgeSeconds;  // since lastSeen
