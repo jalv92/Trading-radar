@@ -43,17 +43,27 @@ namespace TradingRadar.NT
         // Retune once Rec shows typical buy/sell-per-sec magnitudes.
         private const double VelMaxPerSec = 40.0;
         private const double ZGaugeMax = 3.0;   // tape z-score gauge range per spec §6 ("~0..3+, clamp display")
+        // ponytail: display-scale cap for the signed accel bar (net contracts/s²), not an engine threshold
+        // — deterministic per frame, retune from Rec like VelMaxPerSec once typical magnitudes are known.
+        private const double AccelMaxPerSec2 = 20.0;
         private const double Gap = 10;
 
         private ControllerOutput _ctrl;
-        private double _buyPerSec, _sellPerSec, _tapeZ, _bookSkew;
+        private double _buyPerSec, _sellPerSec, _tapeZ, _bookSkew, _tapeAccel;
+        private SetupKind _setup;
+        private ReactBanner _react;
         private bool _has;
 
         public CockpitVisual() { ClipToBounds = true; }
 
-        public void SetFrame(ControllerOutput ctrl, double buyPerSec, double sellPerSec, double tapeZ, double bookSkew)
+        // tapeAccel = signed net-aggressor acceleration (spec §5); setup = active dropdown selection
+        // (spec §9); react = the ReactiveController's banner projection — RadarTab collapses
+        // Watching / Fired+ReactKind / idle -> ReactBanner. Break-setup frames pass react = ReactBanner.Waiting.
+        public void SetFrame(ControllerOutput ctrl, double buyPerSec, double sellPerSec, double tapeZ, double bookSkew,
+                             double tapeAccel, SetupKind setup, ReactBanner react)
         {
             _ctrl = ctrl; _buyPerSec = buyPerSec; _sellPerSec = sellPerSec; _tapeZ = tapeZ; _bookSkew = bookSkew;
+            _tapeAccel = tapeAccel; _setup = setup; _react = react;
             _has = true; InvalidateVisual();
         }
 
@@ -70,13 +80,15 @@ namespace TradingRadar.NT
             y = DrawCountdownCard(dc, x, y, cw, h, pad, dpi);
             y = DrawVelocityCard(dc, x, y, cw, h, pad, dpi);
             y = DrawTapeZCard(dc, x, y, cw, h, pad, dpi);
+            y = DrawTapeAccelCard(dc, x, y, cw, h, pad, dpi);
             y = DrawChopCard(dc, x, y, cw, h, pad, dpi);
             DrawBookSkewStrip(dc, x, y, cw, h, pad, dpi);
         }
 
         // ---- 1. Controller state banner ----
-        private enum BannerKind { SetupLong, SetupShort, Countdown, Armed, Chop, Waiting }
-        private struct BannerState { public BannerKind Kind; public string Text; public Color Color; public double Glow; }
+        // BannerKind now lives in the engine (TradingRadar.Engine.CockpitBanner) so its text/sub mapping
+        // is unit-testable; the struct keeps only the draw-side state (Kind selects the strings + color + glow).
+        private struct BannerState { public BannerKind Kind; public Color Color; public double Glow; }
 
         // Which side (if any) is "live" this frame — shared by the banner (state label) AND the
         // countdown card (which side's Fraction to paint), so they can never disagree: a side latched
@@ -125,42 +137,79 @@ namespace TradingRadar.NT
             ActiveSide a = ResolveActiveSide(c);
             if (!a.Any)
             {
-                if (c.Chop) return new BannerState { Kind = BannerKind.Chop, Text = "CHOP", Color = SlateC, Glow = 0.35 };
-                return new BannerState { Kind = BannerKind.Waiting, Text = "WAITING", Color = SlateC, Glow = 0.15 };
+                if (c.Chop) return new BannerState { Kind = BannerKind.Chop, Color = SlateC, Glow = 0.35 };
+                return new BannerState { Kind = BannerKind.Waiting, Color = SlateC, Glow = 0.15 };
             }
             Color col = a.IsLong ? Bid : Ask;
             if (c.Long == SideState.Fired || c.Short == SideState.Fired)
                 return new BannerState {
-                    Kind = a.IsLong ? BannerKind.SetupLong : BannerKind.SetupShort,
-                    Text = a.IsLong ? "SETUP LONG" : "SETUP SHORT", Color = col, Glow = 1.0 };
+                    Kind = a.IsLong ? BannerKind.SetupLong : BannerKind.SetupShort, Color = col, Glow = 1.0 };
             SideState st = a.IsLong ? c.Long : c.Short;
             return new BannerState {
-                Kind = st == SideState.Countdown ? BannerKind.Countdown : BannerKind.Armed,
-                Text = st == SideState.Countdown ? "COUNTDOWN" : "ARMED", Color = col, Glow = 0.45 };
+                Kind = st == SideState.Countdown ? BannerKind.Countdown : BannerKind.Armed, Color = col, Glow = 0.45 };
         }
 
         private double DrawBannerCard(DrawingContext dc, double x, double y, double cw, double h, double pad, double dpi)
         {
             double bh = 72;
             if (y + bh > h - pad) return y;
-            BannerState bs = ComputeBanner(_ctrl);
-            Brush cardBg = new SolidColorBrush(Color.FromArgb((byte)(22 + 70 * bs.Glow), bs.Color.R, bs.Color.G, bs.Color.B));
+
+            Color col; double glow; string text, sub;
+            if (_setup == SetupKind.Reactive)
+            {
+                CockpitBanner.ReactLabel(_react, out text, out sub);
+                // ponytail: draw-only color/glow (not spec-mandated). REJECT vs BREAK is distinguished by
+                // TEXT, not color — the fade/follow direction is ambiguous from the banner alone (it
+                // depends on which side the wall is on, spec §3). A colored anchor is a later Replay call.
+                switch (_react)
+                {
+                    case ReactBanner.Watching:    col = AmberC; glow = 0.5; break;
+                    case ReactBanner.FiredReject:
+                    case ReactBanner.FiredBreak:  col = AmberC; glow = 1.0; break;
+                    default:                      col = SlateC; glow = 0.15; break;   // ReactBanner.Waiting
+                }
+            }
+            else
+            {
+                BannerState bs = ComputeBanner(_ctrl);
+                col = bs.Color; glow = bs.Glow;
+                CockpitBanner.BreakLabel(bs.Kind, out text, out sub);
+            }
+
+            Brush cardBg = new SolidColorBrush(Color.FromArgb((byte)(22 + 70 * glow), col.R, col.G, col.B));
             dc.DrawRoundedRectangle(cardBg, CardLn, new Rect(x, y, cw, bh), 8, 8);
             Left(dc, "CONTROLLER", x + 12, y + 10, 11, Muted, dpi);
-            Brush txtBr = new SolidColorBrush(Color.FromArgb((byte)(150 + 105 * bs.Glow), bs.Color.R, bs.Color.G, bs.Color.B));
-            dc.DrawText(FT(bs.Text, 26, txtBr, dpi), new Point(x + 14, y + 28));
-            string sub;
-            switch (bs.Kind)
-            {
-                case BannerKind.SetupLong:
-                case BannerKind.SetupShort: sub = "● LATCHED · resets on break cross / fail"; break;
-                case BannerKind.Countdown:  sub = "wall being eaten by trades"; break;
-                case BannerKind.Armed:      sub = "wall intact — waiting for erosion"; break;
-                case BannerKind.Chop:       sub = "slow, alternating tape"; break;
-                default:                    sub = "no dominant wall armed"; break;
-            }
+            Brush txtBr = new SolidColorBrush(Color.FromArgb((byte)(150 + 105 * glow), col.R, col.G, col.B));
+            dc.DrawText(FT(text, 26, txtBr, dpi), new Point(x + 14, y + 28));
             Left(dc, sub, x + 14, y + 56, 10, Muted2, dpi);
             return y + bh + Gap;
+        }
+
+        // ---- 4b. Tape acceleration — signed derivative of the net aggressor rate (spec §5). Renders
+        //          every frame regardless of setup (spec §10). Positive = buyers accelerating (green,
+        //          right of center), negative = sellers accelerating (coral, left). Mirrors the small
+        //          TAPE Z-SCORE card but signed/bipolar like the velocity bar. ----
+        private double DrawTapeAccelCard(DrawingContext dc, double x, double y, double cw, double h, double pad, double dpi)
+        {
+            double ch = 52;
+            if (y + ch > h - pad) return y;
+            dc.DrawRoundedRectangle(CardBg, CardLn, new Rect(x, y, cw, ch), 8, 8);
+            Left(dc, "TAPE ACCEL", x + 12, y + 10, 11, Muted, dpi);
+            double a = _tapeAccel;
+            bool up = a >= 0;
+            string txt = (up ? "+" : "-") + Math.Abs(a).ToString("0.0", CultureInfo.InvariantCulture) + "/s²";
+            RightM(dc, txt, x + cw - 12, y + 6, 15, up ? BidTxt : AskTxt, dpi);
+            double bx = x + 12, by = y + 32, bw = cw - 24, bh2 = 10, cx = bx + bw / 2.0, half = bw / 2.0;
+            dc.DrawRoundedRectangle(Track, CardLn, new Rect(bx, by, bw, bh2), 5, 5);
+            double mag = half * Clamp01(Math.Abs(a) / AccelMaxPerSec2);
+            if (mag > 1)
+            {
+                Color tint = up ? Bid : Ask;
+                double segX = up ? cx : cx - mag;
+                dc.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(170, tint.R, tint.G, tint.B)), null, new Rect(segX, by, mag, bh2), 5, 5);
+            }
+            dc.DrawRectangle(Divider, null, new Rect(cx - 0.5, by - 2, 1, bh2 + 4));
+            return y + ch + Gap;
         }
 
         // ---- 2. Consumption countdown ----

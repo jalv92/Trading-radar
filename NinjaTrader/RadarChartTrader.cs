@@ -160,6 +160,12 @@ namespace TradingRadar.NT
 
         private readonly ComboBox _accountCombo = new ComboBox { Margin = new Thickness(0, 0, 6, 0) };
         private SelectionChangedEventHandler _accountSelectionHandler;   // see PopulateAccounts
+        // Setup selector (spec §9) — "Break" (frozen) vs "React" (reactive dual-outcome). Styled like
+        // _accountCombo. Stored handler for symmetry with the account combo's detach pattern.
+        private readonly ComboBox _setupCombo = new ComboBox { Margin = new Thickness(0, 5, 10, 0) };
+        private SelectionChangedEventHandler _setupSelectionHandler;
+        // Raised on SelectionChanged; RadarTab subscribes and swaps the active controller under _engineLock (§9).
+        public event Action<SetupKind> SetupChanged;
         private readonly CheckBox _armChk = new CheckBox { Content = "ARM LIVE", Visibility = Visibility.Collapsed,
             Foreground = Coral, FontFamily = new FontFamily("Segoe UI"), FontSize = 11,
             VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 2, 6, 0) };
@@ -272,6 +278,22 @@ namespace TradingRadar.NT
             // ItemsSource reassignment blip — see PopulateAccounts.
             _accountSelectionHandler = (o, e) => OnAccountSelected();
             _accountCombo.SelectionChanged += _accountSelectionHandler;
+
+            // Setup selector (spec §9) — styling mirrors the account combo (dark Ink bg, TextCol fg,
+            // stretched). String items + one index->enum line; index 0 = Break (the frozen default).
+            _setupCombo.Background = Ink;
+            _setupCombo.Foreground = TextCol;
+            _setupCombo.HorizontalAlignment = HorizontalAlignment.Stretch;
+            _setupCombo.Items.Add("Break");
+            _setupCombo.Items.Add("React");
+            _setupCombo.SelectedIndex = 0;
+            _setupSelectionHandler = (o, e) =>
+            {
+                SetupKind kind = _setupCombo.SelectedIndex == 1 ? SetupKind.Reactive : SetupKind.Break;
+                Action<SetupKind> h = SetupChanged;
+                if (h != null) h(kind);
+            };
+            _setupCombo.SelectionChanged += _setupSelectionHandler;
             _armChk.Checked   += (o, e) => { _armedFor = _account; RefreshArmUi(); };
             _armChk.Unchecked += (o, e) => { _armedFor = null; RefreshArmUi(); };
             _autoChk.Checked   += (o, e) => { if (!_suppressAutoChkEvent) TryArmAuto(); };
@@ -429,8 +451,12 @@ namespace TradingRadar.NT
                 // the ATM row's right slot, which the daily-cap box now occupies).
                 var autoGroup = new WrapPanel { VerticalAlignment = VerticalAlignment.Center,
                     Margin = new Thickness(0, 5, 0, 0), Children = { _autoChk, _autoStatusText } };
-                Grid.SetColumn(autoGroup, 0); Grid.SetRow(autoGroup, 3); Grid.SetColumnSpan(autoGroup, 2);
+                Grid.SetColumn(autoGroup, 0); Grid.SetRow(autoGroup, 3);   // col0 only now — _setupCombo fills col1/row3
                 grid.Children.Add(autoGroup);
+                // Setup selector fills the empty col1/row3 slot beside AUTO (spec §9), mirroring the
+                // account combo's styling (set in the ctor above).
+                Grid.SetColumn(_setupCombo, 1); Grid.SetRow(_setupCombo, 3);
+                grid.Children.Add(_setupCombo);
 
                 var armWrap = new WrapPanel { Margin = new Thickness(8, 4, 8, 4),
                     Children = { _armChk, _warnText } };
@@ -670,25 +696,40 @@ namespace TradingRadar.NT
             if (f.Time == _lastFireTime) return;
             _lastFireTime = f.Time;
 
-            bool isBuy = f.Side == Side.Ask;   // ask wall above consumed by buys -> long break; bid wall below -> short
+            FireRouting route = ReactiveExecution.Route(f);   // §3 side + §8 MKT-vs-LMT + auto-aggressive
             double tick = EffectiveTick();
-            double tol = tick * SetupJoinToleranceTicks;
-            double price;
-            if (_lastPrice <= 0)
-                price = f.WallPrice;   // stale/no inside context yet — human re-checks the ticket before clicking anyway
-            else if (isBuy)
-                price = Math.Min(_lastPrice + tick + tol, f.WallPrice);    // never above the wall (would be marketable below it)
-            else
-                price = Math.Max(_lastPrice - tick - tol, f.WallPrice);    // never below the wall
 
-            _pendingSetup = new PendingSetup { IsBuy = isBuy, Price = RoundToTick(price, tick) };
-            ApplyPendingSetupUi();
-            // Logged unconditionally (armed or not) — round-3's blind spot was never knowing whether an
-            // engine fire even reached this layer. CSV-only: no Output spam for a routine, frequent event.
-            LogAuto("prestage", isBuy ? "Buy" : "Sell", _pendingSetup.Price, _lastPrice,
-                string.Format(System.Globalization.CultureInfo.InvariantCulture,
-                    "wall {0:0.00}, fraction {1:0.00}.", f.WallPrice, f.Fraction));
-            TryAutoFire(f, isBuy, tick);   // AUTO mode (2026-07-01) — guards 1-4, evaluated after the pre-stage above is stored
+            if (route.Marketable)
+            {
+                // Reactive REJECT (fade) — a marketable chase; no resting LMT to pre-stage. Drop any stale
+                // LMT pre-stage so its glow/indicator don't misrepresent this fire; the AUTO path submits MKT.
+                ClearPendingSetup();
+                LogAuto("prestage", route.IsBuy ? "Buy" : "Sell", _lastPrice, _lastPrice,
+                    string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "REACT reject — marketable fade, wall {0:0.00}.", f.WallPrice));
+            }
+            else
+            {
+                // Break setup OR reactive BREAK (follow) — wall-anchored LMT pre-stage, exactly as the
+                // shipped Break path: join-near-inside the wall, never past it (would be marketable on the
+                // near side). isBuy comes from Route (identical to the old f.Side==Side.Ask for Break).
+                double tol = tick * SetupJoinToleranceTicks;
+                double price;
+                if (_lastPrice <= 0)
+                    price = f.WallPrice;   // stale/no inside context yet — human re-checks the ticket before clicking anyway
+                else if (route.IsBuy)
+                    price = Math.Min(_lastPrice + tick + tol, f.WallPrice);    // never above the wall (would be marketable below it)
+                else
+                    price = Math.Max(_lastPrice - tick - tol, f.WallPrice);    // never below the wall
+                _pendingSetup = new PendingSetup { IsBuy = route.IsBuy, Price = RoundToTick(price, tick) };
+                ApplyPendingSetupUi();
+                // Logged unconditionally (armed or not) — round-3's blind spot was never knowing whether an
+                // engine fire even reached this layer. CSV-only: no Output spam for a routine, frequent event.
+                LogAuto("prestage", route.IsBuy ? "Buy" : "Sell", _pendingSetup.Price, _lastPrice,
+                    string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "wall {0:0.00}, fraction {1:0.00}.", f.WallPrice, f.Fraction));
+            }
+            TryAutoFire(f, route, tick);   // AUTO path — guards 1-5, auto-aggressive honored inside
         }
 
         // ---- AUTO mode (2026-07-01, Sim/Playback only) ----
@@ -698,10 +739,14 @@ namespace TradingRadar.NT
         // order path, no new NT8 Account/Order API. Each skip below Diag's and leaves the pre-stage lit
         // for manual use (only the daily-cap skip also force-disarms).
         // `tick` is passed in from OnSetupFire's own EffectiveTick() call — same fire event, same tick.
-        private void TryAutoFire(FireEvent f, bool isBuy, double tick)
+        private void TryAutoFire(FireEvent f, FireRouting route, double tick)
         {
-            string side = isBuy ? "Buy" : "Sell";
-            if (!_autoArmed)                                              // guard 1a — was a silent return; the #1 blind spot of round-3
+            string side = route.IsBuy ? "Buy" : "Sell";
+            // guard 1a: the AUTO checkbox must be armed — UNLESS this is an auto-aggressive reactive fire,
+            // which fires regardless of the checkbox (spec §8). Every hard gate below (Sim 1b, hours 1c,
+            // busy 2, daily cap 3, stale 4, ATM 5) still applies unchanged; auto-aggressive waives ONLY
+            // the manual arm toggle — it can NEVER reach a non-Sim account (guard 1b, structural).
+            if (!_autoArmed && !route.AutoAggressive)                     // guard 1a
             {
                 DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — not armed at fire time.");
                 return;
@@ -768,15 +813,27 @@ namespace TradingRadar.NT
             // marketableThrough is false by construction; this only catches _lastPrice<=0 (no context yet).
             // F18's actual click-time re-clamp is for the MANUAL path and is still unimplemented — required
             // before any real-account port (see docs/plans/2026-06-30-chart-trader.md).
-            bool marketableThrough = isBuy
-                ? _pendingSetup.Price - _lastPrice > AutoStaleTicks * tick
-                : _lastPrice - _pendingSetup.Price > AutoStaleTicks * tick;
-            if (_lastPrice <= 0 || marketableThrough)
+            // guard 4: degenerate/stale-quote guard. The no-context (_lastPrice<=0) case trips for BOTH
+            // branches; the marketable-through check is LMT-only — a reactive REJECT is INTENTIONALLY
+            // marketable (its pre-stage was cleared in OnSetupFire, so _pendingSetup is null here), so it
+            // must neither be skipped for being marketable nor dereference the null pre-stage.
+            if (_lastPrice <= 0)
             {
-                DiagAuto("guard_skip", side, _pendingSetup.Price, _lastPrice,
-                    string.Format(System.Globalization.CultureInfo.InvariantCulture,
-                        "AUTO skip — stale at fire (setup {0:0.00} vs mid {1:0.00}).", _pendingSetup.Price, _lastPrice));
+                DiagAuto("guard_skip", side, _lastPrice, _lastPrice, "AUTO skip — no price context at fire.");
                 return;
+            }
+            if (!route.Marketable)
+            {
+                bool marketableThrough = route.IsBuy
+                    ? _pendingSetup.Price - _lastPrice > AutoStaleTicks * tick
+                    : _lastPrice - _pendingSetup.Price > AutoStaleTicks * tick;
+                if (marketableThrough)
+                {
+                    DiagAuto("guard_skip", side, _pendingSetup.Price, _lastPrice,
+                        string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                            "AUTO skip — stale at fire (setup {0:0.00} vs mid {1:0.00}).", _pendingSetup.Price, _lastPrice));
+                    return;
+                }
             }
 
             // guard 5 (F20): the ATM template must still be selected at the actual fire moment, not just
@@ -791,7 +848,14 @@ namespace TradingRadar.NT
             }
 
             _autoFireCount++;                                            // all clear — fire
-            SubmitLimit(isBuy, isAuto: true);   // the "submit" log row (order id/qty/price) is written from SubmitRaw once the order exists
+            if (route.Marketable)
+                // Reactive REJECT — marketable chase. isEntry:true attaches the picked ATM bracket (same
+                // as SubmitLimit); isAuto:true seeds _autoOrder so exit-leg telemetry + the one-trade busy
+                // guard still see it. guard 5 + SubmitRaw's naked-auto abort keep it ATM-gated.
+                SubmitRaw(route.IsBuy ? OrderAction.Buy : OrderAction.Sell, OrderType.Market, GetQty(), 0,
+                    route.IsBuy ? "Buy" : "Sell", isEntry: true, isAuto: true);
+            else
+                SubmitLimit(route.IsBuy, isAuto: true);   // Break setup + reactive BREAK — wall-anchored LMT; "submit" log row written from SubmitRaw
         }
 
         // Auto-cancel of an unfilled AUTO-submitted limit — never a manual one (reference-checked against

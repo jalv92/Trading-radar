@@ -41,6 +41,12 @@ namespace TradingRadar.NT
             // Task 11: vote-less book-skew context (PressureModel.BookSkewContext) — the demoted
             // successor of the old Net% meter, rendered as a thin reference strip, never a trigger.
             public double BookSkew;
+            // Reactive setup (spec §5/§9/§10): signed accel readout + the active dropdown selection + the
+            // collapsed ReactiveController banner projection — all computed under _engineLock, painted by
+            // the tick. Break-active frames carry Setup=Break and Banner=Waiting (the cockpit ignores it).
+            public double TapeAccel;
+            public SetupKind Setup;
+            public ReactBanner Banner;
         }
 
         private readonly RadarConfig _cfg = new RadarConfig();   // NQ defaults; later: per-instrument presets
@@ -48,6 +54,12 @@ namespace TradingRadar.NT
         private WallTracker _tracker;
         private TapeSpeed   _tape;
         private ControllerStateMachine _controller;
+        private ReactiveController _reactive;    // spec §4: the swappable second setup (isolated from frozen Break)
+        private TapeAcceleration _accel;         // spec §5: signed net-aggressor acceleration
+        // The user's dropdown choice (RadarChartTrader.SetupChanged). NOT reset on instrument-switch /
+        // replay-reset — that is the "re-apply the selection" contract (spec §4/§9): those sites rebuild
+        // BOTH controllers but leave this field alone, so a switch can't silently revert to Break.
+        private SetupKind _activeSetup = SetupKind.Break;
         // Previous engine run's ControllerOutput — read (never written) BEFORE calling _controller.Update()
         // this run, to decide the ARMED-WALL IDENTITY CONTRACT feed below. Default(Waiting/Waiting) on the
         // very first run correctly falls through to "feed the freshly computed dominant wall".
@@ -121,7 +133,9 @@ namespace TradingRadar.NT
             _book    = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
             _tracker = new WallTracker(_cfg);
             _tape       = new TapeSpeed(0.1);
+            _accel      = new TapeAcceleration(0.1);   // mirror TapeSpeed's alpha/warmup (spec §5)
             _controller = new ControllerStateMachine(InstrumentPresets.For("ES").Controller, _cfg.TickSize);
+            _reactive   = new ReactiveController(new ReactiveConfig(), _cfg.TickSize);   // ponytail: no per-instrument React preset yet — ReactiveConfig defaults (uncalibrated) until React is calibrated
             _visual  = new RadarVisual();
             _cockpit = new CockpitVisual();
 
@@ -218,6 +232,7 @@ namespace TradingRadar.NT
             root.Children.Add(topBar);
             // Right column: Cockpit fills, Chart Trader docked at the bottom (spec §8).
             _chartTrader = new RadarChartTrader();
+            _chartTrader.SetupChanged += OnSetupChanged;   // spec §9: swap the active controller on dropdown change
             Grid rightCol = new Grid();
             rightCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1.0, GridUnitType.Star) });
             // Auto, not a fixed height: the ticket's rows are all Auto-sized, so this row measures to
@@ -255,7 +270,8 @@ namespace TradingRadar.NT
                 if (f != null)
                 {
                     _visual.SetFrame(f.Nodes, f.Bids, f.Asks, f.Mid, f.Tick);
-                    _cockpit.SetFrame(f.Ctrl, f.BuyPerSec, f.SellPerSec, f.TapeZ, f.BookSkew);
+                    _cockpit.SetFrame(f.Ctrl, f.BuyPerSec, f.SellPerSec, f.TapeZ, f.BookSkew,
+                                      f.TapeAccel, f.Setup, f.Banner);   // spec §5/§9/§10 (reactive accel + banner)
                     // reuse the already-marshaled book mid + biggest-wall prices for live PnL + LMT anchoring;
                     // f.Now is the REPLAY-aware market clock AUTO mode's auto-cancel timer ages against.
                     _chartTrader.SetContext(f.Mid, f.WallAbove, f.WallBelow, f.Tick, f.Now);
@@ -304,6 +320,54 @@ namespace TradingRadar.NT
             Instrument = _selector.Instrument;
         }
 
+        // Dropdown (RadarChartTrader.SetupChanged) picked a different setup. Swap under _engineLock — the
+        // same lock the depth/trade handlers hold around _controller/_reactive.Update — so no engine run
+        // straddles the swap. Rebuild only the setup being switched TO (fresh per-run state); leave the
+        // other frozen (selecting React must not reset Break's in-calibration state machine). Reset
+        // _lastCtrl: its identity-pinned wall feed (ResolveWallFeed) belonged to the outgoing setup.
+        private void OnSetupChanged(SetupKind kind)
+        {
+            lock (_engineLock)
+            {
+                _activeSetup = kind;
+                var preset = InstrumentPresets.For(_instrument != null ? _instrument.MasterInstrument.Name : "ES");
+                if (kind == SetupKind.Reactive) _reactive   = new ReactiveController(new ReactiveConfig(), _cfg.TickSize);
+                else                            _controller = new ControllerStateMachine(preset.Controller, _cfg.TickSize);
+                _lastCtrl = default(ControllerOutput);
+            }
+        }
+
+        // Collapse the ReactiveController's (state, ReactKind) into the 4-label banner projection the
+        // cockpit renders (spec §10). Called under _engineLock (reads _reactive.State + cout.Fire, both
+        // freshly produced by this frame's _reactive.Update). Break-active frames pass ReactBanner.Waiting.
+        private ReactBanner CurrentReactBanner(ControllerOutput cout)
+        {
+            switch (_reactive.State)
+            {
+                case ReactState.Watching: return ReactBanner.Watching;
+                case ReactState.Fired:    return cout.Fire.React == ReactKind.Reject ? ReactBanner.FiredReject : ReactBanner.FiredBreak;
+                default:                  return ReactBanner.Waiting;   // Waiting / Cooldown
+            }
+        }
+
+        // Map the surfaced RadarNode.State (LiquidityMemory's applied episode outcome) to the per-side
+        // (Outcome, valid) pair ReactiveController reads (spec §7 / plan §0-R3). Valid=false for any
+        // non-terminal state (Live/Wall/Remembered) — that is "no resolved episode this side", which
+        // guards the phantom default(Outcome)==Absorbed. NOTE (ceiling, D-4 step 10): a CONSUMED wall
+        // that blinks out of the MBP window the same tick it resolves surfaces as Remembered (see
+        // LiquidityMemory.Snapshot masking blind->Remembered), so BREAK is caught only while the eaten
+        // level is still InWindow at resolution — the documented follow-up for the cluster-B upstream.
+        private static void MapOutcome(NodeState st, out Outcome outcome, out bool valid)
+        {
+            switch (st)
+            {
+                case NodeState.Absorbed: outcome = Outcome.Absorbed; valid = true; break;
+                case NodeState.Consumed: outcome = Outcome.Consumed; valid = true; break;
+                case NodeState.Pulled:   outcome = Outcome.Pulled;   valid = true; break;
+                default:                 outcome = Outcome.Absorbed; valid = false; break;   // Live/Wall/Remembered — no resolved episode
+            }
+        }
+
         // IInstrumentProvider — re-subscribe on instrument change (link-aware).
         public Instrument Instrument
         {
@@ -333,7 +397,9 @@ namespace TradingRadar.NT
                     _book       = new BookMirror(_cfg.TickSize, TimeSpan.FromSeconds(30));
                     _tracker    = new WallTracker(_cfg);
                     _tape       = new TapeSpeed(0.1);
+                    _accel      = new TapeAcceleration(0.1);                                   // new instrument = fresh accel EWMA
                     _controller = new ControllerStateMachine(preset.Controller, _cfg.TickSize);
+                    _reactive   = new ReactiveController(new ReactiveConfig(), _cfg.TickSize); // rebuild both; _activeSetup (the selection) is deliberately untouched — that IS the re-apply
                     _pressure   = new PressureModel(preset.Pressure);
                     _lastCtrl   = default(ControllerOutput);
                     _latest  = null;
@@ -554,6 +620,9 @@ namespace TradingRadar.NT
             // Biggest wall above/below mid this run — anchors the Chart Trader's BUY/SELL LMT (§2).
             double wallAbovePx = 0, wallBelowPx = 0;
             long   wallAboveSz = 0, wallBelowSz = 0;
+            // Reactive setup (spec §7 / plan §0-R3): the dominant wall's surfaced episode state per side,
+            // captured on the SAME InWindow-dominant node Break uses, mapped to (Outcome, valid) below.
+            NodeState wallAboveState = NodeState.Live, wallBelowState = NodeState.Live;
             for (int i = 0; i < snapNodes.Count; i++)
             {
                 RadarNode wn = snapNodes[i];
@@ -562,8 +631,8 @@ namespace TradingRadar.NT
                 // already-armed candidate tracking ITS wall through a blink is a different job, handled
                 // below via ResolveWallFeed/SizeAtPrice/WallTracker.TrustedSize, not here.
                 if (!wn.InWindow) continue;   // blind/remembered node — frozen size, must not count as a live dominant wall
-                if (wn.Price > pMid && wn.LastKnownSize > wallAboveSz) { wallAboveSz = wn.LastKnownSize; wallAbovePx = wn.Price; }
-                if (wn.Price < pMid && wn.LastKnownSize > wallBelowSz) { wallBelowSz = wn.LastKnownSize; wallBelowPx = wn.Price; }
+                if (wn.Price > pMid && wn.LastKnownSize > wallAboveSz) { wallAboveSz = wn.LastKnownSize; wallAbovePx = wn.Price; wallAboveState = wn.State; }
+                if (wn.Price < pMid && wn.LastKnownSize > wallBelowSz) { wallBelowSz = wn.LastKnownSize; wallBelowPx = wn.Price; wallBelowState = wn.State; }
             }
 
             // ARMED-WALL IDENTITY CONTRACT: the Controller's wall-identity guard abandons Armed/Countdown
@@ -582,7 +651,17 @@ namespace TradingRadar.NT
             // Tape speed: sample the 1s print rate into the EWMA baseline (also feeds the Rec CSV below).
             var win1s = _book.WindowSince(now.AddSeconds(-1));
             _tape.Sample(win1s.Prints, now);
+            // Spec §5 / plan §0-R4: signed net-aggressor acceleration. netRate = (BuyVol - SellVol) over
+            // the SAME 1s window TapeSpeed uses => already per-second; TapeAcceleration takes the
+            // frame-to-frame derivative. Sign arms the reactive wall on that side (+=buyers, -=sellers).
+            _accel.Sample(win1s.BuyVol - win1s.SellVol, now);
 
+            // Reactive setup (spec §7 / plan §0-R3): map the dominant wall's surfaced state per side into
+            // the (Outcome, valid) pair ReactiveController reads — valid=false for a non-terminal state
+            // so a warmup frame can't phantom-fire a fade.
+            Outcome waOut, wbOut; bool waValid, wbValid;
+            MapOutcome(wallAboveState, out waOut, out waValid);
+            MapOutcome(wallBelowState, out wbOut, out wbValid);
             ControllerInputs cin = new ControllerInputs
             {
                 WallAbovePrice = ctrlWallAbovePx, WallAboveCurrent = ctrlWallAboveSz,
@@ -591,9 +670,17 @@ namespace TradingRadar.NT
                 TapeZScore = _tape.ZScore,
                 TapeAlternations = _book.RecentAlternations(8),
                 Mid = pMid, Now = now, Book = _book,
-                AdaptiveSignificance = _depthBase.P85
+                AdaptiveSignificance = _depthBase.P85,
+                TapeAccel = _accel.Acceleration,                            // spec §5 (cluster A read)
+                WallAboveOutcome = waOut, WallAboveOutcomeValid = waValid,   // spec §7 (per-side, valid-gated)
+                WallBelowOutcome = wbOut, WallBelowOutcomeValid = wbValid
             };
-            ControllerOutput cout = _controller.Update(cin);
+            // spec §4: exactly ONE active controller is Update()-ed per frame; both consume the identical
+            // cin bundle. When React is active _controller is not stepped (Break state frozen), and vice
+            // versa. The fire latch below is Kind-agnostic — a reactive fire carries SetupKind.Reactive.
+            ControllerOutput cout = _activeSetup == SetupKind.Reactive
+                ? _reactive.Update(cin)
+                : _controller.Update(cin);
             // Round-8: LATCH the fire immediately (still inside the caller's _engineLock). Overwrite
             // latest-wins if a prior pending fire wasn't consumed yet by the paint tick — this is the
             // rare/anomalous case (paint tick starved far longer than one engine run) and gets counted,
@@ -647,7 +734,8 @@ namespace TradingRadar.NT
                 WallBelow = wallBelowPx,
                 Ctrl = cout, Fired = cout.Fired, Fire = cout.Fire,
                 BuyPerSec = win1s.BuyVol, SellPerSec = win1s.SellVol, TapeZ = _tape.ZScore,
-                BookSkew = bookSkew
+                BookSkew = bookSkew,
+                TapeAccel = _accel.Acceleration, Setup = _activeSetup, Banner = CurrentReactBanner(cout)   // spec §5/§9/§10
             };
             MaybeDiag(now);
             if (_capture && _capWriter != null)
@@ -901,12 +989,14 @@ namespace TradingRadar.NT
             // A rewind must not leave stale EWMA/state-machine memory: a Countdown armed against the
             // pre-rewind tape would otherwise survive into replayed history it never actually saw.
             _tape       = new TapeSpeed(0.1);
+            _accel      = new TapeAcceleration(0.1);   // rewound history must not inherit the pre-rewind accel EWMA
             // Same instrument as before the reset — recompute its preset rather than assuming ES, so a
             // replay reset on NQ doesn't silently drop back to ES's ControllerConfig. _pressure is left
             // alone: PressureConfig doesn't change on a same-instrument reset (only _controller carries
             // reset-sensitive per-run state).
             var resetPreset = InstrumentPresets.For(_instrument != null ? _instrument.MasterInstrument.Name : "ES");
             _controller = new ControllerStateMachine(resetPreset.Controller, _cfg.TickSize);
+            _reactive   = new ReactiveController(new ReactiveConfig(), _cfg.TickSize);   // rebuild both; _activeSetup preserved (re-apply)
             _lastCtrl   = default(ControllerOutput);
             _lastDiag   = DateTime.MinValue;
             _lastMidLog = DateTime.MinValue;
