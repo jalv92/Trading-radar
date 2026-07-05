@@ -1248,7 +1248,10 @@ namespace TradingRadar.NT
                             (string)autoEl.Attribute("hoursFlat"),
                             (string)autoEl.Attribute("fireDay"),
                             (int?)autoEl.Attribute("fireCount") ?? 0,
-                            (int?)autoEl.Attribute("cap") ?? 0);
+                            (int?)autoEl.Attribute("cap") ?? 0,
+                            (string)autoEl.Attribute("lossLimit"),
+                            (string)autoEl.Attribute("profitLimit"),
+                            (bool?)autoEl.Attribute("moneyMgmt") ?? true);
                     }
                     catch (Exception ex)
                     {
@@ -1279,7 +1282,10 @@ namespace TradingRadar.NT
                     new XAttribute("hoursFlat", _chartTrader.HoursFlatText),
                     new XAttribute("fireDay", _chartTrader.AutoFireDayText),
                     new XAttribute("fireCount", _chartTrader.AutoFireCount),
-                    new XAttribute("cap", _chartTrader.AutoCap)));
+                    new XAttribute("cap", _chartTrader.AutoCap),
+                    new XAttribute("lossLimit", _chartTrader.LossLimitText ?? string.Empty),
+                    new XAttribute("profitLimit", _chartTrader.ProfitLimitText ?? string.Empty),
+                    new XAttribute("moneyMgmt", _chartTrader.MoneyMgmtEnabled)));
         }
     }
 }

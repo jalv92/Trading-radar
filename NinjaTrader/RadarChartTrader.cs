@@ -156,6 +156,16 @@ namespace TradingRadar.NT
         private Order _autoOrder;                // the one working limit this control auto-submitted (null = none)
         private DateTime _autoSubmittedAt;        // replay time of that auto-submit, for the auto-cancel timeout
 
+        // Daily P&L kill-switch (2026-07-05): a hard stop on the day's NET P&L (account realized since
+        // day-start + open unrealized — the same figure NinjaTrader shows as daily P&L). When it crosses the
+        // Loss or Profit limit, flatten (orphan-free, ATM + non-ATM) and lock AUTO out for the rest of the
+        // replay day. Independent of the Cap/day trade limit — whichever trips first stops. All three reset on
+        // a new replay day / a replay rewind (OnReplayReset), same discipline as _autoFireDay above.
+        private DateTime _dailyPnlDay = DateTime.MinValue;   // replay date the realized baseline below is keyed to
+        private double _dailyPnlBaseline;                    // account realized P&L captured at the start of _dailyPnlDay
+        private bool _dailyLimitLocked;                      // true once a limit is hit today — blocks re-arm + fires until reset
+        private DateTime _dailyKillAt = DateTime.MinValue;   // replay time of the last kill-flatten attempt (retry throttle — see CheckDailyPnlLimit)
+
         // ---- always-armed AUTO (2026-07-03, verdict doc item 6) ----
         // _autoIntent is the USER's persisted decision to run AUTO — distinct from the live _autoArmed
         // flag, which a fail-closed guard can drop at any moment (non-Sim, ATM->None, daily cap, 16:00
@@ -216,6 +226,22 @@ namespace TradingRadar.NT
         private readonly TextBox _autoCapBox = new TextBox { Text = "10", Width = 40, Height = 22, FontSize = 11,
             TextAlignment = TextAlignment.Center, Background = Ink, Foreground = TextCol, BorderBrush = BorderBr,
             VerticalContentAlignment = VerticalAlignment.Center };
+        // Money Management (2026-07-05): master checkbox that gates the daily Loss/Profit USD kill-switch
+        // (CheckDailyPnlLimit). On by default (preserves the pre-checkbox behaviour); unchecked disables the
+        // kill and greys the two amount boxes. FontSize 12 to match the Qty/Strategy labels — the old 11 read
+        // smaller than the rest of the ticket.
+        private readonly CheckBox _moneyMgmtChk = new CheckBox { Content = "Money Management", IsChecked = true,
+            Foreground = Muted, FontFamily = new FontFamily("Segoe UI"), FontSize = 12,
+            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 10, 0) };
+        // Daily P&L limits in USD — loss/profit hard stops, late-parsed like the cap box. 0/blank = that side
+        // disabled. Defaults 2000 loss / 3100 profit (user-set). Boxes stretch to fill their star column (the
+        // row spans the full ticket width) and match the Qty box's font, not the old small 11.
+        private readonly TextBox _lossLimitBox = new TextBox { Text = "2000", MinWidth = 70, Height = 28, FontSize = 14,
+            TextAlignment = TextAlignment.Center, Background = Ink, Foreground = TextCol, BorderBrush = BorderBr,
+            HorizontalAlignment = HorizontalAlignment.Stretch, VerticalContentAlignment = VerticalAlignment.Center };
+        private readonly TextBox _profitLimitBox = new TextBox { Text = "3100", MinWidth = 70, Height = 28, FontSize = 14,
+            TextAlignment = TextAlignment.Center, Background = Ink, Foreground = TextCol, BorderBrush = BorderBr,
+            HorizontalAlignment = HorizontalAlignment.Stretch, VerticalContentAlignment = VerticalAlignment.Center };
         // Trading-hours schedule for AUTO (2026-07-03): fires allowed only inside [start, end]; any
         // open position / working limit force-flattened once per day at the flat time. All three times
         // are judged against the REPLAY-aware clock (_now / FireEvent.Time) — i.e. the platform/feed
@@ -439,18 +465,29 @@ namespace TradingRadar.NT
                 var grid = new Grid { Margin = new Thickness(8, 4, 8, 0) };
                 grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
                 grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                for (int r = 0; r < 6; r++) grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
                 Grid.SetColumn(_accountCombo, 0); Grid.SetRow(_accountCombo, 0); grid.Children.Add(_accountCombo);
                 Grid.SetColumn(qtyGroup, 1);      Grid.SetRow(qtyGroup, 0);      grid.Children.Add(qtyGroup);
                 Grid.SetColumn(atmRow, 0);        Grid.SetRow(atmRow, 1);        grid.Children.Add(atmRow);
                 Grid.SetColumn(capGroup, 1);      Grid.SetRow(capGroup, 1);      grid.Children.Add(capGroup);
 
-                // Trading-hours row — directly under the ATM/AUTO row, spanning both columns and
-                // stretching edge to edge: labels take their natural width, the three time boxes each
-                // fill a star column so the line covers the ticket's full width.
+                // Strategy (setup) selector — moved below ATM (2026-07-05) with a "Strategy" label so a
+                // user who doesn't know the tool reads it as a labeled dropdown, right-edge aligned with the
+                // ATM/account combos (same col0 + 10px right margin), not a bare box beside AUTO.
+                var stratLbl = new TextBlock { Text = "Strategy", Margin = new Thickness(0, 0, 6, 0),
+                    VerticalAlignment = VerticalAlignment.Center, FontFamily = new FontFamily("Segoe UI"),
+                    FontSize = 11, Foreground = Muted };
+                DockPanel.SetDock(stratLbl, Dock.Left);
+                _setupCombo.Margin = new Thickness(0);            // the row's own right margin aligns the combo's right edge with ATM/account
+                _setupCombo.HorizontalAlignment = HorizontalAlignment.Stretch;
+                var stratRow = new DockPanel { Margin = new Thickness(0, 6, 10, 0) };
+                stratRow.Children.Add(stratLbl);
+                stratRow.Children.Add(_setupCombo);
+                Grid.SetColumn(stratRow, 0); Grid.SetRow(stratRow, 2); grid.Children.Add(stratRow);
+
+                // Trading-hours row — under the Strategy row, spanning both columns and stretching edge to
+                // edge: labels take their natural width, the three time boxes each fill a star column so the
+                // line covers the ticket's full width.
                 var hoursRow = new Grid { Margin = new Thickness(0, 5, 0, 0) };
                 for (int c = 0; c < 6; c++)
                     hoursRow.ColumnDefinitions.Add(new ColumnDefinition {
@@ -465,19 +502,50 @@ namespace TradingRadar.NT
                 Grid.SetColumn(_hoursEndBox, 3);   hoursRow.Children.Add(_hoursEndBox);
                 Grid.SetColumn(flatLbl, 4);        hoursRow.Children.Add(flatLbl);
                 Grid.SetColumn(_hoursFlatBox, 5);  hoursRow.Children.Add(_hoursFlatBox);
-                Grid.SetColumn(hoursRow, 0); Grid.SetRow(hoursRow, 2); Grid.SetColumnSpan(hoursRow, 2);
+                Grid.SetColumn(hoursRow, 0); Grid.SetRow(hoursRow, 3); Grid.SetColumnSpan(hoursRow, 2);
                 grid.Children.Add(hoursRow);
 
-                // AUTO toggle + status — own full-width row directly below HOURS (moved 2026-07-03 from
-                // the ATM row's right slot, which the daily-cap box now occupies).
+                // Money Management row (2026-07-05) — full-width, spans both columns and mirrors the HOURS row
+                // above: a master checkbox up front gates the daily Loss/Profit kill-switch (CheckDailyPnlLimit),
+                // and the two amount boxes each fill a star column so the line covers the ticket edge to edge
+                // instead of sitting dispersed at the two ends. Fonts match the Qty/Strategy controls (12/14).
+                var mmRow = new Grid { Margin = new Thickness(0, 6, 0, 0) };
+                mmRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });                     // Money Management checkbox
+                mmRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });                     // "Loss $"
+                mmRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); // loss box (fills)
+                mmRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });                     // "Profit $"
+                mmRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); // profit box (fills)
+                var lossLbl = new TextBlock { Text = "Loss $", Margin = new Thickness(14, 0, 6, 0),
+                    VerticalAlignment = VerticalAlignment.Center, FontFamily = new FontFamily("Segoe UI"),
+                    FontSize = 12, Foreground = Muted };
+                var profitLbl = new TextBlock { Text = "Profit $", Margin = new Thickness(12, 0, 6, 0),
+                    VerticalAlignment = VerticalAlignment.Center, FontFamily = new FontFamily("Segoe UI"),
+                    FontSize = 12, Foreground = Muted };
+                Action commitLoss   = () => { _lossLimitBox.Text   = GetLossLimit().ToString("0", System.Globalization.CultureInfo.InvariantCulture); };
+                Action commitProfit = () => { _profitLimitBox.Text = GetProfitLimit().ToString("0", System.Globalization.CultureInfo.InvariantCulture); };
+                _lossLimitBox.LostFocus   += (o, e) => commitLoss();
+                _lossLimitBox.KeyDown     += (o, e) => { if (e.Key == Key.Enter) commitLoss(); };
+                _profitLimitBox.LostFocus += (o, e) => commitProfit();
+                _profitLimitBox.KeyDown   += (o, e) => { if (e.Key == Key.Enter) commitProfit(); };
+                // Master toggle greys the amount boxes when off, so the disabled kill-switch reads at a glance.
+                Action applyMmEnabled = () => { bool on = _moneyMgmtChk.IsChecked == true; _lossLimitBox.IsEnabled = on; _profitLimitBox.IsEnabled = on; };
+                _moneyMgmtChk.Checked   += (o, e) => applyMmEnabled();
+                _moneyMgmtChk.Unchecked += (o, e) => applyMmEnabled();
+                applyMmEnabled();
+                Grid.SetColumn(_moneyMgmtChk, 0); mmRow.Children.Add(_moneyMgmtChk);
+                Grid.SetColumn(lossLbl, 1);        mmRow.Children.Add(lossLbl);
+                Grid.SetColumn(_lossLimitBox, 2);  mmRow.Children.Add(_lossLimitBox);
+                Grid.SetColumn(profitLbl, 3);      mmRow.Children.Add(profitLbl);
+                Grid.SetColumn(_profitLimitBox, 4); mmRow.Children.Add(_profitLimitBox);
+                Grid.SetColumn(mmRow, 0); Grid.SetRow(mmRow, 4); Grid.SetColumnSpan(mmRow, 2);
+                grid.Children.Add(mmRow);
+
+                // AUTO toggle + status — own full-width row, dropped one line (2026-07-05) so the daily-limit
+                // row can take its old slot directly under HOURS.
                 var autoGroup = new WrapPanel { VerticalAlignment = VerticalAlignment.Center,
                     Margin = new Thickness(0, 5, 0, 0), Children = { _autoChk, _autoStatusText } };
-                Grid.SetColumn(autoGroup, 0); Grid.SetRow(autoGroup, 3);   // col0 only now — _setupCombo fills col1/row3
+                Grid.SetColumn(autoGroup, 0); Grid.SetRow(autoGroup, 5);
                 grid.Children.Add(autoGroup);
-                // Setup selector fills the empty col1/row3 slot beside AUTO (spec §9), mirroring the
-                // account combo's styling (set in the ctor above).
-                Grid.SetColumn(_setupCombo, 1); Grid.SetRow(_setupCombo, 3);
-                grid.Children.Add(_setupCombo);
 
                 var armWrap = new WrapPanel { Margin = new Thickness(8, 4, 8, 4),
                     Children = { _armChk, _warnText } };
@@ -619,6 +687,7 @@ namespace TradingRadar.NT
             _now = now;
             MaybeAutoCancel();
             MaybeHoursFlatten();
+            CheckDailyPnlLimit();
             MaybeReconcileOpenAutoTrade();
             MaybeResolveAtmRestore();
             RefreshPositionUi();
@@ -698,6 +767,90 @@ namespace TradingRadar.NT
             int cap;
             if (!int.TryParse(_autoCapBox.Text, out cap) || cap < 1) cap = 1;
             return cap;
+        }
+
+        // Daily P&L limits in USD, late-parsed from the Loss/Profit boxes on the UI thread (same pattern as
+        // GetAutoCap — every caller runs on the SetContext paint tick). 0 = that side disabled (blank/invalid/
+        // negative all collapse to 0). Raising a limit mid-day is honoured on the next tick.
+        private double GetLossLimit()   { return ParseLimit(_lossLimitBox.Text); }
+        private double GetProfitLimit() { return ParseLimit(_profitLimitBox.Text); }
+        private static double ParseLimit(string text)
+        {
+            double v;
+            if (!double.TryParse(text, System.Globalization.NumberStyles.Float | System.Globalization.NumberStyles.AllowThousands,
+                    System.Globalization.CultureInfo.InvariantCulture, out v) || v < 0) return 0;
+            return v;
+        }
+
+        // Daily P&L kill-switch (2026-07-05): flatten + lock AUTO out the instant the day's NET P&L (account
+        // realized since day-start + open unrealized — the same figure NinjaTrader shows as daily P&L) crosses
+        // the Loss or Profit limit. Runs every SetContext tick (UI thread), like MaybeHoursFlatten. Independent
+        // of the Cap/day trade limit — whichever trips first stops. The kill reuses the human Flat path
+        // (Account.Flatten): one native call cancels the ATM stop/target legs AND any resting limit and closes
+        // the position — no orphan orders, ATM or not. Locked until the next replay day or a rewind
+        // (OnReplayReset), so it never re-arms into the same already-blown day.
+        // Retry throttle for the kill-flatten (replay-clock seconds): long enough that a normal fill lands
+        // before a second, over-closing Flatten could go out; short enough to re-fire quickly if the first
+        // attempt threw or was momentarily blocked. Judged on _now (replay clock), like the other timeouts here.
+        private const int DailyKillRetrySeconds = 2;
+
+        private void CheckDailyPnlLimit()
+        {
+            if (_account == null || _instrument == null || _now == DateTime.MinValue) return;
+            if (_moneyMgmtChk.IsChecked != true) { _dailyLimitLocked = false; return; }   // Money Management off — kill-switch disabled
+            double loss = GetLossLimit();
+            double profit = GetProfitLimit();
+            if (loss <= 0 && profit <= 0) { _dailyLimitLocked = false; return; }   // both disabled — never locked
+            if (_now.Date != _dailyPnlDay)   // new replay day (or first tick / post-rewind): re-baseline realized, clear yesterday's lockout
+            {
+                _dailyPnlDay = _now.Date;
+                _dailyPnlBaseline = AccountRealized();
+                _dailyLimitLocked = false;
+                _dailyKillAt = DateTime.MinValue;
+            }
+            if (!_dailyLimitLocked)   // not yet tripped today — evaluate the day's net P&L against the limits
+            {
+                double dailyPnl = (AccountRealized() - _dailyPnlBaseline) + OpenUnrealized();
+                bool hitLoss   = loss   > 0 && dailyPnl <= -loss;
+                bool hitProfit = profit > 0 && dailyPnl >=  profit;
+                if (!hitLoss && !hitProfit) return;
+                double limit = hitLoss ? loss : profit;
+                // Latch the GUARD immediately (blocks re-arm + new fires); disarm now and show the real reason
+                // (ClosePosition's own disarm says "manual Flat" and its early-return guard would keep that
+                // stale reason if called after). The flatten itself is issued/retried below, NOT here — see why.
+                _dailyLimitLocked = true;
+                DiagAuto("daily_limit", null, 0, _lastPrice, string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "DAILY {0} LIMIT — net P&L {1:0.00} $ crossed {2:0} $; flattening + locking AUTO for the day.",
+                    hitLoss ? "LOSS" : "PROFIT", dailyPnl, limit));
+                ForceDisarmAuto(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "daily {0} {1:0} $", hitLoss ? "loss" : "profit", limit));
+            }
+            // Tripped today: keep the account flat. Re-issue the orphan-free flatten (ClosePosition ->
+            // Account.Flatten: cancels the ATM stop/target legs AND any resting limit, then closes) until the
+            // position is CONFIRMED flat — a flatten that threw (account mid-connect) or was momentarily blocked
+            // (in-flight submit at the trip instant) is retried instead of latch-and-forgotten with the position
+            // still open past the limit. Throttled on the replay clock so a normal fill isn't hit with a second,
+            // over-closing market order before it lands.
+            if (IsFlat(CurrentPosition()) && _activeLimit == null && _workingOrders.Count == 0) return;   // confirmed flat + no orders — done
+            if (_dailyKillAt != DateTime.MinValue && (_now - _dailyKillAt).TotalSeconds < DailyKillRetrySeconds) return;
+            _dailyKillAt = _now;
+            ClosePosition(cancelOrdersFirst: true);   // orphan-free native flatten (ATM legs + our limit) + close
+        }
+
+        // Account realized P&L (net, USD). NT8's daily P&L = this minus the day-start baseline (see above).
+        private double AccountRealized()
+        {
+            try { return _account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar); }
+            catch { return 0; }   // an account mid-connect can throw — treat as flat, re-checked next tick
+        }
+
+        // Open position's unrealized P&L (USD) against the radar's own last mid — 0 when flat.
+        private double OpenUnrealized()
+        {
+            Position pos = CurrentPosition();
+            if (IsFlat(pos)) return 0;
+            double refPrice = _lastPrice > 0 ? _lastPrice : pos.AveragePrice;
+            return pos.GetUnrealizedProfitLoss(PerformanceUnit.Currency, refPrice);
         }
 
         // Called by RadarTab's UI-thread paint tick (same thread as SetContext/Instrument — no Dispatcher
@@ -825,6 +978,15 @@ namespace TradingRadar.NT
                     : !IsFlat(posNow) ? "open position"
                     : "unresolved auto trade";
                 DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — busy (" + why + ").");
+                return;
+            }
+
+            // guard 2b (2026-07-05): the daily P&L limit already tripped today — no new AUTO entry (nor a
+            // re-anchor) until the lockout clears at the next replay day / rewind. Independent of, and checked
+            // before, the Cap/day guard below — whichever limit trips first stops (see CheckDailyPnlLimit).
+            if (_dailyLimitLocked)
+            {
+                DiagAuto("guard_skip", side, f.WallPrice, _lastPrice, "AUTO skip — daily P&L limit locked.");
                 return;
             }
 
@@ -1028,7 +1190,7 @@ namespace TradingRadar.NT
         // session/day (Restore, or a fresh day via the day-keyed guard below); see MaybeHoursFlatten.
         private void MaybeAutoRearm(string context)
         {
-            if (_autoArmed || !_autoIntent) return;
+            if (_autoArmed || !_autoIntent || _dailyLimitLocked) return;   // daily P&L limit locks out re-arm for the day
             if (!IsSimAccount(_account) || !_atmUserPicked || _atmSelector.SelectedAtmStrategy == null) return;
             if (_now != DateTime.MinValue && _now.Date == _hoursFlattenDay) return;
             TryArmAuto("(auto-rearm on " + context + ")");
@@ -1188,6 +1350,16 @@ namespace TradingRadar.NT
             if (!IsPlaybackAccount(_account)) return;
             _pendingReplace = null;
             _hoursFlattenDay = DateTime.MinValue;   // a rewind replays the same date — the 16:00 flatten must be able to fire again
+            // Task 3 fix (2026-07-05): a rewind/restart replays the SAME calendar date, so TryAutoFire's
+            // day-change reset (day != _autoFireDay) never trips — the daily trade count carried across the
+            // restart and eventually wedged AUTO at the cap, forcing a radar reopen. Force a fresh day here
+            // (parallel to _hoursFlattenDay above). Same for the daily-P&L baseline + lockout.
+            _autoFireDay = DateTime.MinValue;
+            _autoFireCount = 0;
+            _pendingRestoreFireDay = DateTime.MinValue;   // a persisted count is for the pre-rewind pass — never reseed it after a restart
+            _dailyPnlDay = DateTime.MinValue;             // re-baseline realized on the next tick of the replayed day
+            _dailyLimitLocked = false;                    // a rewind clears the daily P&L lockout
+            _dailyKillAt = DateTime.MinValue;             // and its flatten-retry throttle
             ClearPendingSetup();      // a pre-stage keyed off the pre-reset book/wall is stale after a rewind
             // Rewind + replay reproduces the SAME FireEvent.Time — reset the dedupe guard so the
             // legitimately re-fired setup isn't silently swallowed by OnSetupFire's dedupe check.
@@ -2019,6 +2191,11 @@ namespace TradingRadar.NT
         public string HoursStartText { get { return _hoursStartBox.Text; } }
         public string HoursEndText { get { return _hoursEndBox.Text; } }
         public string HoursFlatText { get { return _hoursFlatBox.Text; } }
+        // Daily P&L limits round-trip as raw box text (like the HOURS boxes) — risk config a prop trader tunes
+        // must survive a workspace reopen, not silently revert to the 2000/3100 defaults.
+        public string LossLimitText { get { return _lossLimitBox.Text; } }
+        public string ProfitLimitText { get { return _profitLimitBox.Text; } }
+        public bool MoneyMgmtEnabled { get { return _moneyMgmtChk.IsChecked == true; } }
         // Blocker fix: persisted alongside the rest of RadarAuto so a restore can seed the daily-cap
         // count instead of resurrecting a fresh one — see _pendingRestoreFireDay/TryAutoFire.
         public string AutoFireDayText
@@ -2039,11 +2216,15 @@ namespace TradingRadar.NT
         // BOTH resolve, via MaybeAutoRearm, gated on the restored _autoIntent.
         public void RestoreAutoState(bool intentArmed, string accountName, string atmName, int qty,
             bool hoursEnabled, string hoursStart, string hoursEnd, string hoursFlat,
-            string fireDay, int fireCount, int autoCap)
+            string fireDay, int fireCount, int autoCap, string lossLimit = null, string profitLimit = null,
+            bool moneyMgmt = true)
         {
             _autoIntent = intentArmed;
             if (qty > 0) _qtyBox.Text = qty.ToString();
             if (autoCap > 0) _autoCapBox.Text = autoCap.ToString();   // 0/missing = keep the compiled default (10)
+            if (!string.IsNullOrEmpty(lossLimit)) _lossLimitBox.Text = lossLimit;       // else keep the 2000 default
+            if (!string.IsNullOrEmpty(profitLimit)) _profitLimitBox.Text = profitLimit; // else keep the 3100 default
+            _moneyMgmtChk.IsChecked = moneyMgmt;   // fires the toggle handler → greys the boxes if off (default on)
             _hoursChk.IsChecked = hoursEnabled;
             ApplyRestoredTime(_hoursStartBox, hoursStart, v => _hoursStart = v);
             ApplyRestoredTime(_hoursEndBox, hoursEnd, v => _hoursEnd = v);
