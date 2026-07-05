@@ -121,8 +121,19 @@ namespace TradingRadar.Engine
                 outcome = inp.WallBelowOutcome; valid = inp.WallBelowOutcomeValid;
             }
 
+            // ABANDON (identity) — MUST run BEFORE resolve (fix pass 2). When React is active, the
+            // NT-layer wall feed (RadarTab.ResolveWallFeed) is a passthrough of the CURRENT dominant
+            // wall on this side, not the latched one. If the latched wall shrinks/hops and a DIFFERENT,
+            // already-terminal wall becomes dominant on the same side, its outcome/valid belongs to
+            // THAT wall — reading it here would fire anchored at the stale latched _wallPrice, on the
+            // wrong wall (spec §6: identity-hop must always abandon, never fire).
+            if (cur <= 0) { EnterCooldown(inp.Now); return false; }                                   // latched wall vanished
+            if (Math.Abs(wallPriceNow - _wallPrice) >= _tick) { EnterCooldown(inp.Now); return false; } // dominant-wall identity hops
+
             // RESOLVE — read ONLY the latched side's outcome, and ONLY when its Valid flag is set
             // (plan §0-R3: default(Outcome)==Absorbed would phantom-fire a fade on a warmup frame).
+            // Reaching here means the current dominant wall on this side still IS the latched wall
+            // (identity confirmed above), so this outcome genuinely belongs to _wallPrice.
             if (valid)
             {
                 if (outcome == Outcome.Consumed)
@@ -137,7 +148,7 @@ namespace TradingRadar.Engine
                         return true;
                     }
                     // Consumed but not trade-backed (cancellation, not real follow): do not follow.
-                    // Fix pass: fall through to the ABANDON checks below instead of returning here — a
+                    // Fix pass 1: fall through to the ABANDON checks below instead of returning here — a
                     // real upstream case (sweep prints a tick off the wall, or aged out of the trade
                     // ring) can hold "valid Consumed, never trade-backed" for many frames; returning
                     // unconditionally made MaxWatchSeconds unreachable and stuck Watching forever.
@@ -157,9 +168,8 @@ namespace TradingRadar.Engine
                 }
             }
 
-            // ABANDON — no resolution this tick (spec §6, any of):
-            if (cur <= 0) { EnterCooldown(inp.Now); return false; }                                   // latched wall vanished
-            if (Math.Abs(wallPriceNow - _wallPrice) >= _tick) { EnterCooldown(inp.Now); return false; } // dominant-wall identity hops
+            // ABANDON — no resolution this tick (spec §6, remaining cases; identity/vanish already
+            // checked above so they can never be shadowed by a fire on a stale wall):
             if (Math.Abs(inp.Mid - _wallPrice) >= _cfg.AwayTicks * _tick) { EnterCooldown(inp.Now); return false; } // price left (accel fizzled)
             if ((inp.Now - _watchStart).TotalSeconds >= _cfg.MaxWatchSeconds) { EnterCooldown(inp.Now); return false; } // wait-and-see timeout
 

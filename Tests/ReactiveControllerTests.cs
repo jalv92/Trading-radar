@@ -259,6 +259,26 @@ public class ReactiveControllerTests
         Assert.Equal(ReactState.Cooldown, m.State);
     }
 
+    // Fix pass 2 regression (resolve-before-abandon ordering): when React is active, the NT-layer wall
+    // feed is a passthrough of the CURRENT dominant wall on this side, not the latched one. If the
+    // latched wall P1 shrinks/hops and a DIFFERENT, already-terminal wall P2 becomes dominant on the
+    // same side, P2's valid outcome belongs to P2 — must NOT fire (fade) anchored at the stale latched
+    // P1. Identity-hop must abandon FIRST, before the outcome/valid resolve is even read.
+    [Fact]
+    public void Identity_hop_to_different_terminal_wall_abandons_not_fires()
+    {
+        var m = Machine();
+        m.Update(In(wallAbovePrice: 100.25, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 1, accel: 2.0)); // latch P1=100.25
+        Assert.Equal(ReactState.Watching, m.State);
+
+        // Dominant ask wall is now P2=100.50 (>= 1 tick from P1), reporting a valid Absorbed outcome —
+        // that resolution belongs to P2, not our latched P1.
+        var o = m.Update(In(wallAbovePrice: 100.50, wallAboveCur: 120, delta: 50, mid: 100.00, sec: 2, accel: 2.0,
+                            aboveOut: Outcome.Absorbed, aboveValid: true));
+        Assert.False(o.Fired);
+        Assert.Equal(ReactState.Cooldown, m.State);
+    }
+
     // Price drifts >= AwayTicks from the wall without resolving (acceleration fizzled) -> abandon.
     [Fact]
     public void Abandons_to_cooldown_on_away_drift()
