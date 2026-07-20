@@ -143,6 +143,8 @@ namespace TradingRadar.NT
                 return react == ReactKind.Reject ? "[React:Reject] "
                      : react == ReactKind.Break  ? "[React:Break] "
                      : "[React] ";
+            if (kind == SetupKind.Absorb)
+                return "[Absorb] ";
             return "[Break] ";
         }
 
@@ -391,10 +393,13 @@ namespace TradingRadar.NT
             _setupCombo.HorizontalAlignment = HorizontalAlignment.Stretch;
             _setupCombo.Items.Add("Break");
             _setupCombo.Items.Add("React");
+            _setupCombo.Items.Add("Absorb");
             _setupCombo.SelectedIndex = 0;
             _setupSelectionHandler = (o, e) =>
             {
-                SetupKind kind = _setupCombo.SelectedIndex == 1 ? SetupKind.Reactive : SetupKind.Break;
+                SetupKind kind = _setupCombo.SelectedIndex == 1 ? SetupKind.Reactive
+                               : _setupCombo.SelectedIndex == 2 ? SetupKind.Absorb
+                               : SetupKind.Break;
                 Action<SetupKind> h = SetupChanged;
                 if (h != null) h(kind);
             };

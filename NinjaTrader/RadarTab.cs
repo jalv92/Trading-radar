@@ -55,6 +55,7 @@ namespace TradingRadar.NT
         private TapeSpeed   _tape;
         private ControllerStateMachine _controller;
         private ReactiveController _reactive;    // spec §4: the swappable second setup (isolated from frozen Break)
+        private AbsorbController _absorb;        // OF3-v2 Absorb setup (isolated, same swap pattern)
         private TapeAcceleration _accel;         // spec §5: signed net-aggressor acceleration
         // The user's dropdown choice (RadarChartTrader.SetupChanged). NOT reset on instrument-switch /
         // replay-reset — that is the "re-apply the selection" contract (spec §4/§9): those sites rebuild
@@ -150,6 +151,7 @@ namespace TradingRadar.NT
             _accel      = new TapeAcceleration(0.1);   // mirror TapeSpeed's alpha/warmup (spec §5)
             _controller = new ControllerStateMachine(InstrumentPresets.For("ES").Controller, _cfg.TickSize);
             _reactive   = new ReactiveController(InstrumentPresets.For("ES").Reactive, _cfg.TickSize);   // per-instrument React preset (NQ day-1 wiring); real instrument's preset lands on the first Instrument set
+            _absorb     = new AbsorbController(new AbsorbConfig(), _cfg.TickSize);   // OF3-v2 frozen defaults (NQ day-1); no preset plumbing yet
             _visual  = new RadarVisual();
             _cockpit = new CockpitVisual();
 
@@ -365,8 +367,9 @@ namespace TradingRadar.NT
             {
                 _activeSetup = kind;
                 var preset = InstrumentPresets.For(_instrument != null ? _instrument.MasterInstrument.Name : "ES");
-                if (kind == SetupKind.Reactive) _reactive   = new ReactiveController(preset.Reactive, _cfg.TickSize);
-                else                            _controller = new ControllerStateMachine(preset.Controller, _cfg.TickSize);
+                if (kind == SetupKind.Reactive)     _reactive   = new ReactiveController(preset.Reactive, _cfg.TickSize);
+                else if (kind == SetupKind.Absorb)  _absorb     = new AbsorbController(new AbsorbConfig(), _cfg.TickSize);
+                else                                _controller = new ControllerStateMachine(preset.Controller, _cfg.TickSize);
                 _lastCtrl = default(ControllerOutput);
                 _lastReactState = _reactive.State; _lastReactAbandon = _reactive.LastAbandon;   // resync to the (maybe rebuilt) React controller
                 // C2 (bug-audit 2026-07-19): the Instrument setter and HandleReplayReset both clear this
@@ -446,6 +449,7 @@ namespace TradingRadar.NT
                     _accel      = new TapeAcceleration(0.1);                                   // new instrument = fresh accel EWMA
                     _controller = new ControllerStateMachine(preset.Controller, _cfg.TickSize);
                     _reactive   = new ReactiveController(preset.Reactive, _cfg.TickSize); // rebuild both; _activeSetup (the selection) is deliberately untouched — that IS the re-apply
+                    _absorb     = new AbsorbController(new AbsorbConfig(), _cfg.TickSize); // rebuild Absorb too (fresh session context for the new instrument)
                     _pressure   = new PressureModel(preset.Pressure);
                     _lastCtrl   = default(ControllerOutput);
                     _lastReactState = _reactive.State; _lastReactAbandon = _reactive.LastAbandon;   // resync to the rebuilt React controller
@@ -608,6 +612,11 @@ namespace TradingRadar.NT
             {
                 if (e.Instrument != _instrument) return;   // stale event from a prior instrument (mid-switch) — drop before touching the book
                 _book.ApplyTrade(te);
+                // Absorb setup tape leg: classify the print against the inside quote
+                DepthLevel bpBid, bpAsk;
+                double bpB = _book.TryBestBid(out bpBid) ? bpBid.Price : 0.0;
+                double bpA = _book.TryBestAsk(out bpAsk) ? bpAsk.Price : 0.0;
+                _absorb.OnTrade(te.Price, te.Volume, bpB, bpA, te.Time);
                 _tradeEvents++;
                 MaybeRunEngine(e.Time, 'T');
             }
@@ -774,6 +783,8 @@ namespace TradingRadar.NT
             // versa. The fire latch below is Kind-agnostic — a reactive fire carries SetupKind.Reactive.
             ControllerOutput cout = _activeSetup == SetupKind.Reactive
                 ? _reactive.Update(cin)
+                : _activeSetup == SetupKind.Absorb
+                ? _absorb.Update(cin)
                 : _controller.Update(cin);
             // Round-8: LATCH the fire immediately (still inside the caller's _engineLock). Overwrite
             // latest-wins if a prior pending fire wasn't consumed yet by the paint tick — this is the
@@ -1125,6 +1136,7 @@ namespace TradingRadar.NT
             var resetPreset = InstrumentPresets.For(_instrument != null ? _instrument.MasterInstrument.Name : "ES");
             _controller = new ControllerStateMachine(resetPreset.Controller, _cfg.TickSize);
             _reactive   = new ReactiveController(resetPreset.Reactive, _cfg.TickSize);   // rebuild both; _activeSetup preserved (re-apply)
+            _absorb     = new AbsorbController(new AbsorbConfig(), _cfg.TickSize);       // rebuild Absorb too (replay rewind = fresh session context)
             _lastCtrl   = default(ControllerOutput);
             _lastReactState = _reactive.State; _lastReactAbandon = _reactive.LastAbandon;   // resync to the rebuilt React controller
             _lastDiag   = DateTime.MinValue;

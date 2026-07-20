@@ -36,6 +36,15 @@ namespace TradingRadar.Engine
                 }
                 r.AutoAggressive = true;   // §8 auto-aggressive (all hard gates still apply in TryAutoFire)
             }
+            else if (f.Kind == SetupKind.Absorb)
+            {
+                // Absorb (OF3-v2): join the absorbed wall with a wall-anchored LMT (fade INTO the
+                // defended level — the wall itself is the edge). AbsorbController emits the TRADE
+                // side (Ask=buy the bid wall). Honors the AUTO checkbox: not auto-aggressive.
+                r.IsBuy = f.Side == Side.Ask;
+                r.Marketable = false;
+                r.AutoAggressive = false;
+            }
             else
             {
                 // Break setup (frozen): unchanged routing — isBuy = Side==Ask, wall-anchored LMT, and it
