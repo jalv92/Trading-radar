@@ -146,3 +146,61 @@ armed — the Cap/day + Money Management already bound the exposure.
 3. Arm rate at 126/hr is ~25% above target: leave band 12 alone for now; only if Countdown quality
    degrades across days consider 13–14 (walls p95 was 13 today).
 4. A React day (band 8 / delta 30) once Break's fire pipeline is producing graded rows.
+
+---
+
+# CAMPAIGN VERDICT — consumption-break on NQ (2026-07-20, 28 graded fires, days 06–14 Jul)
+
+**Decision: STOP. No edge. Retain the radar as a manual visual-read tool, not an auto executor.**
+
+## The corpus (28 unique graded fires across 6 replay days)
+
+| Cut | n | W/L | Net | Expectancy |
+|---|---|---|---|---|
+| **50/100 ATM era (cleanest recent config)** | 18 | 9/9 | **−41t (−$205)** | −2.3 t/trade |
+| Whole corpus | 28 | 13/15 | −455t | −16 t/trade |
+| Break | 20 | 8/12 | −292t | −14.6 t/trade |
+| Reactive | 8 | 5/3 | +88t | +11 t/trade |
+
+Per day: 06 −198t · 07 +35 (n=1) · 08 +55 · 09 −91 · 13 −3 · 14 −2.
+
+## Load-bearing finding — perfect-hindsight exit = $0
+
+On the 18 clean-config fires, a counterfactual grid over every target using the REAL MFE/MAE
+(BE-censoring makes wins conservative):
+
+```
+stop50 / target 35 flat = -135t
+stop50 / target 50 flat =   +0t   <- optimum with perfect hindsight
+stop50 / target 60 flat =  -20t
+stop50 / target 75 flat = -150t
+stop50 / target100 flat = -900t
+```
+
+The best achievable exit — one you could never know live — is exactly breakeven. The entry is a
+**symmetric coin flip**: 9W/9L with MFE median 43t ≈ MAE median 31t. Directional information in the
+entry ≈ 0. No exit rule rescues a symmetric entry; every target just re-slices a random walk.
+
+## Refinement hypotheses — both refuted on the clean 18-fire sample
+
+- **Accel-alignment gate:** accel-aligned entries = 3/9 among wins AND 3/9 among losses. Zero separation.
+- **Hour gate:** wins in hours 11–15, losses in hours 10–15. Overlap; midday no longer separates once
+  the sample is clean. (The midday-trap signal from day-06 did not survive.)
+
+Only survivor: React (+11 t/trade) — but half of that is one lucky 07-07 fire, n=8, and its most
+recent day (07-14) was −2t. Indistinguishable from noise at this sample.
+
+## Why this is structural, not a calibration miss
+
+Same verdict shape as ES (72 trades → breakeven-net → NO-GO). The market hypothesis — that a wall
+being consumed predicts direction on 10-level L2 NQ — does not appear in the data. Instrumentation,
+trigger plumbing, and the React AwayTicks calibration all worked correctly; the signal simply
+carries no edge. Learning this at 28 fires on clean replay data, not with real money, is the intended
+output of this phase.
+
+## What is kept
+
+- The radar (ladder + cockpit) as a **manual** liquidity-read surface for discretionary trading.
+- Chart Trader stays Sim/Playback-gated; the auto-executor is shelved, NOT cleared for real money.
+- If ever revisited: the only branch with a pulse is React-only, config frozen, pre-registered kill
+  at ~15 React fires. Not recommended — it is a bet against a sample of 8.
