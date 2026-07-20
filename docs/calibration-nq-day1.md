@@ -90,3 +90,59 @@ it from the preset. ES keeps today's defaults verbatim.
    the proximity/away radii are the next binding constraint, not the wall gate.
 6. **No threshold gets declared validated under ~15–20 real fires** (ES rounds 3–8 rule). 2–3
    sessions across regimes before locking anything.
+
+---
+
+# Day-2 addendum (replay 2026-07-07, captured 2026-07-19 22:09 — FIRST run on the day-1 priors)
+
+Full-day capture `lr-signals-NQ-20260719-220946.csv` (27,486 rows, replay 07:05→22:00, **Break
+active 100% of the day** — the exact experiment day-1 lacked). Build verified live: every fire's
+|delta15s| ≥ 41 (the old floor 15 would have fired earlier), preset label current.
+
+## Funnel — the day-1 priors work
+
+| Layer | Full day | RTH | ES reference |
+|---|---|---|---|
+| Armed edges | 1,141 (~76/hr) | 817 (**~126/hr**) | target 50–100/hr — slightly hot, same order |
+| Countdown edges | 175 | 150 | ES saw 8–35/day — NQ's funnel BREATHES |
+| Fires | 4 | 4 | 0–5/day expected ✓ |
+
+Kill-chain of the 171 dead Countdowns (last-row gate view): **frac<0.6 → 37%**, **delta<30 → 35%**,
+z-unlatched-view → 23%, other (reload/away/vanish) → 6%. Same hierarchy ES measured (frac #1,
+delta #2) — the funnel shape transfers. Hold progression (1s and 2s) now visible in the CSV.
+
+## The 4 fires — all full-confluence, 3/4 favorable with huge forward runs
+
+| # | Side | Time | frac | tb | delta | z | dist | fwd 30s/60s/120s (ticks, signed) |
+|---|---|---|---|---|---|---|---|---|
+| 1 | L | 12:00:49 | 0.91 | 1.00 | +84 | 1.01 | 1.0t | **+44.5 / +62.5 / +110.5** |
+| 2 | S | 13:10:14 | 0.98 | 0.96 | −137 | 1.40 | 1.0t | **+74.5 / +111.5 / +75.5** |
+| 3 | L | 15:34:39 | 0.91 | 1.00 | +41 | 1.22 | 0.0t | −53.5 / −88.0 / −169.5 (false break) |
+| 4 | L | 15:54:58 | 0.94 | 1.00 | +58 | 1.44 | 1.5t | +37.5 / +69.0 / +47.0 |
+
+n=4 — NO edge claim. But the GEOMETRY is the headline: winners ran **60–110 NQ ticks (15–28 pts,
+$300–550/contract) within 1–2 minutes**, and the loser ran just as far against. NQ Consumption-Break
+outcomes are an order of magnitude larger than ES's (ES median MFE was 9.5t) — the NQ ATM must be
+designed for this scale (wide targets or trail; a cloned ES_3C's 48t first target would have been
+hit by fires 1–2 but is likely still too tight for the runner leg; the 24t stop ≈ survivable on
+fires 1/2/4, instantly dead on fire 3).
+
+## AUTO observability loss — 4 gradeable trades missed
+
+AUTO armed at 07:05 (`arm` row, Playback101 + ATM "AtmStrategy"), yet **all 4 fires logged
+`guard_skip — not armed at fire time`, with NO disarm row in between.** Code path check: every
+FORCED disarm writes a `disarm` CSV row, but a **human uncheck (reason == null) writes nothing** —
+so the consistent story is a manual AUTO uncheck sometime after 07:05 (silent in the CSV by
+design). Cost: zero `lr-fires-NQ` rows, zero realized-R. Follow-up candidates: (a) log human
+unchecks too (`disarm — human uncheck`), closing the last silent path; (b) next run, leave AUTO
+armed — the Cap/day + Money Management already bound the exposure.
+
+## Next-capture asks (in order)
+
+1. **Same setup, AUTO left armed** with an NQ ATM (clone ES_3C to start; expect the runner target to
+   need widening once ~10+ fires exist) → `lr-fires-NQ-*.csv` gets realized R + MFE/MAE.
+2. 2–3 more distinct Break-RTH days before moving any threshold (ES rounds 3–8 rule; nothing
+   validates under ~15–20 real fires).
+3. Arm rate at 126/hr is ~25% above target: leave band 12 alone for now; only if Countdown quality
+   degrades across days consider 13–14 (walls p95 was 13 today).
+4. A React day (band 8 / delta 30) once Break's fire pipeline is producing graded rows.
