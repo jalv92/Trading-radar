@@ -148,7 +148,7 @@ namespace TradingRadar.NT
             _tape       = new TapeSpeed(0.1);
             _accel      = new TapeAcceleration(0.1);   // mirror TapeSpeed's alpha/warmup (spec §5)
             _controller = new ControllerStateMachine(InstrumentPresets.For("ES").Controller, _cfg.TickSize);
-            _reactive   = new ReactiveController(new ReactiveConfig(), _cfg.TickSize);   // ponytail: no per-instrument React preset yet — ReactiveConfig defaults (uncalibrated) until React is calibrated
+            _reactive   = new ReactiveController(InstrumentPresets.For("ES").Reactive, _cfg.TickSize);   // per-instrument React preset (NQ day-1 wiring); real instrument's preset lands on the first Instrument set
             _visual  = new RadarVisual();
             _cockpit = new CockpitVisual();
 
@@ -348,7 +348,7 @@ namespace TradingRadar.NT
             {
                 _activeSetup = kind;
                 var preset = InstrumentPresets.For(_instrument != null ? _instrument.MasterInstrument.Name : "ES");
-                if (kind == SetupKind.Reactive) _reactive   = new ReactiveController(new ReactiveConfig(), _cfg.TickSize);
+                if (kind == SetupKind.Reactive) _reactive   = new ReactiveController(preset.Reactive, _cfg.TickSize);
                 else                            _controller = new ControllerStateMachine(preset.Controller, _cfg.TickSize);
                 _lastCtrl = default(ControllerOutput);
                 _lastReactState = _reactive.State; _lastReactAbandon = _reactive.LastAbandon;   // resync to the (maybe rebuilt) React controller
@@ -428,7 +428,7 @@ namespace TradingRadar.NT
                     _tape       = new TapeSpeed(0.1);
                     _accel      = new TapeAcceleration(0.1);                                   // new instrument = fresh accel EWMA
                     _controller = new ControllerStateMachine(preset.Controller, _cfg.TickSize);
-                    _reactive   = new ReactiveController(new ReactiveConfig(), _cfg.TickSize); // rebuild both; _activeSetup (the selection) is deliberately untouched — that IS the re-apply
+                    _reactive   = new ReactiveController(preset.Reactive, _cfg.TickSize); // rebuild both; _activeSetup (the selection) is deliberately untouched — that IS the re-apply
                     _pressure   = new PressureModel(preset.Pressure);
                     _lastCtrl   = default(ControllerOutput);
                     _lastReactState = _reactive.State; _lastReactAbandon = _reactive.LastAbandon;   // resync to the rebuilt React controller
@@ -1107,7 +1107,7 @@ namespace TradingRadar.NT
             // reset-sensitive per-run state).
             var resetPreset = InstrumentPresets.For(_instrument != null ? _instrument.MasterInstrument.Name : "ES");
             _controller = new ControllerStateMachine(resetPreset.Controller, _cfg.TickSize);
-            _reactive   = new ReactiveController(new ReactiveConfig(), _cfg.TickSize);   // rebuild both; _activeSetup preserved (re-apply)
+            _reactive   = new ReactiveController(resetPreset.Reactive, _cfg.TickSize);   // rebuild both; _activeSetup preserved (re-apply)
             _lastCtrl   = default(ControllerOutput);
             _lastReactState = _reactive.State; _lastReactAbandon = _reactive.LastAbandon;   // resync to the rebuilt React controller
             _lastDiag   = DateTime.MinValue;
