@@ -115,6 +115,12 @@ namespace TradingRadar.Engine
         public int AwayTicks = 6;                // mid this far from the wall => price fell away
         public double ChopSlowZ = -0.3;          // z at/below this = quiet tape
         public int ChopAltCount = 3;             // aggressor sign changes over the window => chop
+        // Bug-audit C1 (2026-07-19): Fired previously exited ONLY on cur<=0 or |mid-wall| >= AwayTicks —
+        // a post-break consolidation inside the away band latched the side Fired indefinitely, blocking
+        // every new Waiting->Armed cycle and freezing the SETUP banner. Elapsed-time exit, judged on
+        // inp.Now vs the latched LastFire.Time (engine stays clock-free). Placeholder — MEASURED later
+        // from fired-episode data, same convention as the file's other thresholds.
+        public double MaxFiredSeconds = 90;
         public TimeSpan Cooldown = TimeSpan.FromSeconds(10);
         public double MinDropBandFrac = 0.12;    // MEASURED round-2 ES: flat 3 sat AT the p90-p95 jitter ceiling (median Drop-at-veto was exactly 3.0); 12% of Peak clears p95 jitter at median wall sizes
         public int JudgeTicks = 2;               // MEASURED round-2 ES: TradeBackedFraction was 0.000 in 100% of vetoes beyond 2 ticks (TradedAt only matches AT the wall) — verdicts render only inside this radius
@@ -251,7 +257,10 @@ namespace TradingRadar.Engine
                     // reversed back past the wall (false break) — symmetric, same metric as StepCountdown's
                     // away-band. No wall-identity check: after a fire the eaten wall vanishes and dominance
                     // hops immediately, so an identity check would un-latch the SETUP indicator instantly.
-                    if (cur <= 0 || Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick)
+                    // C1: plus an elapsed-time exit (MaxFiredSeconds vs the latched LastFire.Time) — a
+                    // post-break consolidation INSIDE the away band otherwise latched this side forever.
+                    if (cur <= 0 || Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick
+                        || (inp.Now - c.LastFire.Time).TotalSeconds >= _cfg.MaxFiredSeconds)
                     { c.State = SideState.Waiting; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.Fraction = 0; c.TradeBackedFraction = 0; }
                     break;
             }
@@ -410,7 +419,10 @@ namespace TradingRadar.Engine
                     // reversed back past the wall (false break) — symmetric, same metric as StepCountdown's
                     // away-band. No wall-identity check: after a fire the eaten wall vanishes and dominance
                     // hops immediately, so an identity check would un-latch the SETUP indicator instantly.
-                    if (cur <= 0 || Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick)
+                    // C1: plus an elapsed-time exit (MaxFiredSeconds vs the latched LastFire.Time) — a
+                    // post-break consolidation INSIDE the away band otherwise latched this side forever.
+                    if (cur <= 0 || Math.Abs(inp.Mid - c.WallPrice) >= _cfg.AwayTicks * _tick
+                        || (inp.Now - c.LastFire.Time).TotalSeconds >= _cfg.MaxFiredSeconds)
                     { c.State = SideState.Waiting; c.CooldownUntil = inp.Now + _cfg.Cooldown; c.Fraction = 0; c.TradeBackedFraction = 0; }
                     break;
             }

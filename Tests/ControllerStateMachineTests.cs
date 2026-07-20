@@ -413,6 +413,36 @@ public class ControllerStateMachineTests
         Assert.Equal(SideState.Armed, oRearm.Long);
     }
 
+    // Bug-audit C1 regression (2026-07-19): a post-break consolidation INSIDE the away band (mid stays
+    // within AwayTicks of the fired wall, wall still present) used to latch the side Fired forever —
+    // neither exit condition (cur<=0 / away-band) could trip. The MaxFiredSeconds elapsed-time exit must
+    // release it: still Fired shortly after the fire, Waiting once the window elapses, cooldown applies,
+    // then a fresh dominant wall re-arms.
+    [Fact]
+    public void Fired_releases_via_elapsed_timeout_when_price_consolidates_inside_away_band()
+    {
+        var m = Machine();
+        m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 1, EmptyBook()));
+        int fires = 0; ControllerOutput o = default(ControllerOutput);
+        for (int s = 2; s <= 8; s++) { var b = BookWithBuys(100.25, 90, s); o = m.Update(In(100.25, 30, 0, 0, 40, 2.0, 0, 100.00, s, b)); if (o.Fired) fires++; }
+        Assert.Equal(1, fires);
+        Assert.Equal(SideState.Fired, o.Long);
+        // Consolidation: mid stays 1 tick from the wall (inside AwayTicks), wall still has size — the
+        // old exits never trip. Shortly after the fire the latch must still hold (banner stays honest).
+        var oHeld = m.Update(In(100.25, 30, 0, 0, 0, 0, 0, 100.00, 9, EmptyBook()));
+        Assert.Equal(SideState.Fired, oHeld.Long);
+        // Past MaxFiredSeconds (90s default; fired somewhere in s=2..8, so s=99 is >= 91s after it) the
+        // elapsed-time exit must release the side to Waiting and start the cooldown.
+        var oTimedOut = m.Update(In(100.25, 30, 0, 0, 0, 0, 0, 100.00, 99, EmptyBook()));
+        Assert.Equal(SideState.Waiting, oTimedOut.Long);
+        // Inside the 10s cooldown a fresh big wall must not re-arm yet.
+        var oCooling = m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 104, EmptyBook()));
+        Assert.Equal(SideState.Waiting, oCooling.Long);
+        // Cooldown elapsed -> a new cycle can start.
+        var oRearmed = m.Update(In(100.25, 120, 0, 0, 0, 0, 0, 100.00, 112, EmptyBook()));
+        Assert.Equal(SideState.Armed, oRearmed.Long);
+    }
+
     // Fix 2 regression: when both candidates are latched Fired, the most recently-fired side's
     // FireEvent must win, not Long unconditionally.
     [Fact]

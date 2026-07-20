@@ -67,6 +67,10 @@ namespace TradingRadar.NT
             _has = true; InvalidateVisual();
         }
 
+        // Bug-audit B1 (2026-07-19): instrument switch — blank the panel instead of showing the OLD
+        // instrument's last banner/gauges until the new instrument's first frame arrives.
+        public void Clear() { _has = false; InvalidateVisual(); }
+
         protected override void OnRender(DrawingContext dc)
         {
             double w = ActualWidth, h = ActualHeight;

@@ -49,7 +49,9 @@ namespace TradingRadar.NT
         private static SolidColorBrush Brush(byte r, byte g, byte b) { var br = new SolidColorBrush(Color.FromRgb(r, g, b)); br.Freeze(); return br; }
         private static SolidColorBrush Frozen(Color c) { var b = new SolidColorBrush(c); b.Freeze(); return b; }
 
-        private Instrument _instrument;
+        // B6 (bug-audit 2026-07-19): read cross-thread in OnOrderUpdate/OnExecutionUpdate before their
+        // Dispatcher marshals; written on the UI thread. Same fix RadarTab._instrument already got.
+        private volatile Instrument _instrument;
         private Account _account;
         private Account _armedFor;      // account the user explicitly armed via the checkbox — per-account, not sticky
         private double _lastPrice;      // book mid, pushed by RadarTab's paint timer (SetContext)
@@ -57,11 +59,22 @@ namespace TradingRadar.NT
         private double _wallBelow;      // price of the biggest wall below mid this engine run (0 = none)
         private double _tick;
         private Order _activeLimit;     // the one working limit order this control currently has resting
+        // Bug-audit A1 (2026-07-19): _ownOrders is read on NT8's account-event thread (OnOrderUpdate's
+        // ownership gate runs BEFORE the Dispatcher marshal) while every mutation runs on the UI thread —
+        // HashSet<T> is not thread-safe, so every access to BOTH sets goes through _orderLock. Keep the
+        // lock scope to the collection access only, never around Account calls or the handler body.
+        private readonly object _orderLock = new object();
         private readonly HashSet<Order> _workingOrders = new HashSet<Order>(); // in-flight orders this control submitted
         // Durable ownership: every Order this control ever created via SubmitRaw, kept until terminal.
         // OnOrderUpdate gates on this FIRST — an ATM's stop/target legs (or any other order on the same
         // account/instrument, e.g. AbsorptionScalper) are never ours and must never become _activeLimit.
         private readonly HashSet<Order> _ownOrders = new HashSet<Order>();
+        // Bug-audit A3 (2026-07-19): one Account.Change() in flight at a time — NT8's ChangePending/
+        // ChangeSubmitted states aren't terminal, and Order.LimitPrice doesn't update until the pending
+        // change confirms, so a second ▲/▼ click before that read a stale price and was silently absorbed.
+        // Set in ChangeActiveLimitPrice, cleared when the order settles (OnOrderUpdate Working/terminal
+        // branches) and on every context switch (instrument/account/replay reset).
+        private bool _changePending;
         private bool _atmUserPicked;    // true only once the user has actually opened+closed the ATM dropdown
                                          // with a template selected — a stale/auto-selected item never attaches
 
@@ -299,7 +312,8 @@ namespace TradingRadar.NT
         private TimeSpan _hoursStart = new TimeSpan(9, 30, 0);
         private TimeSpan _hoursEnd   = new TimeSpan(15, 55, 0);
         private TimeSpan _hoursFlat  = new TimeSpan(16, 0, 0);
-        private DateTime _hoursFlattenDay = DateTime.MinValue;   // replay date already flatten-attempted (once per day, never a retry loop)
+        private DateTime _hoursFlattenDay = DateTime.MinValue;   // replay date CONFIRMED flat after the 16:00 cross (D1: latched on confirmation, not on attempt)
+        private DateTime _hoursFlattenRetryAt = DateTime.MinValue;   // D1: throttle between flatten retries (DailyKillRetrySeconds, replay clock)
 
         private static TextBox MakeTimeBox(string text)
         {
@@ -692,7 +706,10 @@ namespace TradingRadar.NT
             set
             {
                 if (_instrument == value) return;
-                CancelActiveLimitIfWorking("instrument switch");   // don't orphan a live order on switch/teardown
+                // B5: a failed cancel here leaves a REAL resting order that the lines below untrack —
+                // surface it on the ticket instead of only the Output tab.
+                if (!CancelActiveLimitIfWorking("instrument switch"))
+                { _warnText.Text = "CANCEL FAILED on switch — check orders manually"; _warnText.Foreground = Coral; }
                 _instrument = value;
                 _lastPrice = 0;
                 _wallAbove = 0;
@@ -702,8 +719,19 @@ namespace TradingRadar.NT
                 _pendingReplace = null;
                 _pendingFireCtx = null;   // a fire-context for the old instrument no longer applies
                 _sessionOpenDay = DateTime.MinValue; _sessionOpenMid = 0;   // session-open is per-instrument (different price scale) — simplify review finding
-                _workingOrders.Clear();
-                _ownOrders.Clear();
+                lock (_orderLock)
+                {
+                    _workingOrders.Clear();
+                    _ownOrders.Clear();
+                }
+                _changePending = false;   // A3: the old order's settle event can't reach us anymore (ownership cleared)
+                // B4: pending workspace-restore state is for the OLD context — without this, TryAutoFire's
+                // day-change branch could seed the NEW instrument's counter/ATM/account from stale persistence
+                // (OnReplayReset already clears its fire-day for the same reason).
+                _pendingAtmRestoreName = null;
+                _pendingRestoreAccountName = null;
+                _pendingRestoreFireDay = DateTime.MinValue;
+                _pendingRestoreFireCount = 0;
                 AbandonOpenAutoTrade("instrument switch");   // review finding: was never cleared, corrupting exit telemetry across a switch
                 ClearPendingSetup();                // a pre-stage for the old instrument no longer applies
                 _atmSelector.Instrument = value;
@@ -817,8 +845,19 @@ namespace TradingRadar.NT
         {
             if (_hoursChk.IsChecked != true || _now == DateTime.MinValue) return;
             if (_now.TimeOfDay < _hoursFlat || _now.Date == _hoursFlattenDay) return;
-            _hoursFlattenDay = _now.Date;
-            if (IsFlat(CurrentPosition()) && _activeLimit == null) return;   // nothing open — day marked, no action
+            // D1 (bug-audit 2026-07-19): mirror CheckDailyPnlLimit — latch the day only once CONFIRMED
+            // flat. The old version latched BEFORE attempting anything, so one blocked flatten (order in
+            // flight at the exact 16:00 tick, or ValidateForSubmit failing) burned the once-per-day latch
+            // and the open position was never retried.
+            bool noInFlight; lock (_orderLock) noInFlight = _workingOrders.Count == 0;
+            if (IsFlat(CurrentPosition()) && _activeLimit == null && noInFlight)
+            {
+                _hoursFlattenDay = _now.Date;                 // confirmed flat — done for this day
+                _hoursFlattenRetryAt = DateTime.MinValue;
+                return;
+            }
+            if (_hoursFlattenRetryAt != DateTime.MinValue && (_now - _hoursFlattenRetryAt).TotalSeconds < DailyKillRetrySeconds) return;
+            _hoursFlattenRetryAt = _now;
             DiagAuto("hours_flatten", null, 0, _lastPrice, string.Format(
                 System.Globalization.CultureInfo.InvariantCulture,
                 "HOURS — forced flatten at {0:00}:{1:00} (open position/working order past session end).",
@@ -917,7 +956,8 @@ namespace TradingRadar.NT
             // (in-flight submit at the trip instant) is retried instead of latch-and-forgotten with the position
             // still open past the limit. Throttled on the replay clock so a normal fill isn't hit with a second,
             // over-closing market order before it lands.
-            if (IsFlat(CurrentPosition()) && _activeLimit == null && _workingOrders.Count == 0) return;   // confirmed flat + no orders — done
+            bool noInFlight; lock (_orderLock) noInFlight = _workingOrders.Count == 0;
+            if (IsFlat(CurrentPosition()) && _activeLimit == null && noInFlight) return;   // confirmed flat + no orders — done
             if (_dailyKillAt != DateTime.MinValue && (_now - _dailyKillAt).TotalSeconds < DailyKillRetrySeconds) return;
             _dailyKillAt = _now;
             ClosePosition(cancelOrdersFirst: true);   // orphan-free native flatten (ATM legs + our limit) + close
@@ -1201,7 +1241,7 @@ namespace TradingRadar.NT
             double price = _pendingSetup.Price;
             string tag = route.IsBuy ? "BuyLmt" : "SellLmt";
             int qty = GetQty();
-            _workingOrders.Add(old);   // block a second submit while the cancel is in flight (same as the flip)
+            lock (_orderLock) _workingOrders.Add(old);   // block a second submit while the cancel is in flight (same as the flip)
             _pendingReplace = new PendingReplace { Action = action, Qty = qty, Price = price, Tag = tag, WaitingOn = old, IsAuto = true };
             LogAuto("remount", route.IsBuy ? "Buy" : "Sell", price, _lastPrice, string.Format(
                 System.Globalization.CultureInfo.InvariantCulture,
@@ -1219,7 +1259,7 @@ namespace TradingRadar.NT
                 // keeps its ORIGINAL window and ages out via MaybeAutoCancel if it never fills.
                 Diag("auto re-mount: cancel-before-replace failed: " + ex.Message);
                 LogAuto("remount", route.IsBuy ? "Buy" : "Sell", price, _lastPrice, "AUTO re-mount cancel FAILED — old limit kept: " + ex.Message);
-                _workingOrders.Remove(old);
+                lock (_orderLock) _workingOrders.Remove(old);
                 _pendingReplace = null;
                 RefreshArmUi();
             }
@@ -1359,7 +1399,7 @@ namespace TradingRadar.NT
         private bool CanTrade()
         {
             if (_instrument == null || _account == null) return false;
-            if (_workingOrders.Count > 0) return false; // an order from this control is still in flight
+            lock (_orderLock) { if (_workingOrders.Count > 0) return false; } // an order from this control is still in flight
             if (IsSimAccount(_account)) return true;
             return _armChk.IsChecked == true && ReferenceEquals(_armedFor, _account); // arming is per-account
         }
@@ -1402,7 +1442,9 @@ namespace TradingRadar.NT
         {
             Account acct = _accountCombo.SelectedItem as Account;
             if (acct == _account) return;
-            CancelActiveLimitIfWorking("account switch");   // on the OLD account, before we lose the reference
+            // B5: same on-ticket warning as the instrument switch — the old account's order stays live.
+            if (!CancelActiveLimitIfWorking("account switch"))   // on the OLD account, before we lose the reference
+            { _warnText.Text = "CANCEL FAILED on switch — check orders manually"; _warnText.Foreground = Coral; }
             UnsubscribeAccount();
             _account = acct;
             _armedFor = null;           // arming never carries over to a newly selected account
@@ -1411,8 +1453,17 @@ namespace TradingRadar.NT
             _autoOrder = null;
             _pendingReplace = null;
             _pendingFireCtx = null;     // a fire-context for the old account no longer applies
-            _workingOrders.Clear();
-            _ownOrders.Clear();
+            lock (_orderLock)
+            {
+                _workingOrders.Clear();
+                _ownOrders.Clear();
+            }
+            _changePending = false;     // A3: the old account's settle event can't reach us anymore
+            // B4: same stale-restore hazard as the Instrument setter — mirror OnReplayReset's clear.
+            _pendingAtmRestoreName = null;
+            _pendingRestoreAccountName = null;
+            _pendingRestoreFireDay = DateTime.MinValue;
+            _pendingRestoreFireCount = 0;
             AbandonOpenAutoTrade("account switch");   // review finding: was never cleared, corrupting exit telemetry across a switch
             ClearPendingSetup();        // a pre-stage for the old account no longer applies
             _atmSelector.Account = _account;
@@ -1446,6 +1497,7 @@ namespace TradingRadar.NT
             _pendingReplace = null;
             _pendingFireCtx = null;   // a fire-context from before the rewind no longer applies
             _hoursFlattenDay = DateTime.MinValue;   // a rewind replays the same date — the 16:00 flatten must be able to fire again
+            _hoursFlattenRetryAt = DateTime.MinValue;   // D1: and its retry throttle resets with it
             // Task 3 fix (2026-07-05): a rewind/restart replays the SAME calendar date, so TryAutoFire's
             // day-change reset (day != _autoFireDay) never trips — the daily trade count carried across the
             // restart and eventually wedged AUTO at the cap, forcing a radar reopen. Force a fresh day here
@@ -1460,14 +1512,15 @@ namespace TradingRadar.NT
             // Rewind + replay reproduces the SAME FireEvent.Time — reset the dedupe guard so the
             // legitimately re-fired setup isn't silently swallowed by OnSetupFire's dedupe check.
             _lastFireTime = DateTime.MinValue;
-            _workingOrders.Clear();   // any in-flight submit is void after a Playback reset — re-enable the buttons
+            lock (_orderLock) _workingOrders.Clear();   // any in-flight submit is void after a Playback reset — re-enable the buttons
+            _changePending = false;   // A3: any pending Change died with the reset
             AbandonOpenAutoTrade("replay reset");   // review finding: the position flattens on rewind — any open trade record is stale
             Order ord = _activeLimit;
             if (ord != null)
             {
                 if (!IsStillWorking(ord))
                 {
-                    _ownOrders.Remove(ord);
+                    lock (_orderLock) _ownOrders.Remove(ord);
                     _activeLimit = null;   // TryGetActiveOrder now returns false → the paint tick clears the marker
                     if (ReferenceEquals(_autoOrder, ord)) _autoOrder = null;
                 }
@@ -1493,13 +1546,16 @@ namespace TradingRadar.NT
 
         // Cancels the currently-tracked working limit if it's still alive — used on teardown/context
         // switch (instrument, account, Cleanup) so a live order is never left orphaned/untracked.
-        private void CancelActiveLimitIfWorking(string context)
+        // B5 (bug-audit 2026-07-19): returns false when Cancel() threw — the switch call sites then warn
+        // ON THE TICKET, because they proceed to null the tracking regardless and a still-resting order
+        // would otherwise become invisible (blocking the switch itself is not safe for a trading UI).
+        private bool CancelActiveLimitIfWorking(string context)
         {
             Order ord = _activeLimit;
-            if (ord == null || _account == null) return;
-            if (Order.IsTerminalState(ord.OrderState)) return;
-            try { _account.Cancel(new[] { ord }); }
-            catch (Exception ex) { Diag(context + ": cancel failed: " + ex.Message); }
+            if (ord == null || _account == null) return true;
+            if (Order.IsTerminalState(ord.OrderState)) return true;
+            try { _account.Cancel(new[] { ord }); return true; }
+            catch (Exception ex) { Diag(context + ": cancel failed: " + ex.Message); return false; }
         }
 
         private void SubscribeAccount()
@@ -1526,13 +1582,22 @@ namespace TradingRadar.NT
             // F15: gate on ownership FIRST — an ATM's own stop/target legs (or anything else on this
             // account/instrument, e.g. AbsorptionScalper) are never ours and must never reach the
             // tracking below. _ownOrders is seeded the moment SubmitRaw creates an order.
-            if (ord == null || ord.Instrument != inst || !_ownOrders.Contains(ord)) return;
+            if (ord == null || ord.Instrument != inst) return;
+            bool isOwn;                                   // A1: snapshot under the lock — this runs on the
+            lock (_orderLock) isOwn = _ownOrders.Contains(ord);   // account thread, mutations on the UI thread
+            if (!isOwn) return;
             if (e.OrderState == OrderState.Rejected)
                 Diag("order rejected: " + e.Error + " " + e.Comment);
             OrderState state = e.OrderState;
             OrderType  type  = ord.OrderType;
             Dispatcher.InvokeAsync((Action)(() =>
             {
+                // A2 (bug-audit 2026-07-19): an exception anywhere in this marshaled body is silently
+                // swallowed by the discarded DispatcherOperation (same mechanism as commit 39b326b) and
+                // aborts before the tail UI resync — wedging every ticket button until the next discrete
+                // event. try/finally guarantees the resync; catch surfaces the error to the Output tab.
+                try
+                {
                 // Captured BEFORE any mutation below can null _autoOrder on a terminal state — round-3's
                 // schema wants order_update logged "for auto-tracked orders" specifically (CSV-only, no
                 // Output spam: every state transition of an auto order lands here, not just Rejected).
@@ -1572,32 +1637,35 @@ namespace TradingRadar.NT
                         };
                         _pendingFireCtx = null;   // consumed — a later guard_skip must never resurrect this trade's context
                     }
-                    _workingOrders.Remove(ord);   // HashSet.Remove is a no-op if already gone
-                    _ownOrders.Remove(ord);
+                    lock (_orderLock)
+                    {
+                        _workingOrders.Remove(ord);   // HashSet.Remove is a no-op if already gone
+                        _ownOrders.Remove(ord);
+                    }
                     if (ReferenceEquals(_activeLimit, ord)) _activeLimit = null;
                     if (ReferenceEquals(_autoOrder, ord)) _autoOrder = null;
+                    _changePending = false;   // A3: the order this change was riding on is gone — unblock ▲/▼
                     // Opposite-side flip: the old order we cancelled just reached its terminal state —
                     // fire the stashed replacement now (only if it actually got Cancelled, not Filled/Rejected).
                     if (_pendingReplace != null && ReferenceEquals(_pendingReplace.WaitingOn, ord))
                     {
                         PendingReplace p = _pendingReplace;
                         _pendingReplace = null;
-                        // Partial-fill-during-cancel race (code review, 2026-07-05): NT8 terminates a
-                        // partially-filled-then-cancelled order as Cancelled WITH Filled>0 — the two are not
-                        // mutually exclusive. For an AUTO re-mount that means the fill block above just opened
-                        // a real (bracketed) partial position; firing the replacement here would stack a fresh
-                        // resting limit on top of it — precisely what guard 2 exists to prevent, and this
-                        // deferred SubmitRaw re-runs neither ValidateForSubmit nor guard 2 to catch it. Scoped
-                        // to p.IsAuto only — a manual opposite-side flip still replaces on any Cancelled,
-                        // partial fill included, since a human is watching it.
-                        bool autoPartialFill = p.IsAuto && ord.Filled > 0;
-                        if (state == OrderState.Cancelled && !autoPartialFill)
+                        // Partial-fill-during-cancel race (code review, 2026-07-05; widened by bug-audit A5,
+                        // 2026-07-19): NT8 terminates a partially-filled-then-cancelled order as Cancelled
+                        // WITH Filled>0 — the two are not mutually exclusive. A partial fill during the cancel
+                        // means a REAL position just opened; firing the replacement would stack a fresh
+                        // full-qty resting limit on top of it. That hazard is identical for AUTO re-mounts and
+                        // manual opposite-side flips (the old p.IsAuto scoping left the manual path — the only
+                        // live-capable one — exposed), so the guard now applies to BOTH.
+                        bool partialFill = ord.Filled > 0;
+                        if (state == OrderState.Cancelled && !partialFill)
                             // isAuto:true only for an AUTO re-mount — re-seeds _autoOrder/_autoSubmittedAt so the
                             // 5-min window restarts and MaybeAutoCancel/telemetry track the replacement. A manual
                             // opposite-side flip carries IsAuto=false, so its re-submit stays a plain entry.
                             SubmitRaw(p.Action, OrderType.Limit, p.Qty, p.Price, p.Tag, isEntry: true, isAuto: p.IsAuto);
-                        else if (autoPartialFill)
-                            Diag("pending replace dropped — old auto order partially filled (" + ord.Filled + "/" + ord.Quantity +
+                        else if (partialFill)
+                            Diag("pending replace dropped — old order partially filled (" + ord.Filled + "/" + ord.Quantity +
                                 ") during cancel; keeping the open partial position, no stacked limit.");
                         else
                             Diag("pending replace dropped — old order reached " + state + " instead of Cancelled.");
@@ -1605,11 +1673,17 @@ namespace TradingRadar.NT
                 }
                 else if (state == OrderState.Working && type == OrderType.Limit)
                 {
-                    _workingOrders.Remove(ord);   // resting limit no longer counts as "in flight"
+                    lock (_orderLock) _workingOrders.Remove(ord);   // resting limit no longer counts as "in flight"
                     _activeLimit = ord;           // the one tracked working limit (v1: one at a time)
+                    _changePending = false;       // A3: a pending Change settled back to Working — unblock ▲/▼
                 }
-                RefreshPositionUi();
-                RefreshArmUi();   // re-enables buttons / refreshes ▲▼ once state settles
+                }
+                catch (Exception ex) { Diag("OnOrderUpdate: " + ex.Message); }
+                finally
+                {
+                    RefreshPositionUi();
+                    RefreshArmUi();   // re-enables buttons / refreshes ▲▼ once state settles — even if a statement above threw
+                }
             }));
         }
 
@@ -1625,8 +1699,13 @@ namespace TradingRadar.NT
             // control's account-thread handlers.
             Dispatcher.InvokeAsync((Action)(() =>
             {
-                RefreshPositionUi();
-                HandlePossibleExitFill(exec);
+                // A2: same silent-swallow hazard as OnOrderUpdate's marshaled body — see the comment there.
+                try
+                {
+                    RefreshPositionUi();
+                    HandlePossibleExitFill(exec);
+                }
+                catch (Exception ex) { Diag("OnExecutionUpdate: " + ex.Message); }
             }));
         }
 
@@ -2012,7 +2091,7 @@ namespace TradingRadar.NT
         {
             if (_instrument == null)      { Diag("blocked — no instrument."); return false; }
             if (_account == null)         { Diag("blocked — no account selected."); return false; }
-            if (_workingOrders.Count > 0) { Diag("blocked — an order is still in flight."); return false; }
+            lock (_orderLock) { if (_workingOrders.Count > 0) { Diag("blocked — an order is still in flight."); return false; } }
             if (!CanTrade())               { Diag("blocked — real account not armed (check ARM LIVE)."); return false; }
             return true;
         }
@@ -2020,6 +2099,9 @@ namespace TradingRadar.NT
         private void SubmitMarket(OrderAction action, string tag)
         {
             if (!ValidateForSubmit()) return;
+            // A6: a resting limit left standing here could fill later and silently double the position —
+            // ClosePosition(false) already guards this; propagate the same call to its siblings.
+            CancelActiveLimitIfWorking("market entry");
             SubmitRaw(action, OrderType.Market, GetQty(), 0, tag, isEntry: true);
         }
 
@@ -2094,7 +2176,7 @@ namespace TradingRadar.NT
                 // Opposite side (flip): sequence it. Cancel first; the replacement fires from
                 // OnOrderUpdate once the cancel is confirmed (see PendingReplace above).
                 Order old = _activeLimit;
-                _workingOrders.Add(old);   // block a second submit while the cancel is in flight
+                lock (_orderLock) _workingOrders.Add(old);   // block a second submit while the cancel is in flight
                 _pendingReplace = new PendingReplace { Action = action, Qty = qty, Price = price, Tag = tag, WaitingOn = old };
                 try
                 {
@@ -2106,7 +2188,7 @@ namespace TradingRadar.NT
                     // Invariant broken if we proceed: Diag + bail. Do NOT null _activeLimit (old order is
                     // presumably still resting) and do NOT submit the replacement — that would compound it.
                     Diag("cancel-before-replace failed: " + ex.Message);
-                    _workingOrders.Remove(old);
+                    lock (_orderLock) _workingOrders.Remove(old);
                     _pendingReplace = null;
                     RefreshArmUi();
                 }
@@ -2128,6 +2210,15 @@ namespace TradingRadar.NT
                 Diag(context + ": order already " + ord.OrderState + " — refusing to Change.");
                 return;
             }
+            // A3: one Change in flight at a time. ChangePending/ChangeSubmitted aren't terminal, and
+            // ord.LimitPrice doesn't reflect the pending change until it confirms — a second click here
+            // would compute from a stale price and be silently absorbed (the reported dead ▲/▼ clicks).
+            if (_changePending)
+            {
+                Diag(context + ": change already in flight — ignoring.");
+                return;
+            }
+            _changePending = true;
             try
             {
                 ord.LimitPriceChanged = newPrice;
@@ -2135,6 +2226,7 @@ namespace TradingRadar.NT
             }
             catch (Exception ex)
             {
+                _changePending = false;   // the change never went out — don't block the next click
                 Diag(context + " failed: " + ex.Message);
             }
         }
@@ -2151,8 +2243,21 @@ namespace TradingRadar.NT
             bool isBuy = ord.OrderAction == OrderAction.Buy;
             // Keep non-marketable: clamp against mid as a best-bid/best-ask proxy (exact L2 quotes
             // aren't piped into this control — see LimitAnchorPrice). Diag + no-op at the boundary.
-            if (isBuy && newPrice >= _lastPrice)  { Diag("blocked — move would cross the market (buy limit >= mid)."); return; }
-            if (!isBuy && newPrice <= _lastPrice) { Diag("blocked — move would cross the market (sell limit <= mid)."); return; }
+            // A4: a clamped move must be visible ON THE TICKET — Diag alone (Output tab) made a routine
+            // clamp indistinguishable from a broken button. Transient by design: the next RefreshArmUi
+            // repaints the warn line.
+            if (isBuy && newPrice >= _lastPrice)
+            {
+                Diag("blocked — move would cross the market (buy limit >= mid).");
+                _warnText.Text = "MOVE BLOCKED — would cross market"; _warnText.Foreground = Coral;
+                return;
+            }
+            if (!isBuy && newPrice <= _lastPrice)
+            {
+                Diag("blocked — move would cross the market (sell limit <= mid).");
+                _warnText.Text = "MOVE BLOCKED — would cross market"; _warnText.Foreground = Coral;
+                return;
+            }
             ChangeActiveLimitPrice(newPrice, "move");
         }
 
@@ -2165,6 +2270,8 @@ namespace TradingRadar.NT
         private void Reverse()
         {
             if (!ValidateForSubmit()) return;
+            // A6: same resting-limit hazard as SubmitMarket — cancel ours before the reversing market order.
+            CancelActiveLimitIfWorking("reverse");
             Position pos = CurrentPosition();
             if (IsFlat(pos))
             {
@@ -2239,7 +2346,7 @@ namespace TradingRadar.NT
                 // exchange/UTC offset during order processing, so DateTime.MaxValue can overflow and throw.
                 Order o = _account.CreateOrder(_instrument, action, type, OrderEntry.Manual,
                     TimeInForce.Day, qty, limitPrice, 0, string.Empty, orderName, NinjaTrader.Core.Globals.MaxDate, null);
-                _ownOrders.Add(o);   // F15: seed ownership the moment we create it — every order this control originates
+                lock (_orderLock) _ownOrders.Add(o);   // F15: seed ownership the moment we create it — every order this control originates
                 if (isAuto) { _autoOrder = o; _autoSubmittedAt = _now; }
                 // "submit" carries the order id — this is the one place it exists (round-3 schema).
                 if (isAuto)
@@ -2298,7 +2405,7 @@ namespace TradingRadar.NT
                 {
                     _account.Submit(new[] { o });
                 }
-                _workingOrders.Add(o);   // synchronous in-flight guard — closes the double-click window
+                lock (_orderLock) _workingOrders.Add(o);   // synchronous in-flight guard — closes the double-click window
                 RefreshArmUi();
             }
             catch (Exception ex)
@@ -2490,8 +2597,11 @@ namespace TradingRadar.NT
         {
             _cleanedUp = true;   // set FIRST — see EnsureAutoLogWriter
             CancelActiveLimitIfWorking("cleanup");   // don't leave a live order orphaned on teardown
-            _workingOrders.Clear();
-            _ownOrders.Clear();
+            lock (_orderLock)
+            {
+                _workingOrders.Clear();
+                _ownOrders.Clear();
+            }
             Account.AccountStatusUpdate -= OnAccountStatusUpdate;
             UnsubscribeAccount();
             if (_autoLogWriter != null) { _autoLogWriter.Flush(); _autoLogWriter.Dispose(); _autoLogWriter = null; }

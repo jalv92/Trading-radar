@@ -66,6 +66,9 @@ namespace TradingRadar.NT
         private ControllerOutput _lastCtrl;
         private RadarVisual _visual;
         private CockpitVisual _cockpit;
+        // B2 (bug-audit 2026-07-19): the Rec checkbox, promoted to a field so the Instrument setter can
+        // roll the capture (uncheck -> flush+dispose+session summary) BEFORE the instrument swaps.
+        private CheckBox _recChk;
         private RadarChartTrader _chartTrader;
         private PressureModel _pressure = new PressureModel(InstrumentPresets.For("ES").Pressure);
         private InstrumentSelector _selector;
@@ -241,6 +244,7 @@ namespace TradingRadar.NT
                 WriteSessionSummary();
             };
             topBar.Children.Add(recChk);
+            _recChk = recChk;   // B2: reachable from the Instrument setter
             DockPanel.SetDock(topBar, Dock.Top);
             root.Children.Add(topBar);
             // Right column: Cockpit fills, Chart Trader docked at the bottom (spec §8).
@@ -348,6 +352,11 @@ namespace TradingRadar.NT
                 else                            _controller = new ControllerStateMachine(preset.Controller, _cfg.TickSize);
                 _lastCtrl = default(ControllerOutput);
                 _lastReactState = _reactive.State; _lastReactAbandon = _reactive.LastAbandon;   // resync to the (maybe rebuilt) React controller
+                // C2 (bug-audit 2026-07-19): the Instrument setter and HandleReplayReset both clear this
+                // ("a pre-switch fire must not fire into the new instrument/rewind") but the setup swap
+                // didn't — a React fire latched just before flipping to Break was still delivered to
+                // OnSetupFire on the next paint tick and executed AUTO-AGGRESSIVELY under Break.
+                _pendingFireSet = false;
             }
         }
 
@@ -389,6 +398,12 @@ namespace TradingRadar.NT
             set
             {
                 if (_instrument == value) return;
+                // B2: roll the Rec capture BEFORE the swap — the Unchecked handler flushes both writers
+                // and files the session summary under the OLD instrument's name (a mid-session switch
+                // used to keep appending the new instrument's rows into the old instrument's CSVs and
+                // credit the session row to whichever instrument was current at uncheck). Deliberately
+                // outside _engineLock: WriteSessionSummary takes that lock itself.
+                if (_recChk != null && _recChk.IsChecked == true) _recChk.IsChecked = false;
                 Unsubscribe();
                 // Swap the whole engine state atomically w.r.t. the instrument-thread handlers: a late
                 // depth/trade event from the OLD instrument (still queued on its thread) is dropped by the
@@ -424,6 +439,11 @@ namespace TradingRadar.NT
                     _depthBase.Reset();                    // new instrument = new size distribution; don't inherit the old bar
                     _lastDepthSample = DateTime.MinValue;
                 }
+                // B1: blank both visuals now — the paint tick only repaints them when a frame exists
+                // (_latest was just nulled), so without this the OLD instrument's last ladder/cockpit
+                // frame stays on screen until the NEW instrument's first engine run.
+                if (_visual != null) _visual.Clear();
+                if (_cockpit != null) _cockpit.Clear();
                 if (_chartTrader != null) _chartTrader.Instrument = value;
                 Subscribe();
                 RefreshHeader();
@@ -852,7 +872,11 @@ namespace TradingRadar.NT
                             System.Globalization.CultureInfo.InvariantCulture,
                             "{0},mid,,,,,,,,,,{1:0.00},{2},{3}",
                             now.ToString("o"), mid, medBid, medAsk));
-                        _capWriter.Flush();
+                        // B3: no Flush here — this runs on the instrument thread INSIDE _engineLock, and a
+                        // blocking OS write (OneDrive/AV-scanned Documents path) stalls every UI-thread
+                        // action contending the same lock (instrument switch, setup swap, Rec toggle).
+                        // ponytail: trades a small crash-durability window (unflushed rows since the last
+                        // dispose) for removing lock-held blocking I/O — acceptable for an opt-in diagnostic.
                     }
                     // enhanced PressureInputs snapshot (Plan D measurement) — on the 2s heartbeat, OR
                     // immediately when either side's SideState changed this run (ctrlStateChanged, captured
@@ -895,9 +919,11 @@ namespace TradingRadar.NT
                             "{29},{30},{31:0.00},{32:0.00},{33},{34},{35}," +
                             "{36},{37},{38},{39}," +
                             "{40},{41},{42}," +
-                            // React telemetry (append-only) — empty/0 while Break is active. reactState is
-                            // gated to React-active (Break would otherwise always read "Waiting"); the rest
-                            // read 0/default naturally because _reactive is dormant while Break is active.
+                            // React telemetry (append-only) — empty/0 while Break is active. C3 (bug-audit
+                            // 2026-07-19): reactWallPx/reactWallSide/reactAbandon are now EXPLICITLY gated
+                            // on React-active, like reactState — a dormant _reactive FREEZES its last
+                            // values at the swap instant (it isn't stepped under Break), so "reads 0/default
+                            // naturally" was wrong and the stale values leaked into Break-active rows.
                             "{43},{44:0.0000},{45},{46:0.00},{47},{48},{49},{50},{51},{52}",
                             now.ToString("o"), mid, bidMass, askMass, bestBid, bestAsk, delta15, wf, wabove, wpx,
                             wallAbovePx, wallAboveSz, wallBelowPx, wallBelowSz,
@@ -913,9 +939,11 @@ namespace TradingRadar.NT
                             src, seq, cin.AdaptiveSignificance,
                             _activeSetup, cin.TapeAccel,
                             _activeSetup == SetupKind.Reactive ? _reactive.State.ToString() : "",
-                            _reactive.LatchedWallPrice, _reactive.LatchedSide, _reactive.LastAbandon,
+                            _activeSetup == SetupKind.Reactive ? _reactive.LatchedWallPrice : 0.0,
+                            _activeSetup == SetupKind.Reactive ? _reactive.LatchedSide.ToString() : "",
+                            _activeSetup == SetupKind.Reactive ? _reactive.LastAbandon.ToString() : "",
                             waOut, waValid, wbOut, wbValid));
-                        _sigWriter.Flush();
+                        // B3: Flush removed — same lock-held-blocking-I/O rationale as the cap-writer above.
                         _lastLoggedHoldL = cout.LongHoldCount;
                         _lastLoggedHoldS = cout.ShortHoldCount;
                     }

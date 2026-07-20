@@ -93,6 +93,17 @@ namespace TradingRadar.NT
             _anchorTop = double.NaN;   // forces a re-center on the next OnRender from the fresh mid
         }
 
+        // Bug-audit B1 (2026-07-19): called from RadarTab's Instrument setter. ResetLadderMemory alone
+        // only drops the ghost rows — _nodes/_bids/_asks/_mid kept painting the OLD instrument's last
+        // frame until the NEW instrument's first engine run produced a frame.
+        public void Clear()
+        {
+            _nodes = null; _bids = null; _asks = null;
+            _mid = 0;
+            ResetLadderMemory();
+            InvalidateVisual();
+        }
+
         // Pushed each paint tick by RadarTab from the Chart Trader's active working limit order (if any).
         // SetFrame already repaints every tick regardless, so skip the redundant InvalidateVisual when
         // nothing about the order actually changed since the last call.
