@@ -52,6 +52,12 @@ namespace TradingRadar.Engine
         // - Reactive: first per-instrument React preset. Band 8 = RTH p90 of dominant walls (~5-8 joint
         //   watches/hr vs 0.3/hr at the ES-scale 60 — structurally dead); DeltaFloor 30 mirrors Break.
         //   One knob at a time: AccelFloor/proximity judged only after this funnel breathes.
+        // - Reactive AwayTicks 6 -> 24 (day-2 React, replay 2026-07-07, docs/calibration-nq-day1.md):
+        //   with the ES-scale 6, 104/108 abandons were AwayDrift at median watch age 0.3s — NQ's median
+        //   2s mid excursion is ALREADY 7t (5s: 11t, 10s: 18t, 15s p75: 39t), so the watch died inside
+        //   quote noise and only 3 rows all session ever saw a terminal wall outcome. 24 ~= p50-p75 of
+        //   the 10s excursion: survives normal jitter, still abandons when the reaction premise (price
+        //   AT the wall) is truly gone. Pairs with the unchanged MaxWatchSeconds 15 (15s p50 = 25t).
         // Fire-path gates (FireFrac/trade-backed/K-window/reload) remain ES values — zero NQ RTH
         // Countdown episodes yet; still placeholders until ~15-20 real fires exist.
         static InstrumentPreset Nq()
@@ -60,7 +66,7 @@ namespace TradingRadar.Engine
             {
                 Controller = new ControllerConfig { SignificanceBand = 12, DeltaFloor = 30 },
                 Pressure   = new PressureConfig   { DeltaScale = 7.0, AirThinSize = 3 },
-                Reactive   = new ReactiveConfig   { SignificanceBand = 8, DeltaFloor = 30 },
+                Reactive   = new ReactiveConfig   { SignificanceBand = 8, DeltaFloor = 30, AwayTicks = 24 },
                 MinAbsSize = 6,
                 Label      = "NQ (day-1 priors 2026-07-19 - uncalibrated fire path)"
             };
