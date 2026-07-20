@@ -491,7 +491,7 @@ namespace TradingRadar.NT
                     _atmUserPicked = _atmSelector.SelectedAtmStrategy != null;
                     if (_atmUserPicked)
                     {
-                        _lastPickedAtmName = _atmSelector.SelectedAtmStrategy.Name;
+                        _lastPickedAtmName = AtmName(_atmSelector.SelectedAtmStrategy);
                         MaybeAutoRearm("atm re-pick");   // a broken ATM precondition just repaired — see method banner
                     }
                     else
@@ -1272,6 +1272,16 @@ namespace TradingRadar.NT
             return pos == null || pos.MarketPosition == MarketPosition.Flat || pos.Quantity == 0;
         }
 
+        // Template identity for logging AND restore matching. AtmStrategy.Name is the NinjaScript type
+        // label ("AtmStrategy" for every template — confirmed by every arm row since June), while
+        // DisplayName (IDisplayNameProvider, what the selector's dropdown renders) carries the template
+        // name. Fall back to Name so a null DisplayName degrades to the old behavior, never worse.
+        private static string AtmName(NinjaTrader.NinjaScript.AtmStrategy atm)
+        {
+            if (atm == null) return "?";
+            return string.IsNullOrEmpty(atm.DisplayName) ? atm.Name : atm.DisplayName;
+        }
+
         // armNote: non-null only from MaybeAutoRearm — appended to the "arm" CSV row so the decision
         // trail distinguishes a human checkbox click from an automatic re-arm (verdict doc item 6).
         private void TryArmAuto(string armNote = null)
@@ -1304,10 +1314,12 @@ namespace TradingRadar.NT
             if (armed)
                 DiagAuto("arm", null, 0, _lastPrice, string.Format("AUTO armed — account {0}, ATM {1}{2}.",
                     _account != null ? _account.Name : "?",
-                    _atmSelector.SelectedAtmStrategy != null ? _atmSelector.SelectedAtmStrategy.Name : "?",
+                    AtmName(_atmSelector.SelectedAtmStrategy),
                     armNote != null ? " " + armNote : ""));
-            else if (reason != null)
-                DiagAuto("disarm", null, 0, _lastPrice, "AUTO disarmed — " + reason + ".");
+            else
+                // reason == null here is ONLY the human uncheck (the _autoChk.Unchecked handler) — log it
+                // too, or 4 gradeable fires vanish as bare "not armed at fire time" guard_skips (NQ day-2).
+                DiagAuto("disarm", null, 0, _lastPrice, "AUTO disarmed — " + (reason ?? "human uncheck") + ".");
             SolidColorBrush accent = armed ? Amber : Muted;
             _autoChk.Foreground = accent;
             // The checkbox already says "AUTO" — the status only adds the state, so it reads "AUTO armed".
@@ -2582,11 +2594,15 @@ namespace TradingRadar.NT
             foreach (object item in _atmSelector.Items)
             {
                 NinjaTrader.NinjaScript.AtmStrategy cand = item as NinjaTrader.NinjaScript.AtmStrategy;
-                if (cand == null || cand.Name != _pendingAtmRestoreName) continue;
+                // AtmName (not .Name): every template's .Name is the literal "AtmStrategy", so the old
+                // match degenerated to "first template in the list" — a workspace restore could silently
+                // select the WRONG ATM. Old persisted values ("AtmStrategy") now match nothing: the ATM
+                // just isn't restored once and the user re-picks — strictly safer than a wrong bracket.
+                if (cand == null || AtmName(cand) != _pendingAtmRestoreName) continue;
                 _atmSelector.SelectedItem = item;
                 _pendingAtmRestoreName = null;
                 _atmUserPicked = true;
-                _lastPickedAtmName = cand.Name;
+                _lastPickedAtmName = AtmName(cand);
                 ApplyAtmQtyLock();   // lock+reflect the restored ATM's total (stays editable if brackets aren't populated yet)
                 MaybeAutoRearm("restore");
                 return;

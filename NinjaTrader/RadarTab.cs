@@ -91,6 +91,7 @@ namespace TradingRadar.NT
         private volatile bool _pendingFireSet;
         private long _droppedFires;   // latest-wins overwrites of an unconsumed pending fire — should stay 0
         private DispatcherTimer _paintTimer;
+        private DateTime _lastPaintErr;   // UI thread only — throttles the paint-tick catch log
         private bool _subscribed;
         private int      _depthEvents;
         private int      _tradeEvents;
@@ -275,8 +276,14 @@ namespace TradingRadar.NT
             {
                 Interval = TimeSpan.FromMilliseconds(33)
             };
+            // Live blank-screen (2026-07-20): each NT8 window runs its own dispatcher thread, so ONE
+            // unhandled throw in this Tick kills THIS window's UI while the instrument thread keeps
+            // heartbeating to the Output — a permanently blank radar over a healthy-looking log.
+            // Catch, name the culprit in the Output (throttled), keep the pump alive.
             _paintTimer.Tick += (o, e) =>
             {
+                try
+                {
                 if (_replayResetPending)   // post-replay-reset (UI thread)
                 {
                     _replayResetPending = false;
@@ -326,6 +333,16 @@ namespace TradingRadar.NT
                     {
                         _minSizeBox.IsReadOnly = false;
                         _minSizeBox.Foreground = new SolidColorBrush(Color.FromRgb(0xcf, 0xd6, 0xe2));
+                    }
+                }
+                }
+                catch (Exception ex)
+                {
+                    if ((DateTime.UtcNow - _lastPaintErr).TotalSeconds >= 5)   // throttle: a persistent bug would spam 30 lines/s
+                    {
+                        _lastPaintErr = DateTime.UtcNow;
+                        NinjaTrader.Code.Output.Process("[Radar] PAINT TICK ERROR — " + ex,
+                            NinjaTrader.NinjaScript.PrintTo.OutputTab1);
                     }
                 }
             };

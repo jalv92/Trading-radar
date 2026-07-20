@@ -114,7 +114,26 @@ namespace TradingRadar.NT
             InvalidateVisual();
         }
 
+        // Live blank-screen (2026-07-20): a throw inside a WPF render pass kills this window's
+        // dispatcher -> permanently blank ladder while the engine thread keeps heartbeating to the
+        // Output. Catch here so one bad frame never takes the window down, and NAME the culprit
+        // (throttled) so the next occurrence is a one-line diagnosis instead of a mystery.
+        private DateTime _lastRenderErr;
         protected override void OnRender(DrawingContext dc)
+        {
+            try { RenderCore(dc); }
+            catch (Exception ex)
+            {
+                if ((DateTime.UtcNow - _lastRenderErr).TotalSeconds >= 5)
+                {
+                    _lastRenderErr = DateTime.UtcNow;
+                    NinjaTrader.Code.Output.Process("[Radar] LADDER RENDER ERROR — " + ex,
+                        NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+                }
+            }
+        }
+
+        private void RenderCore(DrawingContext dc)
         {
             double w = ActualWidth, h = ActualHeight;
             if (w <= 0 || h <= 0) return;

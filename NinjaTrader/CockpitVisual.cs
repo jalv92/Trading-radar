@@ -71,7 +71,24 @@ namespace TradingRadar.NT
         // instrument's last banner/gauges until the new instrument's first frame arrives.
         public void Clear() { _has = false; InvalidateVisual(); }
 
+        // Same guard as RadarVisual.OnRender (live blank-screen 2026-07-20): never let one bad
+        // frame kill the window's dispatcher; name the exception in the Output instead.
+        private DateTime _lastRenderErr;
         protected override void OnRender(DrawingContext dc)
+        {
+            try { RenderCore(dc); }
+            catch (Exception ex)
+            {
+                if ((DateTime.UtcNow - _lastRenderErr).TotalSeconds >= 5)
+                {
+                    _lastRenderErr = DateTime.UtcNow;
+                    NinjaTrader.Code.Output.Process("[Radar] COCKPIT RENDER ERROR — " + ex,
+                        NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+                }
+            }
+        }
+
+        private void RenderCore(DrawingContext dc)
         {
             double w = ActualWidth, h = ActualHeight;
             if (w <= 0 || h <= 0) return;
