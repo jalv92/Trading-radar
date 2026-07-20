@@ -89,6 +89,27 @@ namespace TradingRadar.NT
             public double Price;
         }
         private PendingSetup _pendingSetup;
+
+        // Per-fire CSV entry-side context (2026-07-19): captured the instant TryAutoFire commits to a
+        // real submission (every guard already passed) — never at a guard_skip, so an unconverted fire
+        // never leaks context into a later trade (the next real fire simply overwrites this before it's
+        // ever read). Transferred into the AutoTrade record at entry-fill (OnOrderUpdate) and cleared
+        // there. SlTicks/TpTicks are filled in a moment later, by SubmitRaw's own ATM-attach branch,
+        // since the bracket only exists once StartAtmStrategy actually runs.
+        private sealed class PendingFireContext
+        {
+            // The raw fire — Kind/React/WallSide/WallPrice/WallSizeAtFire/TapeAccel/ZAtFire/TapeSpeed/
+            // DeltaAtFire/Time all read straight off this (simplify pass: was a field-by-field copy of
+            // FireEvent, one more place to touch every time that struct grows). Only what FireEvent can't
+            // carry gets its own field below.
+            public FireEvent Fire;
+            public string EntryType;                        // "MKT" | "LMT" — a routing decision, not engine state
+            public double MidAtFire;                        // _lastPrice at fire — not on FireEvent
+            public int DayTrendSign;                        // needs the session anchor, which only this control has
+            public int SlTicks; public int TpTicks;         // 0 = no ATM bracket attached (shouldn't happen — AUTO refuses a naked entry)
+        }
+        private PendingFireContext _pendingFireCtx;
+
         // Dedupe guard: ControllerOutput.Fired is one-shot per engine run (~20Hz), but the UI paint tick
         // (~30Hz) can read the same _latest Frame more than once before the engine swaps it in, so
         // OnSetupFire can be called twice with the IDENTICAL FireEvent. FireEvent.Time is unique per fire.
@@ -130,6 +151,12 @@ namespace TradingRadar.NT
             public DateTime EntryTime;   // replay-aware _now at entry fill
             public int ExitQty;
             public double ExitNotional;  // sum(price*qty) across exit fills — running weighted-avg exit price
+            // Per-fire CSV (2026-07-19): the entry-side context snapshot from TryAutoFire (null only if
+            // this trade somehow opened outside that path — defensive, shouldn't happen: _openAutoTrade
+            // is only ever created from an order _autoOrder itself set). MfeTicks/MaeTicks are the running
+            // favorable/adverse excursion in ticks, updated every SetContext tick — see UpdateOpenTradeExcursion.
+            public PendingFireContext FireCtx;
+            public double MfeTicks; public double MaeTicks;
         }
         private AutoTrade _openAutoTrade;
         // Self-heal reconciliation (review finding, major, 2026-07-03): _openAutoTrade otherwise only
@@ -185,6 +212,23 @@ namespace TradingRadar.NT
         // tell why beyond NT8's Output window). Lazily opened on first AUTO log event — see LogAuto below.
         private System.IO.StreamWriter _autoLogWriter;
         private bool _cleanedUp;                 // closed for good — a late marshaled event must not reopen the log
+
+        // Per-fire CSV (2026-07-19) — one row per completed AUTO round-trip, independent of both lr-auto
+        // (every event) and Rec. Same lazily-opened StreamWriter/dir pattern as _autoLogWriter above.
+        private System.IO.StreamWriter _firesLogWriter;
+        // Stable per-control-instance id so a pivot can join rows even if the CSV itself rolls (instrument
+        // switch) — ponytail: reuses the same "open-time timestamp" idea _autoLogWriter's filename already
+        // uses, just captured once here instead of per-file.
+        private readonly string _sessionId = DateTime.Now.ToString("yyyyMMdd-HHmmss", System.Globalization.CultureInfo.InvariantCulture);
+        private const int FiresSchemaVersion = 1;
+
+        // Session-open anchor for the per-fire CSV's dayTrendSign column. ponytail: no existing session
+        // anchor in this control (or anywhere in the codebase — checked) — first mid observed at/after RTH
+        // open (09:35 ET) each new replay day. ASSUMPTION: _now already runs in the feed's own timezone
+        // (ET on this setup), same assumption the HOURS schedule above already makes.
+        private static readonly TimeSpan RthOpenTimeOfDay = new TimeSpan(9, 35, 0);
+        private DateTime _sessionOpenDay = DateTime.MinValue;
+        private double _sessionOpenMid;
 
         // Threading note: see the volatile comment on _autoArmed above.
         public bool IsAutoArmed { get { return _autoArmed; } }
@@ -656,6 +700,8 @@ namespace TradingRadar.NT
                 _activeLimit = null;
                 _autoOrder = null;
                 _pendingReplace = null;
+                _pendingFireCtx = null;   // a fire-context for the old instrument no longer applies
+                _sessionOpenDay = DateTime.MinValue; _sessionOpenMid = 0;   // session-open is per-instrument (different price scale) — simplify review finding
                 _workingOrders.Clear();
                 _ownOrders.Clear();
                 AbandonOpenAutoTrade("instrument switch");   // review finding: was never cleared, corrupting exit telemetry across a switch
@@ -668,6 +714,7 @@ namespace TradingRadar.NT
                 // Roll the AUTO log so the next event opens a file named for the NEW instrument
                 // (review round-3 minor: the name is captured at first-open only).
                 if (_autoLogWriter != null) { _autoLogWriter.Flush(); _autoLogWriter.Dispose(); _autoLogWriter = null; }
+                if (_firesLogWriter != null) { _firesLogWriter.Flush(); _firesLogWriter.Dispose(); _firesLogWriter = null; }
                 RefreshArmUi();
                 RefreshPositionUi();
             }
@@ -685,12 +732,51 @@ namespace TradingRadar.NT
             _wallBelow = wallBelow;
             if (tick > 0) _tick = tick;
             _now = now;
+            MaybeCaptureSessionOpen();
             MaybeAutoCancel();
             MaybeHoursFlatten();
             CheckDailyPnlLimit();
             MaybeReconcileOpenAutoTrade();
             MaybeResolveAtmRestore();
+            UpdateOpenTradeExcursion();
             RefreshPositionUi();
+        }
+
+        // Per-fire CSV instrumentation (2026-07-19, report-only): latches the day's session-open mid the
+        // first tick at/after RTH open (09:35 ET) each new replay day — see _sessionOpenDay's own comment
+        // for the timezone assumption. Cheap (one date compare) once already latched for the day.
+        private void MaybeCaptureSessionOpen()
+        {
+            if (_now == DateTime.MinValue || _lastPrice <= 0) return;
+            if (_now.Date == _sessionOpenDay) return;
+            if (_now.TimeOfDay < RthOpenTimeOfDay) return;
+            _sessionOpenDay = _now.Date;
+            _sessionOpenMid = _lastPrice;
+        }
+
+        // dayTrendSign = sign(midAtFire - sessionOpen) for the per-fire CSV. 0 when the fire's own replay
+        // day never got a session-open anchor (e.g. AUTO fired before 09:35, or mid was never observed).
+        private int ComputeDayTrendSign(DateTime fireTime, double midAtFire)
+        {
+            if (_sessionOpenDay != fireTime.Date || midAtFire <= 0) return 0;
+            if (midAtFire > _sessionOpenMid) return 1;
+            if (midAtFire < _sessionOpenMid) return -1;
+            return 0;
+        }
+
+        // Per-fire CSV MFE/MAE (report-only, 2026-07-19): running favorable/adverse excursion in ticks
+        // while an AUTO trade is open, sampled every SetContext tick (~30Hz) against the same _lastPrice
+        // the PnL readout already uses. Trade-complete MFE/MAE (not a rolling window), matching NT8's own
+        // Strategy Analyzer report. Cheap: one comparison + assignment per tick, only while a trade is open.
+        private void UpdateOpenTradeExcursion()
+        {
+            AutoTrade trade = _openAutoTrade;
+            if (trade == null || _lastPrice <= 0) return;   // no trade open — the common tick; skip EffectiveTick() too
+            double tick = EffectiveTick();
+            if (tick <= 0) return;
+            double signedTicks = (trade.IsLong ? _lastPrice - trade.EntryPrice : trade.EntryPrice - _lastPrice) / tick;
+            if (signedTicks > trade.MfeTicks) trade.MfeTicks = signedTicks;
+            if (-signedTicks > trade.MaeTicks) trade.MaeTicks = -signedTicks;
         }
 
         // Review finding (major, 2026-07-03): self-heal a leaked _openAutoTrade against the REAL account
@@ -1062,6 +1148,14 @@ namespace TradingRadar.NT
             }
 
             _autoFireCount++;                                            // all clear — fire
+            // Per-fire CSV (2026-07-19): snapshot the entry-side context THIS fire is committing to,
+            // before SubmitRaw runs — SlTicks/TpTicks are filled in a moment later, by SubmitRaw's own
+            // ATM-attach branch (the bracket doesn't exist yet here). Consumed + cleared at entry-fill
+            // (OnOrderUpdate); a guard_skip never reaches this line, so it never leaks stale context.
+            _pendingFireCtx = new PendingFireContext {
+                Fire = f,
+                EntryType = route.Marketable ? "MKT" : "LMT",
+                MidAtFire = _lastPrice, DayTrendSign = ComputeDayTrendSign(f.Time, _lastPrice) };
             if (route.Marketable)
                 // Reactive REJECT — marketable chase. isEntry:true attaches the picked ATM bracket (same
                 // as SubmitLimit); isAuto:true seeds _autoOrder so exit-leg telemetry + the one-trade busy
@@ -1316,6 +1410,7 @@ namespace TradingRadar.NT
             _activeLimit = null;        // order tracking is per-account (orders/positions differ)
             _autoOrder = null;
             _pendingReplace = null;
+            _pendingFireCtx = null;     // a fire-context for the old account no longer applies
             _workingOrders.Clear();
             _ownOrders.Clear();
             AbandonOpenAutoTrade("account switch");   // review finding: was never cleared, corrupting exit telemetry across a switch
@@ -1349,6 +1444,7 @@ namespace TradingRadar.NT
         {
             if (!IsPlaybackAccount(_account)) return;
             _pendingReplace = null;
+            _pendingFireCtx = null;   // a fire-context from before the rewind no longer applies
             _hoursFlattenDay = DateTime.MinValue;   // a rewind replays the same date — the 16:00 flatten must be able to fire again
             // Task 3 fix (2026-07-05): a rewind/restart replays the SAME calendar date, so TryAutoFire's
             // day-change reset (day != _autoFireDay) never trips — the daily trade count carried across the
@@ -1471,8 +1567,10 @@ namespace TradingRadar.NT
                         _openAutoTrade = new AutoTrade
                         {
                             EntryOrderId = ord.Id, EntryOrder = ord, IsLong = ord.OrderAction == OrderAction.Buy,
-                            EntryPrice = ord.AverageFillPrice, EntryQty = ord.Filled, EntryTime = _now
+                            EntryPrice = ord.AverageFillPrice, EntryQty = ord.Filled, EntryTime = _now,
+                            FireCtx = _pendingFireCtx   // per-fire CSV — the entry-side snapshot TryAutoFire captured for THIS fire
                         };
+                        _pendingFireCtx = null;   // consumed — a later guard_skip must never resurrect this trade's context
                     }
                     _workingOrders.Remove(ord);   // HashSet.Remove is a no-op if already gone
                     _ownOrders.Remove(ord);
@@ -1670,6 +1768,7 @@ namespace TradingRadar.NT
                     System.Globalization.CultureInfo.InvariantCulture,
                     "entry #{0} @ {1:0.00}, exit @ {2:0.00}, {3:0.#}t gross, {4:0.0}s, reason {5}.",
                     trade.EntryOrderId, trade.EntryPrice, avgExit, realizedTicksNet, durationSec, reason));
+                LogFire(trade, avgExit, reason, realizedTicksNet, durationSec);   // per-fire CSV — one row, this completed round-trip
                 _openAutoTrade = null;
             }
         }
@@ -1837,6 +1936,76 @@ namespace TradingRadar.NT
         {
             Diag(detail);
             LogAuto(evt, side, price, mid, detail);
+        }
+
+        // ---- per-fire CSV (2026-07-19) ----
+        // One row per completed AUTO round-trip (entry+exit joined) — the cut lr-auto/Rec can't make, since
+        // every row there is a single EVENT, not a trade. Built for the reactKind x wallSide / dayTrendSign
+        // pivots the edge measurement needs. Independent of both lr-auto and Rec, same lazily-opened-writer
+        // pattern as EnsureAutoLogWriter/LogAuto above (same dir, same instrument-keyed rolling).
+        private void EnsureFiresLogWriter()
+        {
+            if (_cleanedUp) return;   // see EnsureAutoLogWriter's own comment — a late marshaled event must not reopen
+            if (_firesLogWriter != null) return;
+            try
+            {
+                string dir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "NinjaTrader 8", "LiquidityRadar");
+                System.IO.Directory.CreateDirectory(dir);
+                string inst = _instrument != null ? _instrument.MasterInstrument.Name : "X";
+                string path = System.IO.Path.Combine(dir,
+                    "lr-fires-" + inst + "-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".csv");
+                _firesLogWriter = new System.IO.StreamWriter(path, false);
+                _firesLogWriter.WriteLine("sessionId,schemaVersion,contentDay,entryOrderId,timestampFire,side,setupKind,reactKind," +
+                    "wallSide,wallPrice,wallSizeAtFire,entryType,midAtFire,entryPrice,tapeAccel,tapeZScore,tapeSpeed,aggressorDelta," +
+                    "dayTrendSign,hourBucket,slTicks,tpTicks,exitPrice,exitReason,mfeTicks,maeTicks,realizedTicks,realizedR,durationSec");
+                _firesLogWriter.Flush();
+            }
+            catch (Exception ex) { Diag("fires log open failed: " + ex.Message); }
+        }
+
+        // trade.FireCtx is null only if an AUTO trade somehow opened outside TryAutoFire (defensive —
+        // shouldn't happen: _openAutoTrade is only ever created from an order _autoOrder itself set,
+        // and TryAutoFire always sets _pendingFireCtx before that submit). Columns fed from ctx read 0/
+        // empty in that case rather than a guessed value — see the class banner's ★-column note.
+        private void LogFire(AutoTrade trade, double exitPrice, string exitReason, double realizedTicks, double durationSec)
+        {
+            EnsureFiresLogWriter();
+            if (_firesLogWriter == null) return;
+            PendingFireContext ctx = trade.FireCtx;
+            int slTicks = ctx != null ? ctx.SlTicks : 0;
+            int tpTicks = ctx != null ? ctx.TpTicks : 0;
+            double realizedR = slTicks > 0 ? realizedTicks / slTicks : 0.0;   // 0 when the SL distance is unknown (no ATM bracket read)
+            string contentDay = trade.EntryTime.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+            string timestampFire = (ctx != null ? ctx.Fire.Time : trade.EntryTime).ToString("o");
+            try
+            {
+                _firesLogWriter.WriteLine(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "{0},{1},{2},{3},{4},{5},{6},{7},{8},{9:0.00},{10},{11},{12:0.00},{13:0.00},{14:0.###},{15:0.###},{16:0.###},{17}," +
+                    "{18},{19},{20},{21},{22:0.00},{23},{24:0.#},{25:0.#},{26:0.#},{27:0.##},{28:0.0}",
+                    _sessionId, FiresSchemaVersion, contentDay, trade.EntryOrderId, timestampFire,
+                    trade.IsLong ? "Buy" : "Sell",
+                    ctx != null ? ctx.Fire.Kind.ToString() : string.Empty,
+                    ctx != null ? ctx.Fire.React.ToString() : string.Empty,
+                    ctx != null ? ctx.Fire.WallSide.ToString() : string.Empty,
+                    ctx != null ? ctx.Fire.WallPrice : 0.0,
+                    ctx != null ? ctx.Fire.WallSizeAtFire : 0L,
+                    ctx != null ? ctx.EntryType : string.Empty,
+                    ctx != null ? ctx.MidAtFire : 0.0,
+                    trade.EntryPrice,
+                    ctx != null ? ctx.Fire.TapeAccel : 0.0,
+                    ctx != null ? ctx.Fire.ZAtFire : 0.0,
+                    ctx != null ? ctx.Fire.TapeSpeed : 0.0,
+                    ctx != null ? ctx.Fire.DeltaAtFire : 0L,
+                    ctx != null ? ctx.DayTrendSign : 0,
+                    ctx != null ? ctx.Fire.Time.Hour : 0,   // hourBucket — derivable from Fire.Time, no separate field
+                    slTicks, tpTicks,
+                    exitPrice, exitReason ?? string.Empty,
+                    trade.MfeTicks, trade.MaeTicks,
+                    realizedTicks, realizedR, durationSec));
+                _firesLogWriter.Flush();   // one row per completed trade — rare enough that flush-per-write is cheap insurance, same call as LogAuto
+            }
+            catch (Exception ex) { Diag("fires log write failed: " + ex.Message); }
         }
 
         private bool ValidateForSubmit()
@@ -2097,6 +2266,14 @@ namespace TradingRadar.NT
                         // schema stays 6 columns; kept parseable (BracketSummary's format).
                         if (isAuto) LogAuto("atm_attach", action.ToString(), limitPrice, _lastPrice,
                             "ATM " + atm.Name + " attached to order #" + o.Id + " (" + BracketSummary(atm) + ").");
+                        // Per-fire CSV: slTicks/tpTicks for realizedR — only knowable now the bracket exists.
+                        // 1st bracket only (ponytail: multi-target ATMs would need a per-target row; today's
+                        // templates are 1 contract/1 target, matching the researcher's own sizing note).
+                        if (isAuto && _pendingFireCtx != null && atm.Brackets != null && atm.Brackets.Length > 0)
+                        {
+                            _pendingFireCtx.SlTicks = (int)Math.Round(atm.Brackets[0].StopLoss);
+                            _pendingFireCtx.TpTicks = (int)Math.Round(atm.Brackets[0].Target);
+                        }
                     }
                     catch (Exception atmEx)
                     {
@@ -2318,6 +2495,7 @@ namespace TradingRadar.NT
             Account.AccountStatusUpdate -= OnAccountStatusUpdate;
             UnsubscribeAccount();
             if (_autoLogWriter != null) { _autoLogWriter.Flush(); _autoLogWriter.Dispose(); _autoLogWriter = null; }
+            if (_firesLogWriter != null) { _firesLogWriter.Flush(); _firesLogWriter.Dispose(); _firesLogWriter = null; }
         }
     }
 }

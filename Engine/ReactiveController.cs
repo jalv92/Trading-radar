@@ -159,7 +159,7 @@ namespace TradingRadar.Engine
                     ConsumptionRead r = ConsumptionTracker.Read(_wallSide, _wallPrice, _peak, cur, _watchStart, inp.Book);
                     if (r.Fraction >= _cfg.BreakFireFrac && r.TradeBackedFraction >= _cfg.MinTradeBackedRatio)
                     {
-                        fire = MakeFire(FollowSide(_wallSide), ReactKind.Break, r.Fraction, inp);
+                        fire = MakeFire(FollowSide(_wallSide), ReactKind.Break, r.Fraction, cur, inp);
                         EnterFired(inp.Now);
                         return true;
                     }
@@ -172,7 +172,7 @@ namespace TradingRadar.Engine
                 else if (outcome == Outcome.Absorbed)
                 {
                     // REJECT / fade: wall held/refilled, quote did not cross.
-                    fire = MakeFire(FadeSide(_wallSide), ReactKind.Reject, 0.0, inp);
+                    fire = MakeFire(FadeSide(_wallSide), ReactKind.Reject, 0.0, cur, inp);
                     EnterFired(inp.Now);
                     return true;
                 }
@@ -210,12 +210,15 @@ namespace TradingRadar.Engine
         private static Side FadeSide(Side wall) { return wall == Side.Ask ? Side.Bid : Side.Ask; }
         private static Side FollowSide(Side wall) { return wall; }
 
-        private FireEvent MakeFire(Side tradeSide, ReactKind react, double frac, ControllerInputs inp)
+        private FireEvent MakeFire(Side tradeSide, ReactKind react, double frac, long wallSizeAtFire, ControllerInputs inp)
         {
             return new FireEvent {
                 Side = tradeSide, WallPrice = _wallPrice, EntryHint = _wallPrice,
                 Fraction = frac, DeltaAtFire = inp.AggressorDelta, ZAtFire = inp.TapeZScore, Time = inp.Now,
-                Kind = SetupKind.Reactive, React = react };
+                Kind = SetupKind.Reactive, React = react,
+                // Per-fire CSV instrumentation (report-only) — WallSide is the latched wall's OWN side,
+                // distinct from tradeSide above (spec §3: Reject flips it, Break/Follow doesn't).
+                WallSide = _wallSide, WallSizeAtFire = wallSizeAtFire, TapeAccel = inp.TapeAccel, TapeSpeed = inp.TapeSpeed };
         }
 
         private void EnterFired(DateTime now)

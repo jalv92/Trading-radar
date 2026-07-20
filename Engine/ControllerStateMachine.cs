@@ -12,6 +12,13 @@ namespace TradingRadar.Engine
         // object-initializer (which sets neither) leave these at Kind=Break(0)/React=None(0) — Break
         // logic is untouched.
         public SetupKind Kind; public ReactKind React;
+        // Per-fire CSV instrumentation (2026-07-19, report-only — no control-flow reads these). WallSide
+        // is the WALL's own side (Ask/Bid) as opposed to Side above, which is the TRADE side — spec §3's
+        // direction table maps one to the other (Reject flips it, Break/Follow doesn't); carrying it here
+        // removes the need to re-derive it downstream. WallSizeAtFire/TapeAccel/TapeSpeed are the same
+        // values StepCountdown/ReactiveController already had in scope at the fire tick, just not
+        // previously surfaced on the event. All default to 0 — additive, same pattern as Kind/React above.
+        public Side WallSide; public long WallSizeAtFire; public double TapeAccel; public double TapeSpeed;
     }
 
     public struct ControllerInputs
@@ -32,6 +39,9 @@ namespace TradingRadar.Engine
         // Signed tape acceleration = d(netRate)/dt (§5): +ve = buyers accelerating (arms a wall above),
         // -ve = sellers accelerating (arms a wall below). Fed by TapeAcceleration.cs via the NT layer.
         public double TapeAccel;
+        // Raw 1s print-rate sample fed into TapeSpeed's EWMA (the NT layer's win1s.Prints) — surfaced
+        // here purely so a fire can carry the actual rate (not just its z-score) for the per-fire CSV.
+        public double TapeSpeed;
         // Per-side live episode outcome (§7) reusing Outcome from Primitives.cs, PER SIDE with its own
         // valid flag (plan §0-R3: a single "dominant" outcome is ambiguous when walls sit on both
         // sides — ReactiveController latches ONE side and must read THAT side's resolution).
@@ -318,7 +328,10 @@ namespace TradingRadar.Engine
             c.State = SideState.Fired;
             fire = new FireEvent {
                 Side = wallSide, WallPrice = c.WallPrice, EntryHint = c.WallPrice,
-                Fraction = r.Fraction, DeltaAtFire = inp.AggressorDelta, ZAtFire = inp.TapeZScore, Time = inp.Now };
+                Fraction = r.Fraction, DeltaAtFire = inp.AggressorDelta, ZAtFire = inp.TapeZScore, Time = inp.Now,
+                // Break's trade side IS the wall's own side (spec §3) — WallSide is redundant with Side
+                // here, but kept uniform so a per-fire CSV reader never special-cases Break vs Reactive.
+                WallSide = wallSide, WallSizeAtFire = cur, TapeAccel = inp.TapeAccel, TapeSpeed = inp.TapeSpeed };
             c.LastFire = fire;
             return true;
         }

@@ -724,6 +724,7 @@ namespace TradingRadar.NT
                 WallBelowPrice = ctrlWallBelowPx, WallBelowCurrent = ctrlWallBelowSz,
                 AggressorDelta = aggDelta15,
                 TapeZScore = _tape.ZScore,
+                TapeSpeed = win1s.Prints,   // per-fire CSV instrumentation — the raw rate behind ZScore, not just its z
                 TapeAlternations = _book.RecentAlternations(8),
                 Mid = pMid, Now = now, Book = _book,
                 AdaptiveSignificance = _depthBase.P85,
