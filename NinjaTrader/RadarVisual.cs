@@ -27,7 +27,14 @@ namespace TradingRadar.NT
         static readonly Pen   OrderLineBuy  = FrozenDash(Color.FromRgb(0x34, 0xd3, 0x99), 1.6);
         static readonly Pen   OrderLineSell = FrozenDash(Color.FromRgb(0xfb, 0x71, 0x85), 1.6);
         static readonly Brush BidBook      = FrozenBrush(Color.FromArgb(115, 0x34, 0xd3, 0x99));  // ~.45
-        static readonly Brush AskBook      = FrozenBrush(Color.FromArgb(115, 0xfb, 0x71, 0x85));  // ~.45
+        // Ask base raised over the bid's .45: coral at 45% over the dark ink reads as dead maroon
+        // while emerald at 45% still reads green — equalize PERCEIVED brightness, not alpha (2026-07-20).
+        static readonly Brush AskBook      = FrozenBrush(Color.FromArgb(145, 0xfb, 0x71, 0x85));  // ~.57
+        // "Hot inside" rows: book levels within HotTicks of the mid draw near-full brightness, so the
+        // zone the price is actually trading lights up and decays back to faint as price leaves it.
+        static readonly Brush BidBookHot   = FrozenBrush(Color.FromArgb(215, 0x34, 0xd3, 0x99));
+        static readonly Brush AskBookHot   = FrozenBrush(Color.FromArgb(215, 0xfb, 0x71, 0x85));
+        const int HotTicks = 3;
         static readonly Brush MidChipBg    = FrozenBrush(Color.FromArgb(230, 0x14, 0x18, 0x22));
         static readonly Pen   MidChipBorder= FrozenPen(Color.FromArgb(89, 0xff, 0xce, 0x5c), 1); // ~.35
         static readonly Typeface Mono  = new Typeface(new FontFamily("Consolas"),
@@ -189,11 +196,15 @@ namespace TradingRadar.NT
             if (_bids != null) for (int i = 0; i < _bids.Count; i++) liveKeys.Add((long)Math.Round(_bids[i].Price / _tick));
             if (_asks != null) for (int i = 0; i < _asks.Count; i++) liveKeys.Add((long)Math.Round(_asks[i].Price / _tick));
 
-            // Live-node price keys — skip book levels that coincide with a live wall node (prevents double bar + double size label).
+            // Drawn-node price keys — skip book/ghost bars that coincide with a node the node loop will
+            // draw (prevents double bar + double size label). Must use the SAME predicate as the node
+            // loop (Visible = InWindow OR confidence-retained): a blind node passes Visible and gets its
+            // dim bar, but its price is neither in the book nor InWindow, so the ghost layer used to
+            // draw a SECOND bar of a different width under it — the "bar inside a bar" (live 2026-07-20).
             var liveNodeKeys = new HashSet<long>();
             if (_nodes != null)
                 for (int i = 0; i < _nodes.Count; i++)
-                    if (_nodes[i].InWindow)
+                    if (Visible(_nodes[i]))
                         liveNodeKeys.Add((long)Math.Round(_nodes[i].Price / _tick));
 
             // ---- remembered ladder (ghost) — fills the rows the live book doesn't reach ----
@@ -219,7 +230,8 @@ namespace TradingRadar.NT
                     if (!RowVisible(y)) continue;
                     double barW   = Math.Max(2.0, (_bids[i].Volume / (double)maxSize) * barMaxW);
                     double rowTop = y - rowH * 0.35, rowHt = rowH * 0.70;
-                    dc.DrawRoundedRectangle(BidBook, null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
+                    dc.DrawRoundedRectangle(Math.Abs(_bids[i].Price - _mid) <= HotTicks * _tick ? BidBookHot : BidBook,
+                        null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
                     DrawText(dc, _bids[i].Price.ToString("0.00", CultureInfo.InvariantCulture), 4, y, 14, Mono, PriceTxt, dpi, 1.0);
                     DrawText(dc, _bids[i].Volume.ToString(), barX + barW + 6, y, 13, Mono, BidText, dpi, 1.0);
                 }
@@ -231,7 +243,8 @@ namespace TradingRadar.NT
                     if (!RowVisible(y)) continue;
                     double barW   = Math.Max(2.0, (_asks[i].Volume / (double)maxSize) * barMaxW);
                     double rowTop = y - rowH * 0.35, rowHt = rowH * 0.70;
-                    dc.DrawRoundedRectangle(AskBook, null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
+                    dc.DrawRoundedRectangle(Math.Abs(_asks[i].Price - _mid) <= HotTicks * _tick ? AskBookHot : AskBook,
+                        null, new Rect(barX, rowTop, barW, rowHt), 3, 3);
                     DrawText(dc, _asks[i].Price.ToString("0.00", CultureInfo.InvariantCulture), 4, y, 14, Mono, PriceTxt, dpi, 1.0);
                     DrawText(dc, _asks[i].Volume.ToString(), barX + barW + 6, y, 13, Mono, AskText, dpi, 1.0);
                 }
